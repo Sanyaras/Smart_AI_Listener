@@ -3,15 +3,22 @@ import bodyParser from "body-parser";
 
 const app = express();
 
+// --- parsers ---
 app.use(bodyParser.json({ limit: "2mb" }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"] }));
 
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
-const TG_CHAT_ID = process.env.TG_CHAT_ID;
+// --- env ---
+const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN;
+const TG_CHAT_ID     = process.env.TG_CHAT_ID;
 const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY;
 
+const MEGAPBX_BASE   = process.env.MEGAPBX_BASE || "";   // пример: https://vats299897.megapbx.ru/crmapi/v1
+const MEGAPBX_TOKEN  = process.env.MEGAPBX_TOKEN || "";  // пример: cd0337d3-af81-...
+
+// ------------- helpers -------------
 async function sendTG(text) {
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
   await fetch(url, {
     method: "POST",
@@ -22,7 +29,7 @@ async function sendTG(text) {
       parse_mode: "HTML",
       disable_web_page_preview: true
     })
-  });
+  }).catch(() => {});
 }
 
 function safeStr(obj) {
@@ -34,15 +41,16 @@ function safeStr(obj) {
   }
 }
 
+// ------------- universal webhook handler -------------
 async function handler(req, res) {
   try {
-    const method = req.method;
-    const path = req.path || req.url || "/";
+    const method  = req.method;
+    const path    = req.path || req.url || "/";
     const headers = req.headers || {};
-    const query = req.query || {};
-    const body = typeof req.body === "undefined" ? {} : req.body;
+    const query   = req.query || {};
+    const body    = typeof req.body === "undefined" ? {} : req.body;
 
-    // Проверка ключа (если вообще передан)
+    // мягкая проверка ключа (если прислали и не совпал — 401; если не прислали — пропускаем)
     const gotKey =
       headers["x-crm-key"] ||
       headers["x-auth-token"] ||
@@ -52,7 +60,7 @@ async function handler(req, res) {
       return res.status(401).send("bad key");
     }
 
-    // Полезные поля, если они есть
+    // извлекаем «полезные» поля, если присутствуют
     const event =
       (typeof body === "object" ? (body.event || body.command || body.type) : undefined) ||
       query.event ||
@@ -109,11 +117,97 @@ async function handler(req, res) {
   }
 }
 
-// Принимаем запросы на любой путь
+// принимаем запросы на ЛЮБОЙ путь (на случай если ВАТС игнорирует хвосты)
 app.all("*", handler);
 
+// ------------- probe: авто-проверка API MegaPBX -------------
+async function tryFetch(url, method, headers) {
+  const r = await fetch(url, { method, headers });
+  const text = await r.text();
+  return { status: r.status, ok: r.ok, text: text.slice(0, 2000) };
+}
+
+/**
+ * GET /megafon/probe
+ * Перебирает несколько способов авторизации и эндпоинтов (/accounts, /calls),
+ * и шлёт первый успешный ответ в Telegram.
+ * ENV: MEGAPBX_BASE, MEGAPBX_TOKEN
+ */
+app.get("/megafon/probe", async (req, res) => {
+  if (!MEGAPBX_BASE || !MEGAPBX_TOKEN) {
+    await sendTG("⚠️ MEGAPBX_BASE/MEGAPBX_TOKEN не заданы.");
+    return res.status(400).json({ ok: false, msg: "missing env" });
+  }
+
+  const endpoints = [
+    "/accounts",
+    "/calls?limit=20",
+    `/calls?from=${encodeURIComponent(new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString())}&to=${encodeURIComponent(new Date().toISOString())}`
+  ];
+  const authVariants = [
+    { name: "Bearer",       headers: { Authorization: `Bearer ${MEGAPBX_TOKEN}` } },
+    { name: "X-Auth-Token", headers: { "X-Auth-Token": MEGAPBX_TOKEN } },
+    { name: "QueryToken",   headers: {}, addQuery: `token=${encodeURIComponent(MEGAPBX_TOKEN)}` }
+  ];
+
+  let report = ["🔎 <b>MegaPBX probe</b>", `base: <code>${MEGAPBX_BASE}</code>`];
+  for (const ep of endpoints) {
+    for (const av of authVariants) {
+      const url = av.addQuery ? `${MEGAPBX_BASE}${ep}${ep.includes("?") ? "&" : "?"}${av.addQuery}` : `${MEGAPBX_BASE}${ep}`;
+      try {
+        const out = await tryFetch(url, "GET", av.headers);
+        report.push(`• ${ep} [${av.name}] → ${out.status}${out.ok ? " OK" : ""}`);
+        if (out.ok) {
+          report.push(`<code>${out.text}</code>`);
+          await sendTG(report.join("\n"));
+          return res.json({ ok: true, hit: { ep, auth: av.name } });
+        }
+      } catch (e) {
+        report.push(`• ${ep} [${av.name}] → error: ${e.message}`);
+      }
+    }
+  }
+  await sendTG(report.join("\n"));
+  res.status(502).json({ ok: false, msg: "no working combo found yet" });
+});
+
+/**
+ * GET /megafon/accounts/test
+ * Явно бьём в /accounts и шлём результат в Телеграм.
+ * ENV: MEGAPBX_BASE, MEGAPBX_TOKEN
+ */
+app.get("/megafon/accounts/test", async (req, res) => {
+  if (!MEGAPBX_BASE || !MEGAPBX_TOKEN) {
+    return res.status(400).json({ ok: false, msg: "missing env" });
+  }
+  try {
+    // по очереди пробуем 3 варианта авторизации
+    const tries = [
+      { headers: { Authorization: `Bearer ${MEGAPBX_TOKEN}` }, url: `${MEGAPBX_BASE}/accounts` },
+      { headers: { "X-Auth-Token": MEGAPBX_TOKEN }, url: `${MEGAPBX_BASE}/accounts` },
+      { headers: {}, url: `${MEGAPBX_BASE}/accounts?token=${encodeURIComponent(MEGAPBX_TOKEN)}` }
+    ];
+    for (const t of tries) {
+      const r = await fetch(t.url, { method: "GET", headers: t.headers });
+      const text = await r.text();
+      if (r.ok) {
+        await sendTG("👥 <b>Accounts</b>:\n<code>" + text.slice(0, 3500) + "</code>");
+        return res.json({ ok: true });
+      }
+    }
+    await sendTG("❗️ accounts: ни один способ авторизации не сработал");
+    res.status(502).json({ ok: false });
+  } catch (e) {
+    await sendTG("❗️ accounts error: <code>" + (e?.message || e) + "</code>");
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// health
 app.get("/", (_, res) => res.send("OK"));
 
+// listen
 app.listen(process.env.PORT || 3000, () => {
   console.log("listening on", process.env.PORT || 3000);
 });
+

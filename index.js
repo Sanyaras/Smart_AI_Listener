@@ -18,7 +18,7 @@ const MEGAPBX_BASE   = process.env.MEGAPBX_BASE || "";   // напр.: https://v
 const MEGAPBX_TOKEN  = process.env.MEGAPBX_TOKEN || "";  // напр.: cd0337d3-...
 const MEGAPBX_PROXY  = process.env.MEGAPBX_PROXY || "";  // напр.: http://user:pass@host:port
 
-// агент для выхода в интернет через российский прокси (только для запросов к MegaFon API)
+/* ---------- proxy agent ---------- */
 const proxyAgent = MEGAPBX_PROXY ? new HttpsProxyAgent(MEGAPBX_PROXY) : undefined;
 
 /* ---------- helpers ---------- */
@@ -53,13 +53,36 @@ async function apiGet(path, headers = {}) {
   return { ok: r.ok, status: r.status, text };
 }
 
-/* ---------- special routes (перед catch-all) ---------- */
+/* ---------- SPECIAL ROUTES (before catch-all) ---------- */
 
-/**
- * GET /megafon/probe
- * Перебирает варианты авторизации и эндпоинты (/accounts, /calls).
- * Шлёт первый успешный ответ в Телеграм.
- */
+/** Проверка прокси: какой внешний IP? */
+app.get("/proxy/ip", async (req, res) => {
+  try {
+    const r = await fetch("https://api.ipify.org?format=json", { agent: proxyAgent });
+    const t = await r.text();
+    await sendTG("🛰️ <b>Proxy IP</b>:\n<code>" + t + "</code>");
+    res.type("application/json").send(t);
+  } catch (e) {
+    await sendTG("❗️ /proxy/ip error: <code>" + (e?.message || e) + "</code>");
+    res.status(500).send("proxy ip failed");
+  }
+});
+
+/** Проверка прокси: забрать страницу через прокси */
+app.get("/proxy/fetch", async (req, res) => {
+  const url = req.query.url || "https://ya.ru";
+  try {
+    const r = await fetch(url, { agent: proxyAgent });
+    const text = await r.text();
+    await sendTG("🌐 <b>Proxy fetch OK</b>: " + url + "\n<code>" + text.slice(0, 300) + "</code>");
+    res.type("text/html").send(text);
+  } catch (e) {
+    await sendTG("❗️ /proxy/fetch error (" + url + "): <code>" + (e?.message || e) + "</code>");
+    res.status(500).send("proxy fetch failed");
+  }
+});
+
+/** Probe MegaPBX REST /crmapi/v1 через прокси */
 app.get("/megafon/probe", async (req, res) => {
   if (!MEGAPBX_BASE || !MEGAPBX_TOKEN) {
     await sendTG("⚠️ MEGAPBX_BASE/MEGAPBX_TOKEN не заданы.");
@@ -98,91 +121,7 @@ app.get("/megafon/probe", async (req, res) => {
   res.status(502).json({ ok: false, msg: "no working combo found yet" });
 });
 
-/**
- * GET /megafon/pull
- * Тянем свежие звонки за последние 2 часа и шлём карточки в Телеграм.
- * Если у звонка нет record_url, но есть record_id — добираем ссылку через /records/{id}.
- */
-app.get("/megafon/pull", async (req, res) => {
-  try {
-    if (!MEGAPBX_BASE || !MEGAPBX_TOKEN) {
-      return res.status(400).json({ ok: false, msg: "missing env" });
-    }
-
-    const fromISO = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-    const toISO   = new Date().toISOString();
-
-    const auths = [
-      { headers: { Authorization: `Bearer ${MEGAPBX_TOKEN}` }, suffix: "" },
-      { headers: { "X-Auth-Token": MEGAPBX_TOKEN }, suffix: "" },
-      { headers: {}, suffix: `token=${encodeURIComponent(MEGAPBX_TOKEN)}` }
-    ];
-
-    // пробуем три способа авторизации
-    let callsResp = null;
-    for (const a of auths) {
-      const query = `from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}${a.suffix ? `&${a.suffix}` : ""}`;
-      const out = await apiGet(`/calls?${query}`, a.headers);
-      if (out.ok) { callsResp = { variant: a, text: out.text }; break; }
-    }
-    if (!callsResp) {
-      await sendTG("❗️ /pull: не получили список звонков (все попытки неуспешны)");
-      return res.status(502).json({ ok: false });
-    }
-
-    // парсим ответ (пытаемся поддержать разные форматы)
-    let data;
-    try { data = JSON.parse(callsResp.text); } catch { data = null; }
-    const calls = Array.isArray(data) ? data : (data?.calls || []);
-
-    if (!Array.isArray(calls) || calls.length === 0) {
-      await sendTG("ℹ️ /pull: звонков за интервал не найдено");
-      return res.json({ ok: true, count: 0 });
-    }
-
-    // для каждого звонка формируем карточку
-    for (const c of calls.slice(0, 20)) {
-      const callId = c.id || c.call_id || "-";
-      const from   = c.from || c.caller || "-";
-      const to     = c.to || c.callee || "-";
-      const ext    = c.employee_ext || c.ext || "-";
-      let record   = c.record_url || c.link || null;
-
-      // если дали только record_id — добираем ссылку
-      const rid = c.record_id || c.recordId || c.rec_id;
-      if (!record && rid) {
-        // также пробуем три способа авторизации
-        for (const a of auths) {
-          const path = `/records/${encodeURIComponent(rid)}${a.suffix ? `?${a.suffix}` : ""}`;
-          const out = await apiGet(path, a.headers);
-          if (out.ok) {
-            try {
-              const j = JSON.parse(out.text);
-              record = j.url || j.record_url || j.link || null;
-            } catch {}
-            if (record) break;
-          }
-        }
-      }
-
-      const lines = [
-        "📞 <b>MegaPBX → pull</b>",
-        `• CallID: <code>${callId}</code>`,
-        `• From: <code>${from}</code> → To: <code>${to}</code>`,
-        `• Ext: <code>${ext}</code>`,
-        record ? `• record_url: ${record}` : "• record: –"
-      ];
-      await sendTG(lines.join("\n"));
-    }
-
-    res.json({ ok: true, count: Math.min(20, calls.length) });
-  } catch (e) {
-    await sendTG("❗️ /pull error: <code>" + (e?.message || e) + "</code>");
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-/* ---------- universal webhook handler (catch-all) ---------- */
+/* ---------- UNIVERSAL WEBHOOK HANDLER (catch-all) ---------- */
 async function handler(req, res) {
   try {
     const method  = req.method;
@@ -191,7 +130,6 @@ async function handler(req, res) {
     const query   = req.query || {};
     const body    = typeof req.body === "undefined" ? {} : req.body;
 
-    // мягкая проверка ключа (если прислали и не совпал — 401)
     const gotKey =
       headers["x-crm-key"] ||
       headers["x-auth-token"] ||
@@ -201,7 +139,6 @@ async function handler(req, res) {
       return res.status(401).send("bad key");
     }
 
-    // вытащим полезные поля, если они есть
     const event =
       (typeof body === "object" ? (body.event || body.command || body.type) : undefined) ||
       query.event ||
@@ -255,11 +192,11 @@ async function handler(req, res) {
   }
 }
 
-// catch-all ДОЛЖЕН идти ПОСЛЕ спец-роутов
-app.all("*", handler);
-
 /* ---------- health ---------- */
 app.get("/", (_, res) => res.send("OK"));
+
+/* ---------- catch-all AFTER special routes ---------- */
+app.all("*", handler);
 
 /* ---------- listen ---------- */
 app.listen(process.env.PORT || 3000, () => {

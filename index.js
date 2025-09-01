@@ -16,9 +16,9 @@ const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID     = process.env.TG_CHAT_ID;
 const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY;
 
-const MEGAPBX_BASE   = process.env.MEGAPBX_BASE || "";   // напр.: https://vats299897.megapbx.ru/crmapi/v1
-const MEGAPBX_TOKEN  = process.env.MEGAPBX_TOKEN || "";  // напр.: cd0337d3-...
-const MEGAPBX_PROXY  = process.env.MEGAPBX_PROXY || "";  // напр.: http://user:pass@host:port
+const MEGAPBX_BASE   = process.env.MEGAPBX_BASE || "";
+const MEGAPBX_TOKEN  = process.env.MEGAPBX_TOKEN || "";
+const MEGAPBX_PROXY  = process.env.MEGAPBX_PROXY || "";
 
 /* ---------- proxy agent ---------- */
 function makeAgent(url) {
@@ -66,7 +66,32 @@ async function apiGet(path, headers = {}) {
 
 /* ---------- SPECIAL ROUTES ---------- */
 
-/** Проверка прокси: какой внешний IP? */
+// Debug: показать прокси-ENV и тип агента
+app.get("/proxy/debug", (req, res) => {
+  const raw = process.env.MEGAPBX_PROXY || "";
+  const masked = raw ? raw.replace(/(^[^:]+:\/\/[^:]+:)[^@]+(@.*$)/, "$1***$2") : "(empty)";
+  let agentType = "none";
+  if (proxyAgent) agentType = proxyAgent.constructor?.name || "unknown";
+  res.type("application/json").send(JSON.stringify({
+    MEGAPBX_PROXY: masked,
+    agentType
+  }, null, 2));
+});
+
+// Debug: сравнить IP прямой vs через прокси
+app.get("/proxy/compare", async (req, res) => {
+  try {
+    const direct = await fetch("https://api.ipify.org?format=json")
+      .then(r => r.text()).catch(e => "err:" + e.message);
+    const via = await fetch("https://api.ipify.org?format=json", { agent: proxyAgent })
+      .then(r => r.text()).catch(e => "err:" + e.message);
+    res.type("application/json").send(JSON.stringify({ direct, via_proxy: via }, null, 2));
+  } catch (e) {
+    res.status(500).send("compare failed: " + (e?.message || e));
+  }
+});
+
+// Проверка прокси: только IP через прокси
 app.get("/proxy/ip", async (req, res) => {
   try {
     const r = await fetch("https://api.ipify.org?format=json", { agent: proxyAgent });
@@ -79,7 +104,7 @@ app.get("/proxy/ip", async (req, res) => {
   }
 });
 
-/** Проверка прокси: забрать страницу через прокси */
+// Проверка прокси: загрузка страницы через прокси
 app.get("/proxy/fetch", async (req, res) => {
   const url = req.query.url || "https://ya.ru";
   try {
@@ -93,7 +118,7 @@ app.get("/proxy/fetch", async (req, res) => {
   }
 });
 
-/** Probe MegaPBX REST /crmapi/v1 через прокси */
+// Проверка доступа к MegaPBX REST /crmapi/v1
 app.get("/megafon/probe", async (req, res) => {
   if (!MEGAPBX_BASE || !MEGAPBX_TOKEN) {
     await sendTG("⚠️ MEGAPBX_BASE/MEGAPBX_TOKEN не заданы.");
@@ -132,7 +157,7 @@ app.get("/megafon/probe", async (req, res) => {
   res.status(502).json({ ok: false, msg: "no working combo found yet" });
 });
 
-/* ---------- UNIVERSAL WEBHOOK HANDLER (catch-all) ---------- */
+/* ---------- UNIVERSAL WEBHOOK HANDLER ---------- */
 async function handler(req, res) {
   try {
     const method  = req.method;

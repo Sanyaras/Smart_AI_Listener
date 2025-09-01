@@ -1,6 +1,8 @@
 import express from "express";
 import bodyParser from "body-parser";
+import { HttpProxyAgent } from "http-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { SocksProxyAgent } from "socks-proxy-agent";
 
 const app = express();
 
@@ -19,7 +21,16 @@ const MEGAPBX_TOKEN  = process.env.MEGAPBX_TOKEN || "";  // напр.: cd0337d3-
 const MEGAPBX_PROXY  = process.env.MEGAPBX_PROXY || "";  // напр.: http://user:pass@host:port
 
 /* ---------- proxy agent ---------- */
-const proxyAgent = MEGAPBX_PROXY ? new HttpsProxyAgent(MEGAPBX_PROXY) : undefined;
+function makeAgent(url) {
+  try {
+    if (!url) return undefined;
+    if (url.startsWith("http://"))  return new HttpProxyAgent(url);
+    if (url.startsWith("https://")) return new HttpsProxyAgent(url);
+    if (url.startsWith("socks5://") || url.startsWith("socks://")) return new SocksProxyAgent(url);
+    return undefined;
+  } catch { return undefined; }
+}
+const proxyAgent = makeAgent(MEGAPBX_PROXY);
 
 /* ---------- helpers ---------- */
 async function sendTG(text) {
@@ -53,7 +64,7 @@ async function apiGet(path, headers = {}) {
   return { ok: r.ok, status: r.status, text };
 }
 
-/* ---------- SPECIAL ROUTES (before catch-all) ---------- */
+/* ---------- SPECIAL ROUTES ---------- */
 
 /** Проверка прокси: какой внешний IP? */
 app.get("/proxy/ip", async (req, res) => {
@@ -181,7 +192,7 @@ async function handler(req, res) {
       "",
       "<b>Query</b>:\n<code>" + safeStr(query) + "</code>",
       "",
-      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>"
+      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>`
     ].filter(Boolean);
 
     await sendTG(lines.join("\n"));

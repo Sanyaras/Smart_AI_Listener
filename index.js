@@ -192,7 +192,7 @@ async function handler(req, res) {
       "",
       "<b>Query</b>:\n<code>" + safeStr(query) + "</code>",
       "",
-      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>`
+      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>"
     ].filter(Boolean);
 
     await sendTG(lines.join("\n"));

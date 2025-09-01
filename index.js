@@ -3,20 +3,20 @@ import bodyParser from "body-parser";
 
 const app = express();
 
-// --- parsers ---
+/* ---------- parsers ---------- */
 app.use(bodyParser.json({ limit: "2mb" }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"] }));
 
-// --- env ---
+/* ---------- env ---------- */
 const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID     = process.env.TG_CHAT_ID;
 const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY;
 
-const MEGAPBX_BASE   = process.env.MEGAPBX_BASE || "";   // пример: https://vats299897.megapbx.ru/crmapi/v1
-const MEGAPBX_TOKEN  = process.env.MEGAPBX_TOKEN || "";  // пример: cd0337d3-af81-...
+const MEGAPBX_BASE   = process.env.MEGAPBX_BASE || "";   // напр.: https://vats299897.megapbx.ru/crmapi/v1
+const MEGAPBX_TOKEN  = process.env.MEGAPBX_TOKEN || "";  // напр.: cd0337d3-af81-...
 
-// ------------- helpers -------------
+/* ---------- helpers ---------- */
 async function sendTG(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
@@ -41,96 +41,18 @@ function safeStr(obj) {
   }
 }
 
-// ------------- universal webhook handler -------------
-async function handler(req, res) {
-  try {
-    const method  = req.method;
-    const path    = req.path || req.url || "/";
-    const headers = req.headers || {};
-    const query   = req.query || {};
-    const body    = typeof req.body === "undefined" ? {} : req.body;
-
-    // мягкая проверка ключа (если прислали и не совпал — 401; если не прислали — пропускаем)
-    const gotKey =
-      headers["x-crm-key"] ||
-      headers["x-auth-token"] ||
-      headers["authorization"] ||
-      query.key;
-    if (CRM_SHARED_KEY && gotKey && String(gotKey) !== String(CRM_SHARED_KEY)) {
-      return res.status(401).send("bad key");
-    }
-
-    // извлекаем «полезные» поля, если присутствуют
-    const event =
-      (typeof body === "object" ? (body.event || body.command || body.type) : undefined) ||
-      query.event ||
-      "unknown";
-    const callId =
-      (typeof body === "object" ? (body.call_id || body.uuid) : undefined) ||
-      query.call_id ||
-      "-";
-    const from =
-      (typeof body === "object" ? body.from : undefined) ||
-      query.from ||
-      "-";
-    const to =
-      (typeof body === "object" ? body.to : undefined) ||
-      query.to ||
-      "-";
-    const ext =
-      (typeof body === "object" ? (body.employee_ext || body.ext || body.agent) : undefined) ||
-      query.ext ||
-      "-";
-    const recordUrl =
-      (typeof body === "object" ? (body.record_url || body.recordUrl) : undefined) ||
-      query.record_url;
-    const recordId =
-      (typeof body === "object" ? (body.record_id || body.recordId) : undefined) ||
-      query.record_id;
-
-    const lines = [
-      "📞 <b>MegaPBX → CRM webhook</b>",
-      `• Method: <code>${method}</code>`,
-      `• Path: <code>${path}</code>`,
-      `• Event: <code>${event}</code>`,
-      `• CallID: <code>${callId}</code>`,
-      `• From: <code>${from}</code> → To: <code>${to}</code>`,
-      `• Ext: <code>${ext}</code>`,
-      recordUrl ? `• record_url: ${recordUrl}` : "",
-      recordId ? `• record_id: <code>${recordId}</code>` : "",
-      "",
-      "<b>Headers</b>:\n<code>" + safeStr(headers) + "</code>",
-      "",
-      "<b>Query</b>:\n<code>" + safeStr(query) + "</code>",
-      "",
-      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>"
-    ].filter(Boolean);
-
-    await sendTG(lines.join("\n"));
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    try {
-      await sendTG(`❗️ <b>Error</b>:\n<code>${(e && e.message) || e}</code>`);
-    } catch {}
-    res.status(500).send("server error");
-  }
-}
-
-// принимаем запросы на ЛЮБОЙ путь (на случай если ВАТС игнорирует хвосты)
-app.all("*", handler);
-
-// ------------- probe: авто-проверка API MegaPBX -------------
+/* ---------- API probe helpers ---------- */
 async function tryFetch(url, method, headers) {
   const r = await fetch(url, { method, headers });
   const text = await r.text();
   return { status: r.status, ok: r.ok, text: text.slice(0, 2000) };
 }
 
+/* ---------- special routes (must be BEFORE catch-all) ---------- */
 /**
  * GET /megafon/probe
- * Перебирает несколько способов авторизации и эндпоинтов (/accounts, /calls),
- * и шлёт первый успешный ответ в Telegram.
+ * Перебирает варианты авторизации и эндпоинты (/accounts, /calls),
+ * первый успешный ответ шлёт в Telegram.
  * ENV: MEGAPBX_BASE, MEGAPBX_TOKEN
  */
 app.get("/megafon/probe", async (req, res) => {
@@ -181,7 +103,6 @@ app.get("/megafon/accounts/test", async (req, res) => {
     return res.status(400).json({ ok: false, msg: "missing env" });
   }
   try {
-    // по очереди пробуем 3 варианта авторизации
     const tries = [
       { headers: { Authorization: `Bearer ${MEGAPBX_TOKEN}` }, url: `${MEGAPBX_BASE}/accounts` },
       { headers: { "X-Auth-Token": MEGAPBX_TOKEN }, url: `${MEGAPBX_BASE}/accounts` },
@@ -203,11 +124,87 @@ app.get("/megafon/accounts/test", async (req, res) => {
   }
 });
 
-// health
+/* ---------- universal webhook handler (catch-all) ---------- */
+async function handler(req, res) {
+  try {
+    const method  = req.method;
+    const path    = req.path || req.url || "/";
+    const headers = req.headers || {};
+    const query   = req.query || {};
+    const body    = typeof req.body === "undefined" ? {} : req.body;
+
+    // мягкая проверка ключа: если ключ прислали и он не совпал — 401; если не прислали — пропускаем
+    const gotKey =
+      headers["x-crm-key"] ||
+      headers["x-auth-token"] ||
+      headers["authorization"] ||
+      query.key;
+    if (CRM_SHARED_KEY && gotKey && String(gotKey) !== String(CRM_SHARED_KEY)) {
+      return res.status(401).send("bad key");
+    }
+
+    // попытка извлечь «полезные» поля
+    const event =
+      (typeof body === "object" ? (body.event || body.command || body.type) : undefined) ||
+      query.event ||
+      "unknown";
+    const callId =
+      (typeof body === "object" ? (body.call_id || body.uuid) : undefined) ||
+      query.call_id ||
+      "-";
+    const from =
+      (typeof body === "object" ? body.from : undefined) ||
+      query.from ||
+      "-";
+    const to =
+      (typeof body === "object" ? body.to : undefined) ||
+      query.to ||
+      "-";
+    const ext =
+      (typeof body === "object" ? (body.employee_ext || body.ext || body.agent) : undefined) ||
+      query.ext ||
+      "-";
+    const recordUrl =
+      (typeof body === "object" ? (body.record_url || body.recordUrl) : undefined) ||
+      query.record_url;
+    const recordId =
+      (typeof body === "object" ? (body.record_id || body.recordId) : undefined) ||
+      query.record_id;
+
+    const lines = [
+      "📞 <b>MegaPBX → CRM webhook</b>",
+      `• Method: <code>${method}</code>`,
+      `• Path: <code>${path}</code>`,
+      `• Event: <code>${event}</code>`,
+      `• CallID: <code>${callId}</code>`,
+      `• From: <code>${from}</code> → To: <code>${to}</code>`,
+      `• Ext: <code>${ext}</code>`,
+      recordUrl ? `• record_url: ${recordUrl}` : "",
+      recordId ? `• record_id: <code>${recordId}</code>` : "",
+      "",
+      "<b>Headers</b>:\n<code>" + safeStr(headers) + "</code>",
+      "",
+      "<b>Query</b>:\n<code>" + safeStr(query) + "</code>",
+      "",
+      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>"
+    ].filter(Boolean);
+
+    await sendTG(lines.join("\n"));
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    try { await sendTG(`❗️ <b>Error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
+    res.status(500).send("server error");
+  }
+}
+
+// ВАЖНО: catch-all ДОЛЖЕН идти ПОСЛЕ спец-роутов
+app.all("*", handler);
+
+/* ---------- health ---------- */
 app.get("/", (_, res) => res.send("OK"));
 
-// listen
+/* ---------- listen ---------- */
 app.listen(process.env.PORT || 3000, () => {
   console.log("listening on", process.env.PORT || 3000);
 });
-

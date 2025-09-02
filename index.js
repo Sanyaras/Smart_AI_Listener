@@ -10,9 +10,19 @@ import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 const app = express();
 
 /* --- parsers --- */
-app.use(bodyParser.json({ limit: "3mb" }));
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"] }));
+// сохраняем сырое тело для валидации подписи GitHub (X-Hub-Signature-256)
+app.use(bodyParser.json({
+  limit: "3mb",
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
+app.use(bodyParser.urlencoded({
+  extended: false,
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
+app.use(bodyParser.text({
+  type: ["text/*", "application/octet-stream"],
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 
 /* --- env --- */
 const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN || "";
@@ -168,7 +178,6 @@ async function transcribeAudioFromUrl(fileUrl, meta = {}) {
     return null;
   }
   try {
-    // 1) скачать запись
     let r;
     try { r = await fetch(fileUrl, { redirect: "follow" }); }
     catch (e) { await sendTG(`❗️ Ошибка скачивания записи: <code>${e?.message || e}</code>`); return null; }
@@ -176,10 +185,9 @@ async function transcribeAudioFromUrl(fileUrl, meta = {}) {
 
     const buf = await r.arrayBuffer();
     const bytes = buf.byteLength;
-    const MAX = 60 * 1024 * 1024; // 60MB
+    const MAX = 60 * 1024 * 1024;
     if (bytes > MAX) { await sendTG(`⚠️ Запись ${(bytes/1024/1024).toFixed(1)}MB слишком большая — пропуск.`); return null; }
 
-    // 2) Whisper
     const fileName = (meta.callId ? `${meta.callId}.mp3` : "record.mp3");
     const form = new FormData();
     form.append("file", new Blob([buf]), fileName);
@@ -227,14 +235,12 @@ function getIncomingKey(req) {
 app.get("/", (_, res) => res.send("OK"));
 app.get("/version", (_, res) => res.json({ version: "vps-autodeploy-1.0.0" }));
 
-// TG ping
 app.get("/tg/ping", async (req, res) => {
   const text = req.query.msg || "ping-from-server";
   const ok = await sendTG("🔧 " + text);
   res.json({ ok });
 });
 
-// Диагностика внешнего URL (mp3)
 app.get("/probe-url", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "no url" });
@@ -253,7 +259,6 @@ app.get("/probe-url", async (req, res) => {
   }
 });
 
-// Диагностика OpenAI
 app.get("/diag/openai", async (req, res) => {
   try {
     const r = await fetch("https://api.openai.com/v1/models", {
@@ -264,7 +269,6 @@ app.get("/diag/openai", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
-// Диагностика ENV
 app.get("/diag/env", (req, res) => {
   res.json({
     TG_BOT_TOKEN: !!process.env.TG_BOT_TOKEN,
@@ -276,7 +280,6 @@ app.get("/diag/env", (req, res) => {
   });
 });
 
-// Основной вебхук MegaPBX
 app.all(["/megafon", "/"], async (req, res, next) => {
   if (req.method === "GET") return next();
   try {
@@ -287,8 +290,7 @@ app.all(["/megafon", "/"], async (req, res, next) => {
 
     const normalized = normalizeMegafon(req.body, req.headers, req.query);
     const msg = formatTgMessage(normalized);
-    const okCard = await sendTG(msg);
-    if (!okCard) console.warn("TG message not sent");
+    await sendTG(msg);
 
     const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg)(\?|$)/i.test(u));
     if (firstAudio) {
@@ -297,7 +299,6 @@ app.all(["/megafon", "/"], async (req, res, next) => {
                   `ext: <code>${normalized.ext}</code>`;
       await sendTGDocument(firstAudio, cap);
 
-      // fire-and-forget
       (async () => {
         const text = await transcribeAudioFromUrl(firstAudio, { callId: normalized.callId });
         if (text && text.length) {
@@ -328,7 +329,6 @@ app.all(["/megafon", "/"], async (req, res, next) => {
   }
 });
 
-// Fallback — всё остальное логируем в TG
 app.all("*", async (req, res) => {
   try {
     const body = typeof req.body === "undefined" ? {} : req.body;
@@ -352,68 +352,8 @@ app.all("*", async (req, res) => {
 });
 
 /* -------------------- GitHub webhook /deploy -------------------- */
-
-// проверка подписи GitHub (X-Hub-Signature-256)
 function verifyGithubSignature(req, secret) {
   const sig = req.headers["x-hub-signature-256"];
   if (!sig || !sig.startsWith("sha256=")) return false;
   const h = crypto.createHmac("sha256", secret);
-  const raw = JSON.stringify(req.body); // важно: json bodyParser уже дал объект
-  h.update(raw);
-  const digest = "sha256=" + h.digest("hex");
-  try { return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(digest)); }
-  catch { return false; }
-}
-
-// небольшая оболочка для запуска шелл-команд
-function sh(cmd) {
-  return new Promise((resolve, reject) => {
-    exec(cmd, { env: process.env, cwd: REPO_DIR, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) return reject({ err, stdout, stderr });
-      resolve({ stdout, stderr });
-    });
-  });
-}
-
-// endpoint автодеплоя
-app.post("/deploy", async (req, res) => {
-  try {
-    if (!DEPLOY_SECRET) return res.status(500).json({ ok: false, error: "DEPLOY_SECRET not set" });
-    if (!verifyGithubSignature(req, DEPLOY_SECRET)) return res.status(401).json({ ok: false, error: "bad signature" });
-
-    // (необязательно) проверим, что это push на нужную ветку
-    const ref = req.body?.ref || "";
-    const branch = ref.replace("refs/heads/", "");
-    if (branch && branch !== GIT_BRANCH) {
-      return res.json({ ok: true, skipped: true, reason: `push to ${branch}` });
-    }
-
-    const steps = [
-      `git fetch --all --prune`,
-      `git reset --hard origin/${GIT_BRANCH}`,
-      // при первом разворачивании запустится npm i, далее — npm ci быстрее (если lock появится)
-      `npm ci || npm i`,
-      // пробуем ecosystem; если нет — обычный reload по имени
-      `pm2 startOrReload ecosystem.config.cjs || pm2 restart ${PM2_NAME} --update-env || pm2 start index.js --name ${PM2_NAME}`
-    ];
-
-    let logs = [];
-    for (const cmd of steps) {
-      const { stdout, stderr } = await sh(cmd);
-      logs.push(`$ ${cmd}\n${stdout}${stderr ? ("\n" + stderr) : ""}`);
-    }
-
-    await sendTG("🚀 <b>Auto-deploy:</b> обновил код и перезапустил PM2.");
-    res.json({ ok: true, logs });
-  } catch (e) {
-    const msg = typeof e === "object" ? (e.err?.message || e.message || String(e)) : String(e);
-    await sendTG(`❗️ <b>Auto-deploy failed</b>:\n<code>${msg}</code>`);
-    res.status(500).json({ ok: false, error: msg, details: e });
-  }
-});
-
-/* -------------------- listen -------------------- */
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log("listening on", PORT);
-});
+  const raw = req.rawBody || JSON.stringify(req.body);

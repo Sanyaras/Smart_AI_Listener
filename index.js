@@ -3,6 +3,7 @@ import bodyParser from "body-parser";
 import { HttpProxyAgent } from "http-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
+import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
 /* -------------------- app -------------------- */
 const app = express();
@@ -18,7 +19,7 @@ const TG_CHAT_ID     = process.env.TG_CHAT_ID;
 const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // для транскрибации
 
-const MEGAPBX_PROXY  = process.env.MEGAPBX_PROXY || "";  // опционально: http://user:pass@host:port | https://... | socks5://...
+const MEGAPBX_PROXY  = process.env.MEGAPBX_PROXY || "";  // http://user:pass@host:port | https://... | socks5://...
 
 /* --- proxy agent (optional) --- */
 function makeAgent(url) {
@@ -96,7 +97,7 @@ function normalizeMegafon(body, headers = {}, query = {}) {
   let type = rawType;
   if (cmd === "history") type = "HISTORY";
 
-  const callId = b.callid || b.call_id || b.uuid || b.id || query.callid || query.call_id || "-";
+  const callId    = b.callid || b.call_id || b.uuid || b.id || query.callid || query.call_id || "-";
   const direction = (b.direction || query.direction || "-").toLowerCase();
 
   const telnum = b.telnum || b.to || query.telnum || query.to || "-";     // наш номер/линию
@@ -182,9 +183,7 @@ function formatTgMessage(n) {
     if (wait) extras.push(`ожидание: <code>${wait}s</code>`);
     if (start) extras.push(`начало: <code>${start}</code>`);
   }
-  if (extras.length) {
-    lines.push("", "• " + extras.join(" · "));
-  }
+  if (extras.length) lines.push("", "• " + extras.join(" · "));
 
   if (n.recordInfo?.urls?.length) {
     lines.push("", "🎧 <b>Запись:</b>");
@@ -205,13 +204,11 @@ async function transcribeAudioFromUrl(fileUrl, meta = {}) {
     return null;
   }
   try {
-    // скачиваем файл (через прокси при необходимости)
     const r = await fetch(fileUrl, { agent: proxyAgent });
     if (!r.ok) throw new Error(`download failed: ${r.status}`);
     const buf = await r.arrayBuffer();
     const bytes = buf.byteLength;
 
-    // на всякий случай ограничим размер (Whisper обычно ~25МБ+)
     const MAX = 60 * 1024 * 1024; // 60 MB
     if (bytes > MAX) {
       await sendTG(`⚠️ Запись <code>${(bytes/1024/1024).toFixed(1)}MB</code> слишком большая — пропустил транскрибацию.`);
@@ -222,8 +219,8 @@ async function transcribeAudioFromUrl(fileUrl, meta = {}) {
     const form = new FormData();
     form.append("file", new Blob([buf]), fileName);
     form.append("model", "whisper-1");
-    form.append("language", "ru");           // можно убрать для автоопределения
-    form.append("response_format", "text");  // получим plain text
+    form.append("language", "ru");
+    form.append("response_format", "text");
 
     const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
@@ -253,6 +250,7 @@ function getIncomingKey(req) {
 
 /* -------------------- routes -------------------- */
 app.get("/", (_, res) => res.send("OK"));
+app.get("/version", (_, res) => res.json({ version: "qa+transcribe-rop-v1" }));
 
 app.all(["/megafon", "/"], async (req, res, next) => {
   if (req.method === "GET") return next();
@@ -266,7 +264,7 @@ app.all(["/megafon", "/"], async (req, res, next) => {
     const msg = formatTgMessage(normalized);
     await sendTG(msg);
 
-    // если есть аудиоссылка — отправим «документ» и запустим транскрибацию
+    // если есть аудиоссылка — отправим «документ» и запустим транскрибацию + проф-оценку
     const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg)(\?|$)/i.test(u));
     if (firstAudio) {
       const cap = `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
@@ -274,15 +272,26 @@ app.all(["/megafon", "/"], async (req, res, next) => {
                   `ext: <code>${normalized.ext}</code>`;
       await sendTGDocument(firstAudio, cap);
 
-      // fire-and-forget транскрибация
+      // fire-and-forget: транскрибация -> проф-анализ
       (async () => {
         const text = await transcribeAudioFromUrl(firstAudio, { callId: normalized.callId });
         if (text && text.length) {
           const header = `📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`;
-          const chunks = chunkText(text, 3500);
-          await sendTG(header);
-          for (const part of chunks) {
-            await sendTG(`<code>${part}</code>`);
+          for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
+
+          try {
+            const qa = await analyzeTranscript(text, {
+              callId: normalized.callId,
+              ext: normalized.ext,
+              direction: normalized.direction,
+              from: normalized.from,
+              to: normalized.to,
+              brand: process.env.CALL_QA_BRAND || ""
+            });
+            const card = formatQaForTelegram(qa);
+            await sendTG(card);
+          } catch (e) {
+            await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>");
           }
         }
       })();

@@ -357,3 +357,50 @@ function verifyGithubSignature(req, secret) {
   if (!sig || !sig.startsWith("sha256=")) return false;
   const h = crypto.createHmac("sha256", secret);
   const raw = req.rawBody || JSON.stringify(req.body);
+  const digest = "sha256=" + h.update(raw).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(digest));
+}
+
+app.post("/deploy", async (req, res) => {
+  try {
+    if (!DEPLOY_SECRET) {
+      return res.status(400).json({ ok: false, error: "DEPLOY_SECRET не задан" });
+    }
+    if (!verifyGithubSignature(req, DEPLOY_SECRET)) {
+      await sendTG("❗️ GitHub webhook: неверная подпись");
+      return res.status(401).json({ ok: false, error: "bad signature" });
+    }
+
+    // Можно добавить доп.проверки по содержимому webhook (ветка, repo и т.д.)
+    const branch = req.body?.ref?.split("/").pop();
+    if (branch !== GIT_BRANCH) {
+      await sendTG(`⚠️ Webhook: branch <code>${branch}</code> ≠ <code>${GIT_BRANCH}</code>`);
+      return res.status(200).json({ ok: true, note: "branch skip" });
+    }
+
+    await sendTG("🚀 GitHub webhook: деплой запускается…");
+
+    // Готовим команду деплоя (pull и рестарт pm2)
+    const cmd = [
+      `cd ${REPO_DIR}`,
+      `git fetch --all`,
+      `git reset --hard origin/${GIT_BRANCH}`,
+      `npm install --production`,
+      `pm2 restart ${PM2_NAME}`,
+    ].join(" && ");
+
+    exec(cmd, async (err, stdout, stderr) => {
+      if (err) {
+        await sendTG("❗️ Ошибка деплоя:\n<code>" + safeStr(stderr || err.message || err) + "</code>");
+        return res.status(500).json({ ok: false, error: "deploy failed", details: safeStr(stderr || err) });
+      }
+      await sendTG("✅ Деплой завершён:\n<code>" + safeStr(stdout) + "</code>");
+      res.json({ ok: true, stdout });
+    });
+  } catch (e) {
+    await sendTG("❗️ Ошибка /deploy:\n<code>" + safeStr(e) + "</code>");
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+export default app;

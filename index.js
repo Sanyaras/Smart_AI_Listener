@@ -1,21 +1,36 @@
 import express from "express";
 import bodyParser from "body-parser";
+import { HttpProxyAgent } from "http-proxy-agent";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { SocksProxyAgent } from "socks-proxy-agent";
 
 /* -------------------- app -------------------- */
 const app = express();
 
 /* --- parsers --- */
-// JSON
 app.use(bodyParser.json({ limit: "2mb" }));
-// x-www-form-urlencoded (важно для MegaPBX)
 app.use(bodyParser.urlencoded({ extended: false }));
-// текст (на всякий)
 app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"] }));
 
 /* --- env --- */
 const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID     = process.env.TG_CHAT_ID;
-const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY || "boxfield-qa-2025"; // твой ключ из примера
+const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // для транскрибации
+
+const MEGAPBX_PROXY  = process.env.MEGAPBX_PROXY || "";  // опционально: http://user:pass@host:port | https://... | socks5://...
+
+/* --- proxy agent (optional) --- */
+function makeAgent(url) {
+  try {
+    if (!url) return undefined;
+    if (url.startsWith("http://"))  return new HttpProxyAgent(url);
+    if (url.startsWith("https://")) return new HttpsProxyAgent(url);
+    if (url.startsWith("socks5://") || url.startsWith("socks://")) return new SocksProxyAgent(url);
+    return undefined;
+  } catch { return undefined; }
+}
+const proxyAgent = makeAgent(MEGAPBX_PROXY);
 
 /* -------------------- helpers -------------------- */
 async function sendTG(text) {
@@ -33,6 +48,32 @@ async function sendTG(text) {
   }).catch(() => {});
 }
 
+async function sendTGDocument(fileUrl, caption = "") {
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
+  await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chat_id: TG_CHAT_ID,
+      document: fileUrl, // Telegram умеет тянуть по URL
+      caption,
+      parse_mode: "HTML",
+      disable_content_type_detection: false
+    })
+  }).catch(() => {});
+}
+
+function chunkText(str, max = 3500) {
+  const out = [];
+  let i = 0;
+  while (i < str.length) {
+    out.push(str.slice(i, i + max));
+    i += max;
+  }
+  return out;
+}
+
 function safeStr(obj) {
   try {
     if (typeof obj === "string") return obj.slice(0, 3500);
@@ -42,52 +83,44 @@ function safeStr(obj) {
   }
 }
 
-/** Нормализуем объект события: разные поля → в единый вид */
+/* -------------------- normalizer -------------------- */
 function normalizeMegafon(body, headers = {}, query = {}) {
-  // body может быть строкой (если чужой контент-тайп)
   let b = body;
   if (typeof b === "string") {
     try { b = JSON.parse(b); } catch { b = { raw: b }; }
   }
   if (!b || typeof b !== "object") b = {};
 
-  const type =
-    b.type || b.event || b.command || b.status || query.type || query.event || "unknown";
+  const rawType = b.type || b.event || b.command || b.status || query.type || query.event || "unknown";
+  const cmd     = (b.cmd || query.cmd || "").toLowerCase();
+  let type = rawType;
+  if (cmd === "history") type = "HISTORY";
 
-  const callId =
-    b.callid || b.call_id || b.uuid || b.id || query.callid || query.call_id || "-";
-
-  const direction =
-    b.direction || query.direction || "-"; // 'in' | 'out'
+  const callId = b.callid || b.call_id || b.uuid || b.id || query.callid || query.call_id || "-";
+  const direction = (b.direction || query.direction || "-").toLowerCase();
 
   const telnum = b.telnum || b.to || query.telnum || query.to || "-";     // наш номер/линию
   const phone  = b.phone  || b.from || query.phone  || query.from || "-"; // номер абонента
   const ext    = b.ext || b.employee_ext || b.agent || query.ext || "-";
 
-  // Отформатируем From/To в зависимости от направления
   let from = "-";
   let to   = "-";
   if (direction === "out") { from = telnum; to = phone; }
   else if (direction === "in") { from = phone; to = telnum; }
-  else {
-    // неизвестно — покажем оба, что есть
-    from = b.from || phone || "-";
-    to   = b.to   || telnum || "-";
-  }
+  else { from = b.from || phone || "-"; to = b.to || telnum || "-"; }
 
-  // Соберём кандидатов на "запись" из всех ключей
   const recordInfo = extractRecordInfo(b);
 
-  return {
-    type, callId, direction, telnum, phone, ext, from, to,
-    recordInfo,
-    raw: b,
-    headers,
-    query
+  const extra = {
+    status: b.status || "-",
+    duration: b.duration ? String(b.duration) : undefined,
+    wait: b.wait ? String(b.wait) : undefined,
+    start: b.start || b.ts_start || undefined
   };
+
+  return { type, cmd, callId, direction, telnum, phone, ext, from, to, recordInfo, extra, raw: b, headers, query };
 }
 
-/** Ищем "запись" в произвольном payload: record_url/link/mp3/wav/id и т.п. */
 function extractRecordInfo(obj) {
   const info = { urls: [], ids: [], hints: [] };
   const pushUrl = (u) => { if (u && /^https?:\/\//i.test(u)) info.urls.push(String(u)); };
@@ -102,73 +135,111 @@ function extractRecordInfo(obj) {
       if (v && typeof v === "object") { stack.push(v); continue; }
       const val = String(v ?? "");
 
-      // URL-кандидаты
       if (val.startsWith("http://") || val.startsWith("https://")) {
-        // интересует всё, где встречается record/rec и/или аудиорасширения
         if (/\b(record|rec|recording|audio|file|link)\b/i.test(key) || /\.(mp3|wav|ogg)(\?|$)/i.test(val)) {
           pushUrl(val);
         }
       }
-
-      // Поля с id записи
       if (/\b(record(_?id)?|rec_id|file_id)\b/i.test(key)) pushId(val);
-
-      // Подсказки (например, "link", "url", без расширений)
       if ((/link|url|file/i.test(key)) && val) info.hints.push(`${k}: ${val}`);
     }
   }
-
-  // Удалим дубли
-  info.urls = Array.from(new Set(info.urls));
-  info.ids  = Array.from(new Set(info.ids));
+  info.urls  = Array.from(new Set(info.urls));
+  info.ids   = Array.from(new Set(info.ids));
   info.hints = Array.from(new Set(info.hints));
   return info;
 }
 
-/** Готовим красивый текст для Telegram */
-function formatTgMessage(normalized) {
-  const { type, callId, direction, telnum, phone, ext, from, to, recordInfo, raw } = normalized;
-
-  const typePretty = {
+function prettyType(type) {
+  const t = String(type).toUpperCase();
+  return ({
     RINGING: "📳 RINGING (звонит)",
+    INCOMING: "🔔 INCOMING",
     ACCEPTED: "✅ ACCEPTED (принят)",
+    COMPLETED: "🔔 COMPLETED",
     HANGUP: "⛔️ HANGUP (завершён)",
     MISSED: "❌ MISSED (пропущен)",
-    RECORD: "🎙️ RECORD",
-    RECORD_READY: "🎙️ RECORD_READY",
-    FINISHED: "🏁 FINISHED"
-  }[String(type).toUpperCase()] || `🔔 ${type}`;
+    HISTORY: "🗂 HISTORY (итоги/запись)"
+  }[t] || `🔔 ${type}`);
+}
 
+function formatTgMessage(n) {
   const lines = [
     "📞 <b>MegaPBX → Webhook</b>",
-    `• Событие: <b>${typePretty}</b>`,
-    `• CallID: <code>${callId}</code>`,
-    `• Направление: <code>${direction}</code>`,
-    `• От: <code>${from}</code> → Кому: <code>${to}</code>`,
-    `• Наш номер (telnum): <code>${telnum}</code>`,
-    `• Внутр. (ext): <code>${ext}</code>`
+    `• Событие: <b>${prettyType(n.type)}</b>`,
+    `• CallID: <code>${n.callId}</code>`,
+    `• Направление: <code>${n.direction || "-"}</code>`,
+    `• От: <code>${n.from}</code> → Кому: <code>${n.to}</code>`,
+    `• Наш номер (telnum): <code>${n.telnum}</code>`,
+    `• Внутр. (ext): <code>${n.ext}</code>`
   ];
 
-  // Добавим инфо о записи, если есть
-  if (recordInfo.urls.length) {
-    lines.push("", "🎧 <b>Запись:</b>");
-    for (const u of recordInfo.urls.slice(0, 5)) lines.push(`• ${u}`);
-  } else if (recordInfo.ids.length) {
-    lines.push("", "🎧 <b>Идентификаторы записи:</b>");
-    for (const id of recordInfo.ids.slice(0, 5)) lines.push(`• <code>${id}</code>`);
-  } else if (recordInfo.hints.length) {
-    lines.push("", "🎧 <b>Подсказки по записи:</b>");
-    for (const h of recordInfo.hints.slice(0, 5)) lines.push(`• <code>${h}</code>`);
+  const extras = [];
+  if (n.extra) {
+    const { status, duration, wait, start } = n.extra;
+    if (status && status !== "-") extras.push(`статус: <code>${status}</code>`);
+    if (duration) extras.push(`длительность: <code>${duration}s</code>`);
+    if (wait) extras.push(`ожидание: <code>${wait}s</code>`);
+    if (start) extras.push(`начало: <code>${start}</code>`);
+  }
+  if (extras.length) {
+    lines.push("", "• " + extras.join(" · "));
   }
 
-  // Сырая нагрузка — последней строкой (укороченная)
-  lines.push("", "<i>Raw:</i>", `<code>${safeStr(raw)}</code>`);
+  if (n.recordInfo?.urls?.length) {
+    lines.push("", "🎧 <b>Запись:</b>");
+    for (const u of n.recordInfo.urls.slice(0, 5)) lines.push(`• ${u}`);
+  } else if (n.recordInfo?.ids?.length) {
+    lines.push("", "🎧 <b>Идентификаторы записи:</b>");
+    for (const id of n.recordInfo.ids.slice(0, 5)) lines.push(`• <code>${id}</code>`);
+  }
 
+  lines.push("", "<i>Raw:</i>", `<code>${safeStr(n.raw)}</code>`);
   return lines.join("\n");
 }
 
+/* -------------------- transcription -------------------- */
+async function transcribeAudioFromUrl(fileUrl, meta = {}) {
+  if (!OPENAI_API_KEY) {
+    await sendTG("⚠️ <b>OPENAI_API_KEY не задан</b> — пропускаю транскрибацию.");
+    return null;
+  }
+  try {
+    // скачиваем файл (через прокси при необходимости)
+    const r = await fetch(fileUrl, { agent: proxyAgent });
+    if (!r.ok) throw new Error(`download failed: ${r.status}`);
+    const buf = await r.arrayBuffer();
+    const bytes = buf.byteLength;
+
+    // на всякий случай ограничим размер (Whisper обычно ~25МБ+)
+    const MAX = 60 * 1024 * 1024; // 60 MB
+    if (bytes > MAX) {
+      await sendTG(`⚠️ Запись <code>${(bytes/1024/1024).toFixed(1)}MB</code> слишком большая — пропустил транскрибацию.`);
+      return null;
+    }
+
+    const fileName = (meta.callId ? `${meta.callId}.mp3` : "record.mp3");
+    const form = new FormData();
+    form.append("file", new Blob([buf]), fileName);
+    form.append("model", "whisper-1");
+    form.append("language", "ru");           // можно убрать для автоопределения
+    form.append("response_format", "text");  // получим plain text
+
+    const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: form,
+    });
+    if (!resp.ok) throw new Error(`whisper error: ${resp.status} ${await resp.text()}`);
+    const text = await resp.text();
+    return text.trim();
+  } catch (e) {
+    await sendTG(`❗️ Ошибка транскрибации: <code>${(e && e.message) || e}</code>`);
+    return null;
+  }
+}
+
 /* -------------------- security -------------------- */
-/** Проверяем общий ключ — берём из заголовков/квери/тела */
 function getIncomingKey(req) {
   return (
     req.headers["x-api-key"] ||
@@ -181,15 +252,11 @@ function getIncomingKey(req) {
 }
 
 /* -------------------- routes -------------------- */
-
-/** Health */
 app.get("/", (_, res) => res.send("OK"));
 
-/** Основной вебхук MegaPBX (им удобно слать на корень или /megafon) */
 app.all(["/megafon", "/"], async (req, res, next) => {
-  if (req.method === "GET") return next(); // GET на корень пусть обрабатывает ниже
+  if (req.method === "GET") return next();
   try {
-    // Авторизация по общему ключу (если задан)
     const inKey = getIncomingKey(req);
     if (CRM_SHARED_KEY && inKey && String(inKey) !== String(CRM_SHARED_KEY)) {
       return res.status(401).send("bad key");
@@ -199,24 +266,35 @@ app.all(["/megafon", "/"], async (req, res, next) => {
     const msg = formatTgMessage(normalized);
     await sendTG(msg);
 
-    // Если вдруг запись найдена — можно дополнительно пометить OK
-    const hasRecord = normalized.recordInfo.urls.length || normalized.recordInfo.ids.length;
-    res.json({ ok: true, got: normalized.type, callId: normalized.callId, hasRecord: !!hasRecord });
+    // если есть аудиоссылка — отправим «документ» и запустим транскрибацию
+    const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg)(\?|$)/i.test(u));
+    if (firstAudio) {
+      const cap = `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
+                  `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
+                  `ext: <code>${normalized.ext}</code>`;
+      await sendTGDocument(firstAudio, cap);
+
+      // fire-and-forget транскрибация
+      (async () => {
+        const text = await transcribeAudioFromUrl(firstAudio, { callId: normalized.callId });
+        if (text && text.length) {
+          const header = `📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`;
+          const chunks = chunkText(text, 3500);
+          await sendTG(header);
+          for (const part of chunks) {
+            await sendTG(`<code>${part}</code>`);
+          }
+        }
+      })();
+    }
+
+    res.json({ ok: true, type: normalized.type, callId: normalized.callId, hasAudio: !!firstAudio });
   } catch (e) {
     try { await sendTG(`❗️ <b>Webhook error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
     res.status(500).send("server error");
   }
 });
 
-/** Диагностика: показать, что сервер принимает и JSON, и форму */
-app.post("/megafon/test", async (req, res) => {
-  const normalized = normalizeMegafon(req.body, req.headers, req.query);
-  const msg = formatTgMessage(normalized);
-  await sendTG("🧪 <b>TEST post</b>\n\n" + msg);
-  res.json({ ok: true, test: true });
-});
-
-/** Фоллбэк-логгер на все остальные пути (заголовки/квери/тело) */
 app.all("*", async (req, res) => {
   try {
     const body = typeof req.body === "undefined" ? {} : req.body;

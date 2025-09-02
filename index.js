@@ -35,9 +35,12 @@ const proxyAgent = makeAgent(MEGAPBX_PROXY);
 
 /* -------------------- helpers -------------------- */
 async function sendTG(text) {
-  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
+    console.warn("sendTG skipped: TG_BOT_TOKEN/TG_CHAT_ID missing");
+    return false;
+  }
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
+  const resp = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -46,13 +49,22 @@ async function sendTG(text) {
       parse_mode: "HTML",
       disable_web_page_preview: false
     })
-  }).catch(() => {});
+  });
+  if (!resp.ok) {
+    const err = await resp.text().catch(() => "");
+    console.error("sendTG error:", resp.status, err);
+    return false;
+  }
+  return true;
 }
 
 async function sendTGDocument(fileUrl, caption = "") {
-  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
+    console.warn("sendTGDocument skipped: TG_BOT_TOKEN/TG_CHAT_ID missing");
+    return false;
+  }
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
-  await fetch(url, {
+  const resp = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -62,7 +74,13 @@ async function sendTGDocument(fileUrl, caption = "") {
       parse_mode: "HTML",
       disable_content_type_detection: false
     })
-  }).catch(() => {});
+  });
+  if (!resp.ok) {
+    const err = await resp.text().catch(() => "");
+    console.error("sendTGDocument error:", resp.status, err);
+    return false;
+  }
+  return true;
 }
 
 function chunkText(str, max = 3500) {
@@ -197,24 +215,35 @@ function formatTgMessage(n) {
   return lines.join("\n");
 }
 
-/* -------------------- transcription -------------------- */
+/* -------------------- transcription (detailed logging) -------------------- */
 async function transcribeAudioFromUrl(fileUrl, meta = {}) {
   if (!OPENAI_API_KEY) {
     await sendTG("⚠️ <b>OPENAI_API_KEY не задан</b> — пропускаю транскрибацию.");
     return null;
   }
   try {
-    const r = await fetch(fileUrl, { agent: proxyAgent });
-    if (!r.ok) throw new Error(`download failed: ${r.status}`);
+    // 1) скачиваем запись
+    let r;
+    try {
+      r = await fetch(fileUrl, { agent: proxyAgent, redirect: "follow" });
+    } catch (e) {
+      await sendTG(`❗️ Ошибка скачивания записи: <code>${e?.message || e}</code>`);
+      return null;
+    }
+    if (!r.ok) {
+      await sendTG(`❗️ Ошибка скачивания записи: HTTP <code>${r.status}</code>`);
+      return null;
+    }
+
     const buf = await r.arrayBuffer();
     const bytes = buf.byteLength;
-
     const MAX = 60 * 1024 * 1024; // 60 MB
     if (bytes > MAX) {
       await sendTG(`⚠️ Запись <code>${(bytes/1024/1024).toFixed(1)}MB</code> слишком большая — пропустил транскрибацию.`);
       return null;
     }
 
+    // 2) отправляем в OpenAI Whisper
     const fileName = (meta.callId ? `${meta.callId}.mp3` : "record.mp3");
     const form = new FormData();
     form.append("file", new Blob([buf]), fileName);
@@ -222,16 +251,28 @@ async function transcribeAudioFromUrl(fileUrl, meta = {}) {
     form.append("language", "ru");
     form.append("response_format", "text");
 
-    const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: form,
-    });
-    if (!resp.ok) throw new Error(`whisper error: ${resp.status} ${await resp.text()}`);
+    let resp;
+    try {
+      resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+        body: form,
+      });
+    } catch (e) {
+      await sendTG(`❗️ Ошибка запроса в OpenAI (network): <code>${e?.message || e}</code>`);
+      return null;
+    }
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      await sendTG(`❗️ Whisper вернул ошибку: HTTP <code>${resp.status}</code>\n<code>${errText.slice(0,1000)}</code>`);
+      return null;
+    }
+
     const text = await resp.text();
     return text.trim();
   } catch (e) {
-    await sendTG(`❗️ Ошибка транскрибации: <code>${(e && e.message) || e}</code>`);
+    await sendTG(`❗️ Общая ошибка транскрибации: <code>${e?.message || e}</code>`);
     return null;
   }
 }
@@ -250,7 +291,61 @@ function getIncomingKey(req) {
 
 /* -------------------- routes -------------------- */
 app.get("/", (_, res) => res.send("OK"));
-app.get("/version", (_, res) => res.json({ version: "qa+transcribe-rop-v1" }));
+app.get("/version", (_, res) => res.json({ version: "qa+transcribe-rop-v2" }));
+
+// Диагностика Telegram
+app.get("/tg/ping", async (req, res) => {
+  const text = req.query.msg || "ping-from-server";
+  const ok = await sendTG("🔧 " + text);
+  res.json({ ok });
+});
+
+// Диагностика доступа к внешнему URL (mp3)
+app.get("/probe-url", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ ok: false, error: "no url" });
+  try {
+    const r = await fetch(url, { method: "GET", redirect: "manual", agent: proxyAgent });
+    const headers = {};
+    r.headers.forEach((v, k) => headers[k] = v);
+    // заглянем в первые байты, не скачивая всё
+    let bytes = 0;
+    try {
+      const reader = r.body?.getReader?.();
+      if (reader) {
+        const { value } = await reader.read();
+        bytes = (value?.byteLength || 0);
+      }
+    } catch {}
+    res.json({ ok: true, status: r.status, headers, peek_bytes: bytes });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Диагностика OpenAI ключа/связности
+app.get("/diag/openai", async (req, res) => {
+  try {
+    const r = await fetch("https://api.openai.com/v1/models", {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
+    });
+    const body = await r.text();
+    res.status(r.status).send(body);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// Диагностика окружения (безопасно: не печатаем сам ключ/токен)
+app.get("/diag/env", (req, res) => {
+  res.json({
+    TG_BOT_TOKEN: !!process.env.TG_BOT_TOKEN,
+    TG_CHAT_ID: process.env.TG_CHAT_ID ? (String(process.env.TG_CHAT_ID).slice(0,4) + "...") : "",
+    OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
+    CRM_SHARED_KEY: !!process.env.CRM_SHARED_KEY,
+    MEGAPBX_PROXY: process.env.MEGAPBX_PROXY ? true : false
+  });
+});
 
 app.all(["/megafon", "/"], async (req, res, next) => {
   if (req.method === "GET") return next();
@@ -262,7 +357,8 @@ app.all(["/megafon", "/"], async (req, res, next) => {
 
     const normalized = normalizeMegafon(req.body, req.headers, req.query);
     const msg = formatTgMessage(normalized);
-    await sendTG(msg);
+    const okCard = await sendTG(msg);
+    if (!okCard) console.warn("TG message not sent");
 
     // если есть аудиоссылка — отправим «документ» и запустим транскрибацию + проф-оценку
     const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg)(\?|$)/i.test(u));
@@ -270,7 +366,8 @@ app.all(["/megafon", "/"], async (req, res, next) => {
       const cap = `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
                   `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
                   `ext: <code>${normalized.ext}</code>`;
-      await sendTGDocument(firstAudio, cap);
+      const okDoc = await sendTGDocument(firstAudio, cap);
+      if (!okDoc) console.warn("TG document not sent");
 
       // fire-and-forget: транскрибация -> проф-анализ
       (async () => {
@@ -304,6 +401,7 @@ app.all(["/megafon", "/"], async (req, res, next) => {
   }
 });
 
+// «ловим всё» — чтобы видеть неожиданные запросы
 app.all("*", async (req, res) => {
   try {
     const body = typeof req.body === "undefined" ? {} : req.body;

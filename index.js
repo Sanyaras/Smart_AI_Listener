@@ -1,38 +1,23 @@
 import express from "express";
 import bodyParser from "body-parser";
-import { HttpProxyAgent } from "http-proxy-agent";
-import { HttpsProxyAgent } from "https-proxy-agent";
-import { SocksProxyAgent } from "socks-proxy-agent";
 
+/* -------------------- app -------------------- */
 const app = express();
 
-/* ---------- parsers ---------- */
+/* --- parsers --- */
+// JSON
 app.use(bodyParser.json({ limit: "2mb" }));
-app.use(bodyParser.urlencoded({ extended: true }));
+// x-www-form-urlencoded (важно для MegaPBX)
+app.use(bodyParser.urlencoded({ extended: false }));
+// текст (на всякий)
 app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"] }));
 
-/* ---------- env ---------- */
+/* --- env --- */
 const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID     = process.env.TG_CHAT_ID;
-const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY;
+const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY || "boxfield-qa-2025"; // твой ключ из примера
 
-const MEGAPBX_BASE   = process.env.MEGAPBX_BASE || "";
-const MEGAPBX_TOKEN  = process.env.MEGAPBX_TOKEN || "";
-const MEGAPBX_PROXY  = process.env.MEGAPBX_PROXY || "";
-
-/* ---------- proxy agent ---------- */
-function makeAgent(url) {
-  try {
-    if (!url) return undefined;
-    if (url.startsWith("http://"))  return new HttpProxyAgent(url);
-    if (url.startsWith("https://")) return new HttpsProxyAgent(url);
-    if (url.startsWith("socks5://") || url.startsWith("socks://")) return new SocksProxyAgent(url);
-    return undefined;
-  } catch { return undefined; }
-}
-const proxyAgent = makeAgent(MEGAPBX_PROXY);
-
-/* ---------- helpers ---------- */
+/* -------------------- helpers -------------------- */
 async function sendTG(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
@@ -43,7 +28,7 @@ async function sendTG(text) {
       chat_id: TG_CHAT_ID,
       text,
       parse_mode: "HTML",
-      disable_web_page_preview: true
+      disable_web_page_preview: false
     })
   }).catch(() => {});
 }
@@ -57,184 +42,204 @@ function safeStr(obj) {
   }
 }
 
-async function apiGet(path, headers = {}) {
-  const url = `${MEGAPBX_BASE}${path}`;
-  const r = await fetch(url, { method: "GET", headers, agent: proxyAgent });
-  const text = await r.text();
-  return { ok: r.ok, status: r.status, text };
+/** Нормализуем объект события: разные поля → в единый вид */
+function normalizeMegafon(body, headers = {}, query = {}) {
+  // body может быть строкой (если чужой контент-тайп)
+  let b = body;
+  if (typeof b === "string") {
+    try { b = JSON.parse(b); } catch { b = { raw: b }; }
+  }
+  if (!b || typeof b !== "object") b = {};
+
+  const type =
+    b.type || b.event || b.command || b.status || query.type || query.event || "unknown";
+
+  const callId =
+    b.callid || b.call_id || b.uuid || b.id || query.callid || query.call_id || "-";
+
+  const direction =
+    b.direction || query.direction || "-"; // 'in' | 'out'
+
+  const telnum = b.telnum || b.to || query.telnum || query.to || "-";     // наш номер/линию
+  const phone  = b.phone  || b.from || query.phone  || query.from || "-"; // номер абонента
+  const ext    = b.ext || b.employee_ext || b.agent || query.ext || "-";
+
+  // Отформатируем From/To в зависимости от направления
+  let from = "-";
+  let to   = "-";
+  if (direction === "out") { from = telnum; to = phone; }
+  else if (direction === "in") { from = phone; to = telnum; }
+  else {
+    // неизвестно — покажем оба, что есть
+    from = b.from || phone || "-";
+    to   = b.to   || telnum || "-";
+  }
+
+  // Соберём кандидатов на "запись" из всех ключей
+  const recordInfo = extractRecordInfo(b);
+
+  return {
+    type, callId, direction, telnum, phone, ext, from, to,
+    recordInfo,
+    raw: b,
+    headers,
+    query
+  };
 }
 
-/* ---------- SPECIAL ROUTES ---------- */
+/** Ищем "запись" в произвольном payload: record_url/link/mp3/wav/id и т.п. */
+function extractRecordInfo(obj) {
+  const info = { urls: [], ids: [], hints: [] };
+  const pushUrl = (u) => { if (u && /^https?:\/\//i.test(u)) info.urls.push(String(u)); };
+  const pushId  = (x) => { if (x) info.ids.push(String(x)); };
 
-// Debug: показать прокси-ENV и тип агента
-app.get("/proxy/debug", (req, res) => {
-  const raw = process.env.MEGAPBX_PROXY || "";
-  const masked = raw ? raw.replace(/(^[^:]+:\/\/[^:]+:)[^@]+(@.*$)/, "$1***$2") : "(empty)";
-  let agentType = "none";
-  if (proxyAgent) agentType = proxyAgent.constructor?.name || "unknown";
-  res.type("application/json").send(JSON.stringify({
-    MEGAPBX_PROXY: masked,
-    agentType
-  }, null, 2));
-});
+  const stack = [obj];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== "object") continue;
+    for (const [k, v] of Object.entries(cur)) {
+      const key = k.toLowerCase();
+      if (v && typeof v === "object") { stack.push(v); continue; }
+      const val = String(v ?? "");
 
-// Debug: сравнить IP прямой vs через прокси
-app.get("/proxy/compare", async (req, res) => {
-  try {
-    const direct = await fetch("https://api.ipify.org?format=json")
-      .then(r => r.text()).catch(e => "err:" + e.message);
-    const via = await fetch("https://api.ipify.org?format=json", { agent: proxyAgent })
-      .then(r => r.text()).catch(e => "err:" + e.message);
-    res.type("application/json").send(JSON.stringify({ direct, via_proxy: via }, null, 2));
-  } catch (e) {
-    res.status(500).send("compare failed: " + (e?.message || e));
-  }
-});
-
-// Проверка прокси: только IP через прокси
-app.get("/proxy/ip", async (req, res) => {
-  try {
-    const r = await fetch("https://api.ipify.org?format=json", { agent: proxyAgent });
-    const t = await r.text();
-    await sendTG("🛰️ <b>Proxy IP</b>:\n<code>" + t + "</code>");
-    res.type("application/json").send(t);
-  } catch (e) {
-    await sendTG("❗️ /proxy/ip error: <code>" + (e?.message || e) + "</code>");
-    res.status(500).send("proxy ip failed");
-  }
-});
-
-// Проверка прокси: загрузка страницы через прокси
-app.get("/proxy/fetch", async (req, res) => {
-  const url = req.query.url || "https://ya.ru";
-  try {
-    const r = await fetch(url, { agent: proxyAgent });
-    const text = await r.text();
-    await sendTG("🌐 <b>Proxy fetch OK</b>: " + url + "\n<code>" + text.slice(0, 300) + "</code>");
-    res.type("text/html").send(text);
-  } catch (e) {
-    await sendTG("❗️ /proxy/fetch error (" + url + "): <code>" + (e?.message || e) + "</code>");
-    res.status(500).send("proxy fetch failed");
-  }
-});
-
-// Проверка доступа к MegaPBX REST /crmapi/v1
-app.get("/megafon/probe", async (req, res) => {
-  if (!MEGAPBX_BASE || !MEGAPBX_TOKEN) {
-    await sendTG("⚠️ MEGAPBX_BASE/MEGAPBX_TOKEN не заданы.");
-    return res.status(400).json({ ok: false, msg: "missing env" });
-  }
-
-  const endpoints = [
-    "/accounts",
-    "/calls?limit=20",
-    `/calls?from=${encodeURIComponent(new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString())}&to=${encodeURIComponent(new Date().toISOString())}`
-  ];
-  const authVariants = [
-    { name: "Bearer",       headers: { Authorization: `Bearer ${MEGAPBX_TOKEN}` } },
-    { name: "X-Auth-Token", headers: { "X-Auth-Token": MEGAPBX_TOKEN } },
-    { name: "QueryToken",   headers: {}, addQuery: `token=${encodeURIComponent(MEGAPBX_TOKEN)}` }
-  ];
-
-  let report = ["🔎 <b>MegaPBX probe</b>", `base: <code>${MEGAPBX_BASE}</code>`];
-  for (const ep of endpoints) {
-    for (const av of authVariants) {
-      const path = av.addQuery ? `${ep}${ep.includes("?") ? "&" : "?"}${av.addQuery}` : ep;
-      try {
-        const out = await apiGet(path, av.headers);
-        report.push(`• ${ep} [${av.name}] → ${out.status}${out.ok ? " OK" : ""}`);
-        if (out.ok) {
-          report.push(`<code>${out.text.slice(0, 2000)}</code>`);
-          await sendTG(report.join("\n"));
-          return res.json({ ok: true, hit: { ep, auth: av.name } });
+      // URL-кандидаты
+      if (val.startsWith("http://") || val.startsWith("https://")) {
+        // интересует всё, где встречается record/rec и/или аудиорасширения
+        if (/\b(record|rec|recording|audio|file|link)\b/i.test(key) || /\.(mp3|wav|ogg)(\?|$)/i.test(val)) {
+          pushUrl(val);
         }
-      } catch (e) {
-        report.push(`• ${ep} [${av.name}] → error: ${e.message}`);
       }
+
+      // Поля с id записи
+      if (/\b(record(_?id)?|rec_id|file_id)\b/i.test(key)) pushId(val);
+
+      // Подсказки (например, "link", "url", без расширений)
+      if ((/link|url|file/i.test(key)) && val) info.hints.push(`${k}: ${val}`);
     }
   }
-  await sendTG(report.join("\n"));
-  res.status(502).json({ ok: false, msg: "no working combo found yet" });
-});
 
-/* ---------- UNIVERSAL WEBHOOK HANDLER ---------- */
-async function handler(req, res) {
+  // Удалим дубли
+  info.urls = Array.from(new Set(info.urls));
+  info.ids  = Array.from(new Set(info.ids));
+  info.hints = Array.from(new Set(info.hints));
+  return info;
+}
+
+/** Готовим красивый текст для Telegram */
+function formatTgMessage(normalized) {
+  const { type, callId, direction, telnum, phone, ext, from, to, recordInfo, raw } = normalized;
+
+  const typePretty = {
+    RINGING: "📳 RINGING (звонит)",
+    ACCEPTED: "✅ ACCEPTED (принят)",
+    HANGUP: "⛔️ HANGUP (завершён)",
+    MISSED: "❌ MISSED (пропущен)",
+    RECORD: "🎙️ RECORD",
+    RECORD_READY: "🎙️ RECORD_READY",
+    FINISHED: "🏁 FINISHED"
+  }[String(type).toUpperCase()] || `🔔 ${type}`;
+
+  const lines = [
+    "📞 <b>MegaPBX → Webhook</b>",
+    `• Событие: <b>${typePretty}</b>`,
+    `• CallID: <code>${callId}</code>`,
+    `• Направление: <code>${direction}</code>`,
+    `• От: <code>${from}</code> → Кому: <code>${to}</code>`,
+    `• Наш номер (telnum): <code>${telnum}</code>`,
+    `• Внутр. (ext): <code>${ext}</code>`
+  ];
+
+  // Добавим инфо о записи, если есть
+  if (recordInfo.urls.length) {
+    lines.push("", "🎧 <b>Запись:</b>");
+    for (const u of recordInfo.urls.slice(0, 5)) lines.push(`• ${u}`);
+  } else if (recordInfo.ids.length) {
+    lines.push("", "🎧 <b>Идентификаторы записи:</b>");
+    for (const id of recordInfo.ids.slice(0, 5)) lines.push(`• <code>${id}</code>`);
+  } else if (recordInfo.hints.length) {
+    lines.push("", "🎧 <b>Подсказки по записи:</b>");
+    for (const h of recordInfo.hints.slice(0, 5)) lines.push(`• <code>${h}</code>`);
+  }
+
+  // Сырая нагрузка — последней строкой (укороченная)
+  lines.push("", "<i>Raw:</i>", `<code>${safeStr(raw)}</code>`);
+
+  return lines.join("\n");
+}
+
+/* -------------------- security -------------------- */
+/** Проверяем общий ключ — берём из заголовков/квери/тела */
+function getIncomingKey(req) {
+  return (
+    req.headers["x-api-key"] ||
+    req.headers["x-crm-key"] ||
+    req.headers["x-auth-token"] ||
+    req.headers["authorization"] ||
+    req.query?.key ||
+    (typeof req.body === "object" ? req.body.crm_token : undefined)
+  );
+}
+
+/* -------------------- routes -------------------- */
+
+/** Health */
+app.get("/", (_, res) => res.send("OK"));
+
+/** Основной вебхук MegaPBX (им удобно слать на корень или /megafon) */
+app.all(["/megafon", "/"], async (req, res, next) => {
+  if (req.method === "GET") return next(); // GET на корень пусть обрабатывает ниже
   try {
-    const method  = req.method;
-    const path    = req.path || req.url || "/";
-    const headers = req.headers || {};
-    const query   = req.query || {};
-    const body    = typeof req.body === "undefined" ? {} : req.body;
-
-    const gotKey =
-      headers["x-crm-key"] ||
-      headers["x-auth-token"] ||
-      headers["authorization"] ||
-      query.key;
-    if (CRM_SHARED_KEY && gotKey && String(gotKey) !== String(CRM_SHARED_KEY)) {
+    // Авторизация по общему ключу (если задан)
+    const inKey = getIncomingKey(req);
+    if (CRM_SHARED_KEY && inKey && String(inKey) !== String(CRM_SHARED_KEY)) {
       return res.status(401).send("bad key");
     }
 
-    const event =
-      (typeof body === "object" ? (body.event || body.command || body.type) : undefined) ||
-      query.event ||
-      "unknown";
-    const callId =
-      (typeof body === "object" ? (body.call_id || body.uuid) : undefined) ||
-      query.call_id ||
-      "-";
-    const from =
-      (typeof body === "object" ? body.from : undefined) ||
-      query.from ||
-      "-";
-    const to =
-      (typeof body === "object" ? body.to : undefined) ||
-      query.to ||
-      "-";
-    const ext =
-      (typeof body === "object" ? (body.employee_ext || body.ext || body.agent) : undefined) ||
-      query.ext ||
-      "-";
-    const recordUrl =
-      (typeof body === "object" ? (body.record_url || body.recordUrl) : undefined) ||
-      query.record_url;
-    const recordId =
-      (typeof body === "object" ? (body.record_id || body.recordId) : undefined) ||
-      query.record_id;
+    const normalized = normalizeMegafon(req.body, req.headers, req.query);
+    const msg = formatTgMessage(normalized);
+    await sendTG(msg);
 
-    const lines = [
-      "📞 <b>MegaPBX → CRM webhook</b>",
-      `• Method: <code>${method}</code>`,
-      `• Path: <code>${path}</code>`,
-      `• Event: <code>${event}</code>`,
-      `• CallID: <code>${callId}</code>`,
-      `• From: <code>${from}</code> → To: <code>${to}</code>`,
-      `• Ext: <code>${ext}</code>`,
-      recordUrl ? `• record_url: ${recordUrl}` : "",
-      recordId ? `• record_id: <code>${recordId}</code>` : "",
-      "",
-      "<b>Headers</b>:\n<code>" + safeStr(headers) + "</code>",
-      "",
-      "<b>Query</b>:\n<code>" + safeStr(query) + "</code>",
-      "",
-      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>"
-    ].filter(Boolean);
-
-    await sendTG(lines.join("\n"));
-    res.json({ ok: true });
+    // Если вдруг запись найдена — можно дополнительно пометить OK
+    const hasRecord = normalized.recordInfo.urls.length || normalized.recordInfo.ids.length;
+    res.json({ ok: true, got: normalized.type, callId: normalized.callId, hasRecord: !!hasRecord });
   } catch (e) {
-    try { await sendTG(`❗️ <b>Error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
+    try { await sendTG(`❗️ <b>Webhook error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
     res.status(500).send("server error");
   }
-}
+});
 
-/* ---------- health ---------- */
-app.get("/", (_, res) => res.send("OK"));
+/** Диагностика: показать, что сервер принимает и JSON, и форму */
+app.post("/megafon/test", async (req, res) => {
+  const normalized = normalizeMegafon(req.body, req.headers, req.query);
+  const msg = formatTgMessage(normalized);
+  await sendTG("🧪 <b>TEST post</b>\n\n" + msg);
+  res.json({ ok: true, test: true });
+});
 
-/* ---------- catch-all AFTER special routes ---------- */
-app.all("*", handler);
+/** Фоллбэк-логгер на все остальные пути (заголовки/квери/тело) */
+app.all("*", async (req, res) => {
+  try {
+    const body = typeof req.body === "undefined" ? {} : req.body;
+    const lines = [
+      "📞 <b>MegaPBX → CRM webhook</b>",
+      `• Method: <code>${req.method}</code>`,
+      `• Path: <code>${req.path || req.url || "/"}</code>`,
+      "",
+      "<b>Headers</b>:\n<code>" + safeStr(req.headers) + "</code>",
+      "",
+      "<b>Query</b>:\n<code>" + safeStr(req.query || {}) + "</code>",
+      "",
+      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>"
+    ];
+    await sendTG(lines.join("\n"));
+    res.json({ ok: true, note: "fallback handler" });
+  } catch (e) {
+    try { await sendTG(`❗️ <b>Fallback error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
+    res.status(500).send("server error");
+  }
+});
 
-/* ---------- listen ---------- */
+/* -------------------- listen -------------------- */
 app.listen(process.env.PORT || 3000, () => {
   console.log("listening on", process.env.PORT || 3000);
 });

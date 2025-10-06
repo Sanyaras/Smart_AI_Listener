@@ -1,9 +1,8 @@
-// index.js — VPS edition + автодеплой по GitHub webhook
+// index.js — Railway edition (Git-only deploy)
 
 import express from "express";
 import bodyParser from "body-parser";
 import crypto from "crypto";
-import { exec } from "child_process";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
 /* -------- fetch/FormData/Blob polyfill for Node < 18 -------- */
@@ -18,7 +17,6 @@ if (typeof fetch !== "function") {
 const app = express();
 
 /* --- parsers --- */
-// сохраняем сырое тело для валидации подписи GitHub (X-Hub-Signature-256)
 app.use(bodyParser.json({
   limit: "3mb",
   verify: (req, res, buf) => { req.rawBody = buf; }
@@ -36,16 +34,8 @@ app.use(bodyParser.text({
 const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID     = process.env.TG_CHAT_ID || "";
 const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // ключ для Whisper
-
-// автодеплой
-const DEPLOY_SECRET = process.env.DEPLOY_SECRET || "";                 // тот же секрет укажешь в GitHub webhook
-const REPO_DIR      = process.env.REPO_DIR || "/opt/Smart_AI_Listener"; // где лежит репо на сервере
-const GIT_BRANCH    = process.env.GIT_BRANCH || "main";
-const PM2_NAME      = process.env.PM2_NAME || "smart-listener";
-
-// поведение
-const AUTO_TRANSCRIBE = process.env.AUTO_TRANSCRIBE === "1";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // для Whisper (опц.)
+const AUTO_TRANSCRIBE = process.env.AUTO_TRANSCRIBE === "1"; // по умолчанию 0 на Railway
 
 /* -------------------- utils -------------------- */
 function chunkText(str, max = 3500) {
@@ -91,7 +81,7 @@ async function sendTGDocument(fileUrl, caption = "") {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       chat_id: TG_CHAT_ID,
-      document: fileUrl, // Telegram сам скачает
+      document: fileUrl, // Telegram сам попробует скачать
       caption,
       parse_mode: "HTML",
       disable_content_type_detection: false
@@ -101,18 +91,14 @@ async function sendTGDocument(fileUrl, caption = "") {
   return true;
 }
 
-/* --- Railway-aware обёртка URL записи через наш relay --- */
+/* --- Railway-aware обёртка записи (используем только если задан RELAY_BASE_URL) --- */
 function wrapRecordingUrl(url) {
-  const onRailway =
-    process.env.RAILWAY_ENVIRONMENT ||
-    process.env.RAILWAY_STATIC_URL ||
-    process.env.RAILWAY_PUBLIC_DOMAIN;
-  if (!onRailway) return url; // на VPS — не трогаем
-
-  const relayBase = process.env.RELAY_BASE_URL || "http://87.228.115.134:4010/fetch/rec.mp3?url=";
+  const relayBase = process.env.RELAY_BASE_URL; // напр. "https://relay.example/fetch/rec.mp3?url="
+  if (!relayBase) return url;
   try {
     const u = new URL(url);
-    if (u.hostname === "87.228.115.134" && (u.port === "4010" || u.port === "")) return url;
+    const rb = new URL(relayBase);
+    if (u.hostname === rb.hostname && u.port === rb.port) return url; // уже обёрнут
   } catch {}
   return relayBase + encodeURIComponent(url);
 }
@@ -198,7 +184,7 @@ function formatTgMessage(n) {
   return lines.join("\n");
 }
 
-/* -------------------- транскрибация -------------------- */
+/* -------------------- транскрибация (выключена по умолчанию) -------------------- */
 async function transcribeAudioFromUrl(fileUrl, meta = {}) {
   if (!OPENAI_API_KEY) {
     await sendTG("⚠️ <b>OPENAI_API_KEY не задан</b> — пропускаю транскрибацию.");
@@ -222,17 +208,11 @@ async function transcribeAudioFromUrl(fileUrl, meta = {}) {
     form.append("language", "ru");
     form.append("response_format", "text");
 
-    let resp;
-    try {
-      resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-        body: form
-      });
-    } catch (e) {
-      await sendTG(`❗️ Ошибка запроса в OpenAI (network): <code>${e?.message || e}</code>`);
-      return null;
-    }
+    const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: form
+    });
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
       await sendTG(`❗️ Whisper ошибка: HTTP <code>${resp.status}</code>\n<code>${errText.slice(0,1000)}</code>`);
@@ -260,10 +240,10 @@ function getIncomingKey(req) {
 
 /* -------------------- routes -------------------- */
 app.get("/", (_, res) => res.send("OK"));
-app.get("/version", (_, res) => res.json({ version: "vps-autodeploy-1.0.0" }));
+app.get("/version", (_, res) => res.json({ version: "railway-1.0.0" }));
 
 app.get("/tg/ping", async (req, res) => {
-  const text = req.query.msg || "ping-from-server";
+  const text = req.query.msg || "ping-from-railway";
   const ok = await sendTG("🔧 " + text);
   res.json({ ok });
 });
@@ -302,8 +282,6 @@ app.get("/diag/env", (req, res) => {
     TG_CHAT_ID: process.env.TG_CHAT_ID ? (String(process.env.TG_CHAT_ID).slice(0,4) + "...") : "",
     OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
     CRM_SHARED_KEY: !!process.env.CRM_SHARED_KEY,
-    DEPLOY_SECRET: !!process.env.DEPLOY_SECRET,
-    REPO_DIR, GIT_BRANCH, PM2_NAME,
     AUTO_TRANSCRIBE
   });
 });
@@ -322,7 +300,7 @@ app.all(["/megafon", "/"], async (req, res, next) => {
 
     const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg)(\?|$)/i.test(u));
     if (firstAudio) {
-      const wrapped = wrapRecordingUrl(firstAudio);   // Railway-safe ссылка
+      const wrapped = wrapRecordingUrl(firstAudio);
 
       const cap = `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
                   `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
@@ -384,63 +362,6 @@ app.all("*", async (req, res) => {
   }
 });
 
-/* -------------------- GitHub webhook /deploy -------------------- */
-function verifyGithubSignature(req, secret) {
-  const sig = req.headers["x-hub-signature-256"];
-  if (!sig || !sig.startsWith("sha256=")) return false;
-  const h = crypto.createHmac("sha256", secret);
-  const raw = req.rawBody || JSON.stringify(req.body);
-  const digest = "sha256=" + h.update(raw).digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(digest));
-}
-
-app.post("/deploy", async (req, res) => {
-  try {
-    if (!DEPLOY_SECRET) {
-      return res.status(400).json({ ok: false, error: "DEPLOY_SECRET не задан" });
-    }
-    if (!verifyGithubSignature(req, DEPLOY_SECRET)) {
-      await sendTG("❗️ GitHub webhook: неверная подпись");
-      return res.status(401).json({ ok: false, error: "bad signature" });
-    }
-
-    const branch = req.body?.ref?.split("/").pop();
-    if (branch !== GIT_BRANCH) {
-      await sendTG(`⚠️ Webhook: branch <code>${branch}</code> ≠ <code>${GIT_BRANCH}</code>`);
-      return res.status(200).json({ ok: true, note: "branch skip" });
-    }
-
-    await sendTG("🚀 GitHub webhook: деплой запускается…");
-
-    const cmd = [
-      `cd ${REPO_DIR}`,
-      `git fetch --all`,
-      `git reset --hard origin/${GIT_BRANCH}`,
-      `npm install --production`,
-      `pm2 restart ${PM2_NAME}`
-    ].join(" && ");
-
-    exec(cmd, { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }, async (err, stdout, stderr) => {
-      if (err) {
-        await sendTG("❗️ Ошибка деплоя:\n<code>" + safeStr(stderr || err.message || err) + "</code>");
-        return res.status(500).json({ ok: false, error: "deploy failed", details: safeStr(stderr || err) });
-      }
-      await sendTG("✅ Деплой завершён:\n<code>" + safeStr(stdout) + "</code>");
-      res.json({ ok: true, stdout });
-    });
-  } catch (e) {
-    await sendTG("❗️ Ошибка /deploy:\n<code>" + safeStr(e) + "</code>");
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-export default app;
-
-/* -------------------- start server -------------------- */
-const PORT = Number(process.env.PORT || 3000);
-const HOST = process.env.HOST || "0.0.0.0";
-if (process.env.NO_LISTEN !== "1") {
-  app.listen(PORT, HOST, () => {
-    console.log(`Smart AI Listener up at http://${HOST}:${PORT}`);
-  });
-}
+/* -------------------- start server (Railway uses PORT) -------------------- */
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Smart AI Listener (Railway) on :${PORT}`));

@@ -520,4 +520,47 @@ app.all("*", async (req, res) => {
 
 /* -------------------- start server (Railway uses PORT) -------------------- */
 const PORT = process.env.PORT || 3000;
+/* -------------------- auto Telegram webhook setup -------------------- */
+async function setupTelegramWebhook() {
+  try {
+    if (!TG_BOT_TOKEN) {
+      console.warn("❌ TG_BOT_TOKEN отсутствует, пропускаем setWebhook");
+      return;
+    }
+
+    // URL Railway-проекта
+    const baseUrl = process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_URL || process.env.RAILWAY_PROJECT_URL;
+    if (!baseUrl) {
+      console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука");
+      return;
+    }
+
+    // Путь вебхука (используем реальный секрет из ENV)
+const secret = TG_WEBHOOK_SECRET || "hook12345";
+const base = (process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_URL || process.env.RAILWAY_PROJECT_URL || "").replace(/\/+$/,"");
+if (!base) {
+  console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука");
+  return;
+}
+const webhookUrl = `${base}/tg/${secret}`;
+
+const resp = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ url: webhookUrl, secret_token: secret }),
+});
+
+    const data = await resp.json();
+    if (data.ok) {
+      console.log(`✅ Telegram webhook установлен: ${webhookUrl}`);
+    } else {
+      console.error("❌ Ошибка установки вебхука:", data);
+    }
+  } catch (e) {
+    console.error("❗ Ошибка setupTelegramWebhook:", e);
+  }
+}
+
+// Запускаем установку при старте
+setupTelegramWebhook();
 app.listen(PORT, () => console.log(`Smart AI Listener (${VERSION}) on :${PORT}`));

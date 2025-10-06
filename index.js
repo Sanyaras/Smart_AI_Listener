@@ -6,6 +6,14 @@ import crypto from "crypto";
 import { exec } from "child_process";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
+/* -------- fetch/FormData/Blob polyfill for Node < 18 -------- */
+if (typeof fetch !== "function") {
+  const { fetch, FormData, Blob } = await import("undici");
+  globalThis.fetch = fetch;
+  globalThis.FormData = FormData;
+  globalThis.Blob = Blob;
+}
+
 /* -------------------- app -------------------- */
 const app = express();
 
@@ -35,6 +43,9 @@ const DEPLOY_SECRET = process.env.DEPLOY_SECRET || "";                 // тот
 const REPO_DIR      = process.env.REPO_DIR || "/opt/Smart_AI_Listener"; // где лежит репо на сервере
 const GIT_BRANCH    = process.env.GIT_BRANCH || "main";
 const PM2_NAME      = process.env.PM2_NAME || "smart-listener";
+
+// поведение
+const AUTO_TRANSCRIBE = process.env.AUTO_TRANSCRIBE === "1";
 
 /* -------------------- utils -------------------- */
 function chunkText(str, max = 3500) {
@@ -98,10 +109,9 @@ function wrapRecordingUrl(url) {
     process.env.RAILWAY_PUBLIC_DOMAIN;
   if (!onRailway) return url; // на VPS — не трогаем
 
-  const relayBase = "http://87.228.115.134:4010/fetch/rec.mp3?url=";
+  const relayBase = process.env.RELAY_BASE_URL || "http://87.228.115.134:4010/fetch/rec.mp3?url=";
   try {
     const u = new URL(url);
-    // если уже наш relay — не оборачиваем повторно
     if (u.hostname === "87.228.115.134" && (u.port === "4010" || u.port === "")) return url;
   } catch {}
   return relayBase + encodeURIComponent(url);
@@ -293,7 +303,8 @@ app.get("/diag/env", (req, res) => {
     OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
     CRM_SHARED_KEY: !!process.env.CRM_SHARED_KEY,
     DEPLOY_SECRET: !!process.env.DEPLOY_SECRET,
-    REPO_DIR, GIT_BRANCH, PM2_NAME
+    REPO_DIR, GIT_BRANCH, PM2_NAME,
+    AUTO_TRANSCRIBE
   });
 });
 
@@ -318,27 +329,30 @@ app.all(["/megafon", "/"], async (req, res, next) => {
                   `ext: <code>${normalized.ext}</code>`;
       await sendTGDocument(wrapped, cap);
 
-      (async () => {
-        const text = await transcribeAudioFromUrl(wrapped, { callId: normalized.callId });
-        if (text && text.length) {
-          await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
-          for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
-          try {
-            const qa = await analyzeTranscript(text, {
-              callId: normalized.callId,
-              ext: normalized.ext,
-              direction: normalized.direction,
-              from: normalized.from,
-              to: normalized.to,
-              brand: process.env.CALL_QA_BRAND || ""
-            });
-            const card = formatQaForTelegram(qa);
-            await sendTG(card);
-          } catch (e) {
-            await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>");
+      // 🔕 транскрибация отключена по умолчанию (включится, если AUTO_TRANSCRIBE=1)
+      if (AUTO_TRANSCRIBE) {
+        (async () => {
+          const text = await transcribeAudioFromUrl(wrapped, { callId: normalized.callId });
+          if (text && text.length) {
+            await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
+            for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
+            try {
+              const qa = await analyzeTranscript(text, {
+                callId: normalized.callId,
+                ext: normalized.ext,
+                direction: normalized.direction,
+                from: normalized.from,
+                to: normalized.to,
+                brand: process.env.CALL_QA_BRAND || ""
+              });
+              const card = formatQaForTelegram(qa);
+              await sendTG(card);
+            } catch (e) {
+              await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>");
+            }
           }
-        }
-      })();
+        })();
+      }
     }
 
     res.json({ ok: true, type: normalized.type, callId: normalized.callId, hasAudio: !!firstAudio });
@@ -390,7 +404,6 @@ app.post("/deploy", async (req, res) => {
       return res.status(401).json({ ok: false, error: "bad signature" });
     }
 
-    // Можно добавить доп.проверки по содержимому webhook (ветка, repo и т.д.)
     const branch = req.body?.ref?.split("/").pop();
     if (branch !== GIT_BRANCH) {
       await sendTG(`⚠️ Webhook: branch <code>${branch}</code> ≠ <code>${GIT_BRANCH}</code>`);
@@ -399,16 +412,15 @@ app.post("/deploy", async (req, res) => {
 
     await sendTG("🚀 GitHub webhook: деплой запускается…");
 
-    // Готовим команду деплоя (pull и рестарт pm2)
     const cmd = [
       `cd ${REPO_DIR}`,
       `git fetch --all`,
       `git reset --hard origin/${GIT_BRANCH}`,
       `npm install --production`,
-      `pm2 restart ${PM2_NAME}`,
+      `pm2 restart ${PM2_NAME}`
     ].join(" && ");
 
-    exec(cmd, async (err, stdout, stderr) => {
+    exec(cmd, { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }, async (err, stdout, stderr) => {
       if (err) {
         await sendTG("❗️ Ошибка деплоя:\n<code>" + safeStr(stderr || err.message || err) + "</code>");
         return res.status(500).json({ ok: false, error: "deploy failed", details: safeStr(stderr || err) });
@@ -423,3 +435,12 @@ app.post("/deploy", async (req, res) => {
 });
 
 export default app;
+
+/* -------------------- start server -------------------- */
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || "0.0.0.0";
+if (process.env.NO_LISTEN !== "1") {
+  app.listen(PORT, HOST, () => {
+    console.log(`Smart AI Listener up at http://${HOST}:${PORT}`);
+  });
+}

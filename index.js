@@ -1,8 +1,7 @@
-// index.js — Railway edition (Git-only deploy)
+// index.js — Railway edition: MegaPBX → TG (file upload), no VPS
 
 import express from "express";
 import bodyParser from "body-parser";
-import crypto from "crypto";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
 /* -------------------- app -------------------- */
@@ -27,7 +26,9 @@ const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID     = process.env.TG_CHAT_ID || "";
 const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // для Whisper (опц.)
-const AUTO_TRANSCRIBE = process.env.AUTO_TRANSCRIBE === "1"; // по умолчанию 0 на Railway
+const AUTO_TRANSCRIBE = process.env.AUTO_TRANSCRIBE === "1"; // по умолчанию 0
+const SHOW_CONTACT_EVENTS = process.env.SHOW_CONTACT_EVENTS === "1"; // скрываем contact по умолчанию
+const RELAY_BASE_URL = process.env.RELAY_BASE_URL || ""; // если нужно проксировать запись через РФ
 
 /* -------------------- utils -------------------- */
 function chunkText(str, max = 3500) {
@@ -36,11 +37,20 @@ function chunkText(str, max = 3500) {
   while (i < str.length) { out.push(str.slice(i, i + max)); i += max; }
   return out;
 }
+function cap(s, n = 2000) {
+  const t = String(s ?? "");
+  return t.length > n ? t.slice(0, n) + "…[cut]" : t;
+}
 function safeStr(obj) {
   try {
-    if (typeof obj === "string") return obj.slice(0, 3500);
-    return JSON.stringify(obj, null, 2).slice(0, 3500);
+    if (typeof obj === "string") return cap(obj, 3500);
+    return cap(JSON.stringify(obj, null, 2), 3500);
   } catch { return "[unserializable]"; }
+}
+function fmtPhone(p) {
+  if (!p) return "-";
+  const s = String(p).trim();
+  return s.startsWith("+") ? s : ("+" + s);
 }
 function prettyType(type) {
   const t = String(type).toUpperCase();
@@ -51,7 +61,8 @@ function prettyType(type) {
     COMPLETED: "🔔 COMPLETED",
     HANGUP: "⛔️ HANGUP (завершён)",
     MISSED: "❌ MISSED (пропущен)",
-    HISTORY: "🗂 HISTORY (итоги/запись)"
+    HISTORY: "🗂 HISTORY (итоги/запись)",
+    CANCELLED: "🚫 CANCELLED (отменён)"
   }[t] || `🔔 ${type}`);
 }
 async function sendTG(text) {
@@ -71,28 +82,71 @@ async function sendTGDocument(fileUrl, caption = "") {
   const resp = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      chat_id: TG_CHAT_ID,
-      document: fileUrl, // Telegram сам попробует скачать
-      caption,
-      parse_mode: "HTML",
-      disable_content_type_detection: false
-    })
+    body: JSON.stringify({ chat_id: TG_CHAT_ID, document: fileUrl, caption, parse_mode: "HTML" })
   });
   if (!resp.ok) { console.error("sendTGDocument error:", resp.status, await resp.text().catch(()=>'')); return false; }
   return true;
 }
 
-/* --- Railway-aware обёртка записи (используем только если задан RELAY_BASE_URL) --- */
+const TG_FILE_MAX = 50 * 1024 * 1024; // ~50MB лимит бота
+
+async function sendTGDocumentFromUrl(fileUrl, caption = "", fileNameHint = "record.mp3") {
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return false;
+
+  // 1) скачиваем запись на Railway
+  let resp;
+  try {
+    resp = await fetch(fileUrl, { redirect: "follow" });
+  } catch (e) {
+    await sendTG(`❗️ Не удалось скачать запись:\n<code>${String(e)}</code>\n${fileUrl}`);
+    return false;
+  }
+  if (!resp.ok) {
+    const txt = await resp.text().catch(()=> "");
+    await sendTG(`❗️ Ошибка скачивания записи: HTTP <code>${resp.status}</code>\n<code>${cap(txt,500)}</code>`);
+    return false;
+  }
+  const buf = await resp.arrayBuffer();
+  if (buf.byteLength > TG_FILE_MAX) {
+    await sendTG(`⚠️ Файл ${(buf.byteLength/1024/1024).toFixed(1)}MB больше лимита (~50MB). Шлю ссылкой.`);
+    return sendTGDocument(fileUrl, caption);
+  }
+
+  // 2) имя файла
+  let filename = fileNameHint || "record.mp3";
+  try {
+    const u = new URL(fileUrl);
+    const last = decodeURIComponent(u.pathname.split("/").pop() || "");
+    if (last) filename = last;
+  } catch {}
+
+  // 3) загружаем в Telegram как multipart
+  const form = new FormData();
+  form.append("chat_id", TG_CHAT_ID);
+  form.append("caption", caption);
+  form.append("parse_mode", "HTML");
+  form.append("document", new Blob([buf]), filename);
+
+  const api = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
+  const send = await fetch(api, { method: "POST", body: form });
+  if (!send.ok) {
+    const t = await send.text().catch(()=> "");
+    console.error("sendTGDocumentFromUrl error:", send.status, t);
+    await sendTG(`❗️ Ошибка отправки файла в ТГ: HTTP <code>${send.status}</code>\n<code>${cap(t,500)}</code>`);
+    return false;
+  }
+  return true;
+}
+
+/* --- relay wrapper (используем только если задан RELAY_BASE_URL) --- */
 function wrapRecordingUrl(url) {
-  const relayBase = process.env.RELAY_BASE_URL; // напр. "https://relay.example/fetch/rec.mp3?url="
-  if (!relayBase) return url;
+  if (!RELAY_BASE_URL) return url;
   try {
     const u = new URL(url);
-    const rb = new URL(relayBase);
+    const rb = new URL(RELAY_BASE_URL);
     if (u.hostname === rb.hostname && u.port === rb.port) return url; // уже обёрнут
   } catch {}
-  return relayBase + encodeURIComponent(url);
+  return RELAY_BASE_URL + encodeURIComponent(url);
 }
 
 /* -------------------- MegaPBX normalizer -------------------- */
@@ -133,6 +187,8 @@ function normalizeMegafon(body, headers = {}, query = {}) {
   const telnum = b.telnum || b.to || query.telnum || query.to || "-";
   const phone  = b.phone  || b.from || query.phone  || query.from || "-";
   const ext    = b.ext || b.employee_ext || b.agent || query.ext || "-";
+  const diversion = b.diversion || query.diversion || "-";
+  const user = b.user || b.agent || b.employee || query.user || "-";
   let from = "-", to = "-";
   if (direction === "out")      { from = telnum; to = phone; }
   else if (direction === "in")  { from = phone; to = telnum; }
@@ -144,7 +200,7 @@ function normalizeMegafon(body, headers = {}, query = {}) {
     wait: b.wait ? String(b.wait) : undefined,
     start: b.start || b.ts_start || undefined
   };
-  return { type, cmd, callId, direction, telnum, phone, ext, from, to, recordInfo, extra, raw: b, headers, query };
+  return { type, cmd, callId, direction, telnum, phone, ext, from, to, recordInfo, extra, user, diversion, raw: b, headers, query };
 }
 function formatTgMessage(n) {
   const lines = [
@@ -152,10 +208,12 @@ function formatTgMessage(n) {
     `• Событие: <b>${prettyType(n.type)}</b>`,
     `• CallID: <code>${n.callId}</code>`,
     `• Направление: <code>${n.direction || "-"}</code>`,
-    `• От: <code>${n.from}</code> → Кому: <code>${n.to}</code>`,
-    `• Наш номер (telnum): <code>${n.telnum}</code>`,
+    `• От: ${fmtPhone(n.from)} → Кому: ${fmtPhone(n.to)}`,
+    `• Наш номер (telnum): ${fmtPhone(n.telnum)}`,
     `• Внутр. (ext): <code>${n.ext}</code>`
   ];
+  if (n.user && n.user !== "-")       lines.push(`• Оператор (user): <code>${n.user}</code>`);
+  if (n.diversion && n.diversion !== "-") lines.push(`• Diversion: ${fmtPhone(n.diversion)}`);
   const extras = [];
   if (n.extra) {
     const { status, duration, wait, start } = n.extra;
@@ -207,7 +265,7 @@ async function transcribeAudioFromUrl(fileUrl, meta = {}) {
     });
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
-      await sendTG(`❗️ Whisper ошибка: HTTP <code>${resp.status}</code>\n<code>${errText.slice(0,1000)}</code>`);
+      await sendTG(`❗️ Whisper ошибка: HTTP <code>${resp.status}</code>\n<code>${cap(errText,1000)}</code>`);
       return null;
     }
     const text = await resp.text();
@@ -232,7 +290,7 @@ function getIncomingKey(req) {
 
 /* -------------------- routes -------------------- */
 app.get("/", (_, res) => res.send("OK"));
-app.get("/version", (_, res) => res.json({ version: "railway-1.0.0" }));
+app.get("/version", (_, res) => res.json({ version: "railway-1.1.0" }));
 
 app.get("/tg/ping", async (req, res) => {
   const text = req.query.msg || "ping-from-railway";
@@ -259,101 +317,4 @@ app.get("/probe-url", async (req, res) => {
 });
 
 app.get("/diag/openai", async (req, res) => {
-  if (!OPENAI_API_KEY) return res.status(200).json({ ok:false, note:"OPENAI_API_KEY not set" });
-  try {
-    const r = await fetch("https://api.openai.com/v1/models", {
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
-    });
-    const body = await r.text();
-    res.status(r.status).send(body);
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
-app.get("/diag/env", (req, res) => {
-  res.json({
-    TG_BOT_TOKEN: !!process.env.TG_BOT_TOKEN,
-    TG_CHAT_ID: process.env.TG_CHAT_ID ? (String(process.env.TG_CHAT_ID).slice(0,4) + "...") : "",
-    OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
-    CRM_SHARED_KEY: !!process.env.CRM_SHARED_KEY,
-    AUTO_TRANSCRIBE
-  });
-});
-
-app.all(["/megafon", "/"], async (req, res, next) => {
-  if (req.method === "GET") return next();
-  try {
-    const inKey = getIncomingKey(req);
-if (CRM_SHARED_KEY && String(inKey) !== String(CRM_SHARED_KEY)) {
-  return res.status(401).send("bad key");
-}
-    const normalized = normalizeMegafon(req.body, req.headers, req.query);
-    const msg = formatTgMessage(normalized);
-    await sendTG(msg);
-
-    const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg)(\?|$)/i.test(u));
-    if (firstAudio) {
-      const wrapped = wrapRecordingUrl(firstAudio);
-
-      const cap = `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
-                  `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
-                  `ext: <code>${normalized.ext}</code>`;
-      await sendTGDocument(wrapped, cap);
-
-      // 🔕 транскрибация отключена по умолчанию (включится, если AUTO_TRANSCRIBE=1)
-      if (AUTO_TRANSCRIBE) {
-        (async () => {
-          const text = await transcribeAudioFromUrl(wrapped, { callId: normalized.callId });
-          if (text && text.length) {
-            await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
-            for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
-            try {
-              const qa = await analyzeTranscript(text, {
-                callId: normalized.callId,
-                ext: normalized.ext,
-                direction: normalized.direction,
-                from: normalized.from,
-                to: normalized.to,
-                brand: process.env.CALL_QA_BRAND || ""
-              });
-              const card = formatQaForTelegram(qa);
-              await sendTG(card);
-            } catch (e) {
-              await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>");
-            }
-          }
-        })();
-      }
-    }
-
-    res.json({ ok: true, type: normalized.type, callId: normalized.callId, hasAudio: !!firstAudio });
-  } catch (e) {
-    try { await sendTG(`❗️ <b>Webhook error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
-    res.status(500).send("server error");
-  }
-});
-
-app.all("*", async (req, res) => {
-  try {
-    const body = typeof req.body === "undefined" ? {} : req.body;
-    const lines = [
-      "📞 <b>MegaPBX → CRM webhook</b>",
-      `• Method: <code>${req.method}</code>`,
-      `• Path: <code>${req.path || req.url || "/"}</code>`,
-      "",
-      "<b>Headers</b>:\n<code>" + safeStr(req.headers) + "</code>",
-      "",
-      "<b>Query</b>:\n<code>" + safeStr(req.query || {}) + "</code>",
-      "",
-      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>"
-    ];
-    await sendTG(lines.join("\n"));
-    res.json({ ok: true, note: "fallback handler" });
-  } catch (e) {
-    try { await sendTG(`❗️ <b>Fallback error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
-    res.status(500).send("server error");
-  }
-});
-
-/* -------------------- start server (Railway uses PORT) -------------------- */
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Smart AI Listener (Railway) on :${PORT}`));
+  if (!OPENAI_API_KEY) return res.status(200).

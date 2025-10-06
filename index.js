@@ -5,14 +5,6 @@ import bodyParser from "body-parser";
 import crypto from "crypto";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
-/* -------- fetch/FormData/Blob polyfill for Node < 18 -------- */
-if (typeof fetch !== "function") {
-  const { fetch, FormData, Blob } = await import("undici");
-  globalThis.fetch = fetch;
-  globalThis.FormData = FormData;
-  globalThis.Blob = Blob;
-}
-
 /* -------------------- app -------------------- */
 const app = express();
 
@@ -267,6 +259,7 @@ app.get("/probe-url", async (req, res) => {
 });
 
 app.get("/diag/openai", async (req, res) => {
+  if (!OPENAI_API_KEY) return res.status(200).json({ ok:false, note:"OPENAI_API_KEY not set" });
   try {
     const r = await fetch("https://api.openai.com/v1/models", {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
@@ -290,10 +283,9 @@ app.all(["/megafon", "/"], async (req, res, next) => {
   if (req.method === "GET") return next();
   try {
     const inKey = getIncomingKey(req);
-    if (CRM_SHARED_KEY && inKey && String(inKey) !== String(CRM_SHARED_KEY)) {
-      return res.status(401).send("bad key");
-    }
-
+if (CRM_SHARED_KEY && String(inKey) !== String(CRM_SHARED_KEY)) {
+  return res.status(401).send("bad key");
+}
     const normalized = normalizeMegafon(req.body, req.headers, req.query);
     const msg = formatTgMessage(normalized);
     await sendTG(msg);

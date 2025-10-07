@@ -260,6 +260,61 @@ function pushEvent(ev) {
 }
 app.get("/diag/events", (_, res) => res.json({ count: LAST_EVENTS.length, items: LAST_EVENTS.slice().reverse() }));
 
+/* ---- metrics / tracking ---- */
+const STATS = {
+  total: 0,
+  byType: {},      // { INCOMING: n, ACCEPTED: n, ... }
+  byCmd: {},       // { event: n, contact: n, history: n }
+  withAudioUrl: 0,
+  withoutAudioUrl: 0,
+  errors: 0
+};
+
+const CALLS = new Map(); // callId -> { firstTs, lastTs, types:Set, lastType, hasAudio, awaitingHistory:boolean }
+
+function trackEvent(n) {
+  STATS.total++;
+  STATS.byType[n.type] = (STATS.byType[n.type] || 0) + 1;
+  const cmd = (n.cmd || "unknown");
+  STATS.byCmd[cmd] = (STATS.byCmd[cmd] || 0) + 1;
+
+  const hasAudio = (n.recordInfo?.urls?.length || 0) > 0;
+  if (hasAudio) STATS.withAudioUrl++; else STATS.withoutAudioUrl++;
+
+  const now = Date.now();
+  const slot = CALLS.get(n.callId) || { firstTs: now, types: new Set(), hasAudio: false, awaitingHistory: false };
+  slot.lastTs = now;
+  slot.lastType = n.type;
+  slot.types.add(n.type);
+  slot.hasAudio = slot.hasAudio || hasAudio;
+
+  if (n.type === "COMPLETED") slot.awaitingHistory = true;
+  if (String(n.type).toUpperCase() === "HISTORY") slot.awaitingHistory = false;
+
+  CALLS.set(n.callId, slot);
+}
+
+const HISTORY_TIMEOUT_MS = (parseInt(process.env.HISTORY_TIMEOUT_MIN || "7",10)) * 60 * 1000;
+setInterval(async () => {
+  const now = Date.now();
+  for (const [callId, slot] of CALLS.entries()) {
+    if (!slot.awaitingHistory) continue;
+    if (now - slot.lastTs > HISTORY_TIMEOUT_MS) {
+      try {
+        await sendTG(
+          `⏰ <b>HISTORY не пришёл вовремя</b>\n` +
+          `• CallID: <code>${callId}</code>\n` +
+          `• Последнее событие: <code>${slot.lastType}</code>\n` +
+          `• Прошло: ${(Math.round((now-slot.lastTs)/600)/100)} мин\n` +
+          `• Была ссылка на запись: <code>${slot.hasAudio ? "да" : "нет"}</code>`
+        );
+      } catch {}
+      slot.awaitingHistory = false; // чтобы не спамить
+      CALLS.set(callId, slot);
+    }
+  }
+}, 60 * 1000);
+
 /* -------------------- routes: diagnostics -------------------- */
 app.get("/", (_, res) => res.send("OK"));
 app.get("/version", (_, res) => res.json({ version: VERSION }));
@@ -273,6 +328,31 @@ app.get("/diag/env", (req, res) => {
     RELAY_BASE_URL: !!RELAY_BASE_URL, TG_WEBHOOK_SECRET: !!TG_WEBHOOK_SECRET,
     TG_UPLOAD_CHAT_ID: !!TG_UPLOAD_CHAT_ID, ROUTE_SECRET: TG_SECRET
   });
+});
+app.get("/diag/stats", (_, res) => {
+  res.json({
+    version: VERSION,
+    totals: STATS,
+    calls_tracked: CALLS.size,
+  });
+});
+
+app.get("/diag/calls", (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "100",10), 500);
+  const items = [];
+  for (const [id, s] of CALLS.entries()) {
+    items.push({
+      callId: id,
+      firstTs: s.firstTs,
+      lastTs: s.lastTs,
+      lastType: s.lastType,
+      types: Array.from(s.types),
+      hasAudio: s.hasAudio,
+      awaitingHistory: s.awaitingHistory
+    });
+  }
+  items.sort((a,b)=>b.lastTs - a.lastTs);
+  res.json({ count: items.length, items: items.slice(0, limit) });
 });
 app.get("/tg/ping", async (req, res) => { const text = req.query.msg || "ping-from-railway"; const ok = await sendTG("🔧 " + text); res.json({ ok }); });
 app.get("/probe-url", async (req, res) => {
@@ -376,6 +456,7 @@ app.all(["/megafon", "/"], async (req, res, next) => {
 
     const normalized = normalizeMegafon(req.body, req.headers, req.query);
     pushEvent({ kind: "megafon", callId: normalized.callId, type: normalized.type, cmd: normalized.cmd });
+    trackEvent(normalized);
 
     // мгновенный ответ
     res.json({ ok: true, type: normalized.type, callId: normalized.callId });
@@ -386,6 +467,15 @@ app.all(["/megafon", "/"], async (req, res, next) => {
         if (normalized.cmd === "contact" && !SHOW_CONTACT_EVENTS) return;
 
         await sendTG(formatTgMessage(normalized));
+        // HISTORY пришёл без прямой ссылки на запись — сигналим
+if (normalized.type === "HISTORY" && (!normalized.recordInfo?.urls?.length)) {
+  await sendTG(
+    "⚠️ HISTORY без ссылки на запись\n" +
+    `• CallID: <code>${normalized.callId}</code>\n` +
+    `• От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
+    `• ext: <code>${normalized.ext}</code>`
+  );
+}
 
         const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
         if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {

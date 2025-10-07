@@ -1,5 +1,5 @@
-// index.js — Railway: MegaPBX → Telegram + Telegram file ASR via TG relay (no VPS)
-// v1.4.0
+// index.js — Railway: MegaPBX → Telegram + Telegram relay ASR, non-blocking webhooks
+// v1.5.0
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -9,33 +9,24 @@ import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 const app = express();
 
 /* --- parsers --- */
-app.use(bodyParser.json({
-  limit: "25mb",
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
-app.use(bodyParser.urlencoded({
-  extended: false,
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
-app.use(bodyParser.text({
-  type: ["text/*", "application/octet-stream"],
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+app.use(bodyParser.json({ limit: "25mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
+app.use(bodyParser.urlencoded({ extended: false, verify: (req, res, buf) => { req.rawBody = buf; } }));
+app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"], verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 /* --- env --- */
-const TG_BOT_TOKEN        = process.env.TG_BOT_TOKEN || "";
-const TG_CHAT_ID          = process.env.TG_CHAT_ID || "";                   // куда слать уведомления/итоги
-const TG_WEBHOOK_SECRET   = process.env.TG_WEBHOOK_SECRET || "";            // секрет для пути вебхука
-const TG_SECRET           = (TG_WEBHOOK_SECRET || "hook12345").trim();      // единый секрет маршрута
-const CRM_SHARED_KEY      = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
-const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || "";               // Whisper
-const AUTO_TRANSCRIBE     = process.env.AUTO_TRANSCRIBE === "1";            // авто-ASR для MegaPBX
-const AUTO_TRANSCRIBE_VIA_TG = process.env.AUTO_TRANSCRIBE_VIA_TG === "1";  // релэй записи через Telegram
-const SHOW_CONTACT_EVENTS = process.env.SHOW_CONTACT_EVENTS === "1";        // скрывать contact по умолчанию
-const RELAY_BASE_URL      = process.env.RELAY_BASE_URL || "";               // если когда-то понадобится РФ-прокси
-const TG_DIRECT_FETCH     = process.env.TG_DIRECT_FETCH === "1";            // TG сам скачивает ссылку для превью
-const TG_UPLOAD_CHAT_ID   = process.env.TG_UPLOAD_CHAT_ID || TG_CHAT_ID;    // тихий чат для relay-загрузки
-const VERSION             = "railway-1.4.0";
+const TG_BOT_TOKEN            = process.env.TG_BOT_TOKEN || "";
+const TG_CHAT_ID              = process.env.TG_CHAT_ID || "";                           // чат для уведомлений
+const TG_WEBHOOK_SECRET       = process.env.TG_WEBHOOK_SECRET || "";                    // секрет пути вебхука
+const TG_SECRET               = (TG_WEBHOOK_SECRET || "hook12345").trim();              // фактический секрет
+const CRM_SHARED_KEY          = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
+const OPENAI_API_KEY          = process.env.OPENAI_API_KEY || "";                       // Whisper
+const AUTO_TRANSCRIBE         = process.env.AUTO_TRANSCRIBE === "1";
+const AUTO_TRANSCRIBE_VIA_TG  = process.env.AUTO_TRANSCRIBE_VIA_TG === "1";             // relay через Telegram
+const SHOW_CONTACT_EVENTS     = process.env.SHOW_CONTACT_EVENTS === "1";
+const RELAY_BASE_URL          = process.env.RELAY_BASE_URL || "";
+const TG_DIRECT_FETCH         = process.env.TG_DIRECT_FETCH === "1";                    // Telegram сам скачает ссылку
+const TG_UPLOAD_CHAT_ID       = process.env.TG_UPLOAD_CHAT_ID || TG_CHAT_ID;            // «тихий» чат для relay
+const VERSION                 = "railway-1.5.0";
 
 /* -------------------- utils -------------------- */
 function chunkText(str, max = 3500) { const out=[]; for (let i=0;i<str.length;i+=max) out.push(str.slice(i,i+max)); return out; }
@@ -49,7 +40,7 @@ async function fetchWithTimeout(url, opts = {}, ms = 12000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(new Error("timeout")), ms);
   try {
-    const headers = { "user-agent": "SmartAIListener/1.4 (+railway)", ...opts.headers };
+    const headers = { "user-agent": "SmartAIListener/1.5 (+railway)", ...opts.headers };
     return await fetch(url, { ...opts, headers, signal: ctrl.signal });
   } finally { clearTimeout(timer); }
 }
@@ -72,7 +63,7 @@ async function sendTGDocument(fileUrl, caption = "") {
   const resp = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: TG_CHAT_ID, document: fileUrl, caption, parse_mode: "HTML" })
+    body: JSON.stringify({ chat_id: TG_CHAT_ID, document: fileUrl, caption, parse_mode: "HTML", disable_content_type_detection: false })
   }, 15000);
   if (!resp.ok) { console.error("sendTGDocument error:", resp.status, await resp.text().catch(()=>'')); return false; }
   return true;
@@ -85,39 +76,15 @@ async function tgReply(chatId, text, extra = {}) {
   const r = await fetchWithTimeout(url, { method: "POST", headers: { "content-type":"application/json" }, body: JSON.stringify(body) }, 12000);
   return r.ok;
 }
-async function tgSendDocument(chatId, fileUrlOrStream, caption = "", filename) {
-  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
-  if (typeof fileUrlOrStream === "string") {
-    const r = await fetchWithTimeout(url, {
-      method: "POST",
-      headers: { "content-type":"application/json" },
-      body: JSON.stringify({ chat_id: chatId, document: fileUrlOrStream, caption, parse_mode: "HTML" })
-    }, 15000);
-    return r.ok;
-  } else {
-    const form = new FormData();
-    form.append("chat_id", String(chatId));
-    form.append("caption", caption);
-    form.append("parse_mode", "HTML");
-    form.append("document", fileUrlOrStream, filename || "audio.mp3");
-    const r = await fetchWithTimeout(url, { method: "POST", body: form }, 15000);
-    return r.ok;
-  }
-}
 async function tgGetFileUrl(fileId) {
   const getFile = `https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile`;
-  const r = await fetchWithTimeout(getFile, {
-    method: "POST",
-    headers: { "content-type":"application/json" },
-    body: JSON.stringify({ file_id: fileId })
-  }, 12000);
+  const r = await fetchWithTimeout(getFile, { method: "POST", headers: { "content-type":"application/json" }, body: JSON.stringify({ file_id: fileId }) }, 12000);
   if (!r.ok) throw new Error(`getFile http ${r.status}`);
   const j = await r.json();
   const path = j?.result?.file_path;
   if (!path) throw new Error("file_path missing");
   return `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${path}`;
 }
-// Отправить внешний URL в Telegram, получить file_id и CDN-URL
 async function tgSendUrlAndGetCdnUrl(fileUrl, caption = "") {
   if (!TG_UPLOAD_CHAT_ID) throw new Error("TG_UPLOAD_CHAT_ID not set");
   const api = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
@@ -272,6 +239,14 @@ function getIncomingKey(req) {
   );
 }
 
+/* ---- ring buffer for last webhook events (diagnostics) ---- */
+const LAST_EVENTS = [];
+function pushEvent(ev) {
+  LAST_EVENTS.push({ ts: new Date().toISOString(), ...ev });
+  if (LAST_EVENTS.length > 200) LAST_EVENTS.shift();
+}
+app.get("/diag/events", (_, res) => res.json({ count: LAST_EVENTS.length, items: LAST_EVENTS.slice().reverse() }));
+
 /* -------------------- routes: diagnostics -------------------- */
 app.get("/", (_, res) => res.send("OK"));
 app.get("/version", (_, res) => res.json({ version: VERSION }));
@@ -281,38 +256,21 @@ app.get("/diag/env", (req, res) => {
     TG_CHAT_ID: process.env.TG_CHAT_ID ? (String(process.env.TG_CHAT_ID).slice(0,4) + "...") : "",
     OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
     CRM_SHARED_KEY: !!process.env.CRM_SHARED_KEY,
-    AUTO_TRANSCRIBE,
-    AUTO_TRANSCRIBE_VIA_TG,
-    SHOW_CONTACT_EVENTS,
-    TG_DIRECT_FETCH,
-    RELAY_BASE_URL: !!RELAY_BASE_URL,
-    TG_WEBHOOK_SECRET: !!TG_WEBHOOK_SECRET,
-    TG_UPLOAD_CHAT_ID: !!TG_UPLOAD_CHAT_ID,
-    ROUTE_SECRET: TG_SECRET
+    AUTO_TRANSCRIBE, AUTO_TRANSCRIBE_VIA_TG, SHOW_CONTACT_EVENTS, TG_DIRECT_FETCH,
+    RELAY_BASE_URL: !!RELAY_BASE_URL, TG_WEBHOOK_SECRET: !!TG_WEBHOOK_SECRET,
+    TG_UPLOAD_CHAT_ID: !!TG_UPLOAD_CHAT_ID, ROUTE_SECRET: TG_SECRET
   });
 });
-app.get("/tg/ping", async (req, res) => {
-  const text = req.query.msg || "ping-from-railway";
-  const ok = await sendTG("🔧 " + text);
-  res.json({ ok });
-});
+app.get("/tg/ping", async (req, res) => { const text = req.query.msg || "ping-from-railway"; const ok = await sendTG("🔧 " + text); res.json({ ok }); });
 app.get("/probe-url", async (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).json({ ok: false, error: "no url" });
+  const url = req.query.url; if (!url) return res.status(400).json({ ok: false, error: "no url" });
   try {
     let r = await fetchWithTimeout(url, { method: "HEAD", redirect: "manual" }, 8000);
     const head = {}; r.headers.forEach((v, k) => head[k] = v);
     let peekStatus = null, peekBytes = 0;
-    try {
-      const rr = await fetchWithTimeout(url, { method: "GET", headers: { Range: "bytes=0-0" } }, 8000);
-      peekStatus = rr.status;
-      const buf = await rr.arrayBuffer();
-      peekBytes = buf.byteLength || 0;
-    } catch {}
+    try { const rr = await fetchWithTimeout(url, { method: "GET", headers: { Range: "bytes=0-0" } }, 8000); peekStatus = rr.status; const buf = await rr.arrayBuffer(); peekBytes = buf.byteLength || 0; } catch {}
     return res.json({ ok: true, status: r.status, headers: head, peek_status: peekStatus, peek_bytes: peekBytes });
-  } catch (e) {
-    return res.status(502).json({ ok: false, error: String(e) });
-  }
+  } catch (e) { return res.status(502).json({ ok: false, error: String(e) }); }
 });
 
 /* -------------------- manual ASR / file push -------------------- */
@@ -320,33 +278,19 @@ app.all("/asr", async (req, res) => {
   try {
     const inKey = getIncomingKey(req);
     if (CRM_SHARED_KEY && String(inKey) !== String(CRM_SHARED_KEY)) return res.status(401).json({ ok:false, error:"bad key" });
-
     const url = (req.method === "GET" ? req.query.url : (req.body?.url || req.query?.url));
     if (!url) return res.status(400).json({ ok:false, error:"no url" });
-
     const wrapped = wrapRecordingUrl(String(url));
     const cap = `🎧 Запись (manual)\n<code>${wrapped}</code>`;
-
     if (TG_DIRECT_FETCH) await sendTGDocument(wrapped, cap);
-
     const text = await transcribeAudioFromUrl(wrapped, { callId: "manual" });
     if (!text) return res.status(502).json({ ok:false, error:"asr failed" });
-
     await sendTG("📝 <b>Транскрипт</b> (manual):");
     for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
-
-    try {
-      const qa = await analyzeTranscript(text, { callId: "manual", brand: process.env.CALL_QA_BRAND || "" });
-      await sendTG(formatQaForTelegram(qa));
-    } catch (e) {
-      await sendTG("⚠️ Ошибка анализа QA: <code>"+(e?.message||e)+"</code>");
-    }
-
+    try { const qa = await analyzeTranscript(text, { callId: "manual", brand: process.env.CALL_QA_BRAND || "" }); await sendTG(formatQaForTelegram(qa)); }
+    catch (e) { await sendTG("⚠️ Ошибка анализа QA: <code>"+(e?.message||e)+"</code>"); }
     res.json({ ok:true, chars: text.length });
-  } catch (e) {
-    await sendTG(`❗️ /asr error: <code>${e?.message||e}</code>`);
-    res.status(500).json({ ok:false, error:String(e) });
-  }
+  } catch (e) { await sendTG(`❗️ /asr error: <code>${e?.message||e}</code>`); res.status(500).json({ ok:false, error:String(e) }); }
 });
 
 /* -------------------- Telegram webhook: /tg/<secret> -------------------- */
@@ -359,13 +303,11 @@ app.post(`/tg/${TG_SECRET}`, async (req, res) => {
 
     const txt = msg.text?.trim() || "";
     if (txt.startsWith("/start") || txt.startsWith("/help")) {
-      await tgReply(chatId,
-        "👋 Пришли мне аудиофайл (voice/audio/document) — я расшифрую и пришлю аналитику (РОП).\n" +
-        "Совместимо с .mp3/.ogg/.m4a/.wav. Максимум ~60 МБ.");
+      await tgReply(chatId, "👋 Пришли мне аудиофайл (voice/audio/document) — я расшифрую и пришлю аналитику (РОП).\nСовместимо с .mp3/.ogg/.m4a/.wav. Максимум ~60 МБ.");
       return res.json({ ok:true });
     }
 
-    // Находим file_id (audio/voice/document)
+    // Detect file_id
     let fileId = null;
     let fileName = "audio.mp3";
     if (msg.voice) { fileId = msg.voice.file_id; fileName = "voice.ogg"; }
@@ -385,10 +327,8 @@ app.post(`/tg/${TG_SECRET}`, async (req, res) => {
           const text = await transcribeAudioFromUrl(url, { callId: "tg-cmd", fileName: "audio.ext" });
           if (!text) { await tgReply(chatId, "❗️ Не смог расшифровать по ссылке."); return res.json({ ok:true }); }
           await tgReply(chatId, "📝 <b>Транскрипт</b>:\n<code>" + cap(text, 3500) + "</code>");
-          try {
-            const qa = await analyzeTranscript(text, { callId: "tg-cmd", brand: process.env.CALL_QA_BRAND || "" });
-            await tgReply(chatId, formatQaForTelegram(qa));
-          } catch (e) { await tgReply(chatId, "⚠️ Ошибка анализа QA: <code>"+(e?.message||e)+"</code>"); }
+          try { const qa = await analyzeTranscript(text, { callId: "tg-cmd", brand: process.env.CALL_QA_BRAND || "" }); await tgReply(chatId, formatQaForTelegram(qa)); }
+          catch (e) { await tgReply(chatId, "⚠️ Ошибка анализа QA: <code>"+(e?.message||e)+"</code>"); }
           return res.json({ ok:true });
         }
       }
@@ -396,23 +336,13 @@ app.post(`/tg/${TG_SECRET}`, async (req, res) => {
       return res.json({ ok:true });
     }
 
-    // Качаем с серверов Telegram и транскрибируем
     await tgReply(chatId, "⏳ Скачиваю файл из Telegram, расшифровываю…");
-    let fileUrl;
-    try { fileUrl = await tgGetFileUrl(fileId); }
-    catch (e) { await tgReply(chatId, "❗️ Не удалось получить file_path из Telegram."); return res.json({ ok:true }); }
-
+    let fileUrl; try { fileUrl = await tgGetFileUrl(fileId); } catch { await tgReply(chatId, "❗️ Не удалось получить file_path из Telegram."); return res.json({ ok:true }); }
     const text = await transcribeAudioFromUrl(fileUrl, { callId: "tg-file", fileName });
     if (!text) { await tgReply(chatId, "❗️ Не удалось выполнить распознавание."); return res.json({ ok:true }); }
-
     for (const part of chunkText(text, 3500)) await tgReply(chatId, "📝 <b>Транскрипт</b>:\n<code>"+part+"</code>");
-    try {
-      const qa = await analyzeTranscript(text, { callId: "tg-file", brand: process.env.CALL_QA_BRAND || "" });
-      await tgReply(chatId, formatQaForTelegram(qa));
-    } catch (e) {
-      await tgReply(chatId, "⚠️ Ошибка анализа QA: <code>"+(e?.message||e)+"</code>");
-    }
-
+    try { const qa = await analyzeTranscript(text, { callId: "tg-file", brand: process.env.CALL_QA_BRAND || "" }); await tgReply(chatId, formatQaForTelegram(qa)); }
+    catch (e) { await tgReply(chatId, "⚠️ Ошибка анализа QA: <code>"+(e?.message||e)+"</code>"); }
     res.json({ ok:true });
   } catch (e) {
     console.error("TG webhook error:", e);
@@ -421,71 +351,80 @@ app.post(`/tg/${TG_SECRET}`, async (req, res) => {
   }
 });
 
-/* -------------------- MegaPBX webhook -------------------- */
+/* -------------------- MegaPBX webhook (non-blocking) -------------------- */
 app.all(["/megafon", "/"], async (req, res, next) => {
   if (req.method === "GET") return next();
   try {
     const inKey = getIncomingKey(req);
-    if (CRM_SHARED_KEY && String(inKey) !== String(CRM_SHARED_KEY)) return res.status(401).send("bad key");
+    if (CRM_SHARED_KEY && String(inKey) !== String(CRM_SHARED_KEY)) {
+      pushEvent({ kind: "reject", reason: "bad key", headers: req.headers });
+      return res.status(401).send("bad key");
+    }
 
     const normalized = normalizeMegafon(req.body, req.headers, req.query);
+    pushEvent({ kind: "megafon", callId: normalized.callId, type: normalized.type, cmd: normalized.cmd });
 
-    if (normalized.cmd === "contact" && !SHOW_CONTACT_EVENTS) {
-      return res.json({ ok: true, skip: "contact" });
-    }
+    // мгновенный ответ
+    res.json({ ok: true, type: normalized.type, callId: normalized.callId });
 
-    await sendTG(formatTgMessage(normalized));
+    // фоновая работа
+    (async () => {
+      try {
+        if (normalized.cmd === "contact" && !SHOW_CONTACT_EVENTS) return;
 
-    const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
-    if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
-      const wrapped = wrapRecordingUrl(firstAudio);
-      const cap =
-        `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
-        `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
-        `ext: <code>${normalized.ext}</code>`;
+        await sendTG(formatTgMessage(normalized));
 
-      if (TG_DIRECT_FETCH) await sendTGDocument(wrapped, cap);
-      else await sendTGDocument(wrapped, cap); // одинаково, но оставим опцию на будущее
+        const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
+        if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED"))) return; // safety guard
+        if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
+          const wrapped = wrapRecordingUrl(firstAudio);
+          const cap =
+            `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
+            `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
+            `ext: <code>${normalized.ext}</code>`;
 
-      if (AUTO_TRANSCRIBE) {
-        try {
-          let asrUrl = wrapped;
-          if (AUTO_TRANSCRIBE_VIA_TG) {
+          await sendTGDocument(wrapped, cap); // для превью в чате
+
+          if (AUTO_TRANSCRIBE) {
             try {
-              asrUrl = await tgSendUrlAndGetCdnUrl(
-                wrapped,
-                `🎧 Авто-ASR (relay) CallID ${normalized.callId}`
-              );
+              let asrUrl = wrapped;
+              if (AUTO_TRANSCRIBE_VIA_TG) {
+                try {
+                  asrUrl = await tgSendUrlAndGetCdnUrl(wrapped, `🎧 Авто-ASR (relay) CallID ${normalized.callId}`);
+                } catch (e) {
+                  await sendTG("⚠️ relay через Telegram не удался, пробую скачать напрямую.\n<code>" + (e?.message||e) + "</code>");
+                  asrUrl = wrapped;
+                }
+              }
+
+              const text = await transcribeAudioFromUrl(asrUrl, { callId: normalized.callId });
+              if (text) {
+                await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
+                for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
+                try {
+                  const qa = await analyzeTranscript(text, {
+                    callId: normalized.callId, ext: normalized.ext, direction: normalized.direction,
+                    from: normalized.from, to: normalized.to, brand: process.env.CALL_QA_BRAND || ""
+                  });
+                  await sendTG(formatQaForTelegram(qa));
+                } catch (e) { await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>"); }
+              } else {
+                await sendTG("⚠️ ASR не удалось выполнить (после relay).");
+              }
             } catch (e) {
-              await sendTG("⚠️ relay через Telegram не удался, пробую скачать напрямую.\n<code>" + (e?.message||e) + "</code>");
-              asrUrl = wrapped;
+              await sendTG("❗️ Ошибка авто-ASR: <code>" + (e?.message || e) + "</code>");
             }
           }
-
-          const text = await transcribeAudioFromUrl(asrUrl, { callId: normalized.callId });
-          if (text) {
-            await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
-            for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
-            try {
-              const qa = await analyzeTranscript(text, {
-                callId: normalized.callId, ext: normalized.ext, direction: normalized.direction,
-                from: normalized.from, to: normalized.to, brand: process.env.CALL_QA_BRAND || ""
-              });
-              await sendTG(formatQaForTelegram(qa));
-            } catch (e) { await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>"); }
-          } else {
-            await sendTG("⚠️ ASR не удалось выполнить (после relay).");
-          }
-        } catch (e) {
-          await sendTG("❗️ Ошибка авто-ASR: <code>" + (e?.message || e) + "</code>");
         }
+      } catch (e) {
+        await sendTG("❗️ Background task error: <code>" + (e?.message || e) + "</code>");
       }
-    }
+    })();
 
-    res.json({ ok: true, type: normalized.type, callId: normalized.callId, hasAudio: !!firstAudio });
   } catch (e) {
     try { await sendTG(`❗️ <b>Webhook error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
-    res.status(500).send("server error");
+    // отвечаем 200 даже при ошибке, чтобы провайдер не дудосил ретраями
+    res.status(200).json({ ok: false, error: String(e) });
   }
 });
 

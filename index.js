@@ -375,7 +375,7 @@ app.all(["/megafon", "/"], async (req, res, next) => {
         await sendTG(formatTgMessage(normalized));
 
         const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
-        if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED"))) return; // safety guard
+        if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) return; // safety guard
         if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
           const wrapped = wrapRecordingUrl(firstAudio);
           const cap =

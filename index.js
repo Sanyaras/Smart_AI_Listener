@@ -542,6 +542,13 @@ if (!base) {
   console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука");
   return;
 }
+// Путь вебхука (используем реальный секрет из ENV)
+const secret = TG_WEBHOOK_SECRET || "hook12345";
+const base = (process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_URL || process.env.RAILWAY_PROJECT_URL || "").replace(/\/+$/,"");
+if (!base) {
+  console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука");
+  return;
+}
 const webhookUrl = `${base}/tg/${secret}`;
 
 const resp = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook`, {

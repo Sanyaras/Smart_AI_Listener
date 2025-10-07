@@ -23,15 +23,16 @@ app.use(bodyParser.text({
 
 /* --- env --- */
 const TG_BOT_TOKEN        = process.env.TG_BOT_TOKEN || "";
-const TG_CHAT_ID          = process.env.TG_CHAT_ID || "";                         // для серверных уведомлений
-const TG_WEBHOOK_SECRET   = process.env.TG_WEBHOOK_SECRET || "";                  // секрет в URL, чтобы принимать апдейты
+const TG_CHAT_ID          = process.env.TG_CHAT_ID || "";                 // для серверных уведомлений
+const TG_WEBHOOK_SECRET   = process.env.TG_WEBHOOK_SECRET || "";          // секрет в URL для приёма апдейтов
+const TG_SECRET           = (TG_WEBHOOK_SECRET || "hook12345").trim();    // единый секрет (и для маршрута, и для setWebhook)
 const CRM_SHARED_KEY      = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
-const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || "";                    // для Whisper
-const AUTO_TRANSCRIBE     = process.env.AUTO_TRANSCRIBE === "1";                 // авто-ASR для MegaPBX
-const SHOW_CONTACT_EVENTS = process.env.SHOW_CONTACT_EVENTS === "1";             // скрываем contact по умолчанию
-const RELAY_BASE_URL      = process.env.RELAY_BASE_URL || "";                    // если когда-то понадобится РФ-прокси
-const TG_DIRECT_FETCH     = process.env.TG_DIRECT_FETCH === "1";                 // пусть Telegram сам скачивает ссылку из MegaPBX
-const VERSION             = "railway-1.3.0";
+const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || "";             // для Whisper
+const AUTO_TRANSCRIBE     = process.env.AUTO_TRANSCRIBE === "1";          // авто-ASR для MegaPBX
+const SHOW_CONTACT_EVENTS = process.env.SHOW_CONTACT_EVENTS === "1";      // скрываем contact по умолчанию
+const RELAY_BASE_URL      = process.env.RELAY_BASE_URL || "";             // если понадобится РФ-прокси
+const TG_DIRECT_FETCH     = process.env.TG_DIRECT_FETCH === "1";          // пусть Telegram сам скачивает ссылку из MegaPBX
+const VERSION             = "railway-1.3.1";
 
 /* -------------------- utils -------------------- */
 function chunkText(str, max = 3500) {
@@ -91,8 +92,7 @@ async function sendTG(text) {
   return true;
 }
 async function sendTGDocument(fileUrl, caption = "") {
-  if (!TG_BOT_TOKEN) return false;
-  // Если указан TG_CHAT_ID — шлём туда; иначе предполагаем, что будет указан chat_id в caption нельзя — поэтому обязателен TG_CHAT_ID
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return false;
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
   const resp = await fetchWithTimeout(url, {
     method: "POST",
@@ -103,7 +103,7 @@ async function sendTGDocument(fileUrl, caption = "") {
   return true;
 }
 
-/* --- Telegram helpers (for chat replies inside webhook) --- */
+/* --- Telegram helpers (chat replies inside webhook) --- */
 async function tgReply(chatId, text, extra = {}) {
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
   const body = { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra };
@@ -116,7 +116,6 @@ async function tgReply(chatId, text, extra = {}) {
 }
 async function tgSendDocument(chatId, fileUrlOrStream, caption = "", filename) {
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
-  // Универсально: если string — Telegram сам скачает; если Blob — отправим multipart
   if (typeof fileUrlOrStream === "string") {
     const r = await fetchWithTimeout(url, {
       method: "POST",
@@ -299,7 +298,10 @@ app.get("/diag/env", (req, res) => {
     TG_CHAT_ID: process.env.TG_CHAT_ID ? (String(process.env.TG_CHAT_ID).slice(0,4) + "...") : "",
     OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
     CRM_SHARED_KEY: !!process.env.CRM_SHARED_KEY,
-    AUTO_TRANSCRIBE, SHOW_CONTACT_EVENTS, TG_DIRECT_FETCH, RELAY_BASE_URL: !!RELAY_BASE_URL, TG_WEBHOOK_SECRET: !!TG_WEBHOOK_SECRET
+    AUTO_TRANSCRIBE, SHOW_CONTACT_EVENTS, TG_DIRECT_FETCH,
+    RELAY_BASE_URL: !!RELAY_BASE_URL,
+    TG_WEBHOOK_SECRET: !!TG_WEBHOOK_SECRET,
+    ROUTE_SECRET: TG_SECRET
   });
 });
 app.get("/tg/ping", async (req, res) => {
@@ -338,10 +340,8 @@ app.all("/asr", async (req, res) => {
     const wrapped = wrapRecordingUrl(String(url));
     const cap = `🎧 Запись (manual)\n<code>${wrapped}</code>`;
 
-    // если включён TG_DIRECT_FETCH — просто покажем файл в TG как ссылку
     if (TG_DIRECT_FETCH) await sendTGDocument(wrapped, cap);
 
-    // ASR
     const text = await transcribeAudioFromUrl(wrapped, { callId: "manual" });
     if (!text) return res.status(502).json({ ok:false, error:"asr failed" });
 
@@ -364,14 +364,13 @@ app.all("/asr", async (req, res) => {
 
 /* -------------------- Telegram webhook: /tg/<secret> -------------------- */
 /* Принимаем аудиофайлы: voice, audio, document (mp3/ogg/m4a/oga/opus/wav) */
-app.post(`/tg/${TG_WEBHOOK_SECRET}`, async (req, res) => {
+app.post(`/tg/${TG_SECRET}`, async (req, res) => {
   try {
     const upd = req.body || {};
     const msg = upd.message || upd.edited_message || {};
     const chatId = msg.chat?.id;
     if (!chatId) return res.json({ ok:true });
 
-    // Команда /start или /help
     const txt = msg.text?.trim() || "";
     if (txt.startsWith("/start") || txt.startsWith("/help")) {
       await tgReply(chatId,
@@ -393,7 +392,6 @@ app.post(`/tg/${TG_WEBHOOK_SECRET}`, async (req, res) => {
 
     if (!fileId) {
       if (txt) {
-        // поддержка: /asr <url> — транскрибируем ссылку (если внешняя доступна)
         const m = txt.match(/^\/asr\s+(\S+)/i);
         if (m) {
           const url = m[1];
@@ -434,7 +432,7 @@ app.post(`/tg/${TG_WEBHOOK_SECRET}`, async (req, res) => {
   } catch (e) {
     console.error("TG webhook error:", e);
     try { if (TG_CHAT_ID) await sendTG("❗️ TG webhook error:\n<code>"+(e?.message||e)+"</code>"); } catch {}
-    res.status(200).json({ ok:true }); // всегда 200, чтобы Telegram не ретраил без конца
+    res.status(200).json({ ok:true }); // 200, чтобы Telegram не ретраил без конца
   }
 });
 
@@ -447,31 +445,21 @@ app.all(["/megafon", "/"], async (req, res, next) => {
 
     const normalized = normalizeMegafon(req.body, req.headers, req.query);
 
-    // скрываем контактные пинги, если не включено явно
     if (normalized.cmd === "contact" && !SHOW_CONTACT_EVENTS) {
       return res.json({ ok: true, skip: "contact" });
     }
 
-    // карточка в ТГ
     await sendTG(formatTgMessage(normalized));
 
-    // на HISTORY ссылка надёжнее всего; на COMPLETED попробуем тоже
     const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
-    if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
+    if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED"))) {
       const wrapped = wrapRecordingUrl(firstAudio);
       const cap =
         `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
         `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
         `ext: <code>${normalized.ext}</code>`;
 
-      // если TG_DIRECT_FETCH=1 — пусть Telegram скачивает сам (обходит .ru)
-      if (TG_DIRECT_FETCH) {
-        await sendTGDocument(wrapped, cap);
-      } else {
-        // попытка ре-загрузить через Railway (если доступно)
-        // (если сервер .ru недоступен — sendTGDocumentFromUrl можно было бы добавить, но сейчас не нужно)
-        await sendTGDocument(wrapped, cap);
-      }
+      await sendTGDocument(wrapped, cap);
 
       if (AUTO_TRANSCRIBE) {
         const text = await transcribeAudioFromUrl(wrapped, { callId: normalized.callId });
@@ -520,54 +508,29 @@ app.all("*", async (req, res) => {
 
 /* -------------------- start server (Railway uses PORT) -------------------- */
 const PORT = process.env.PORT || 3000;
+
 /* -------------------- auto Telegram webhook setup -------------------- */
 async function setupTelegramWebhook() {
   try {
-    if (!TG_BOT_TOKEN) {
-      console.warn("❌ TG_BOT_TOKEN отсутствует, пропускаем setWebhook");
-      return;
-    }
+    if (!TG_BOT_TOKEN) { console.warn("❌ TG_BOT_TOKEN отсутствует, пропускаем setWebhook"); return; }
 
-    // URL Railway-проекта
-    const baseUrl = process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_URL || process.env.RAILWAY_PROJECT_URL;
-    if (!baseUrl) {
-      console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука");
-      return;
-    }
+    const base = (process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_URL || process.env.RAILWAY_PROJECT_URL || "").replace(/\/+$/,"");
+    if (!base) { console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука"); return; }
 
-    // Путь вебхука (используем реальный секрет из ENV)
-const secret = TG_WEBHOOK_SECRET || "hook12345";
-const base = (process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_URL || process.env.RAILWAY_PROJECT_URL || "").replace(/\/+$/,"");
-if (!base) {
-  console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука");
-  return;
-}
-// Путь вебхука (используем реальный секрет из ENV)
-const secret = TG_WEBHOOK_SECRET || "hook12345";
-const base = (process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_URL || process.env.RAILWAY_PROJECT_URL || "").replace(/\/+$/,"");
-if (!base) {
-  console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука");
-  return;
-}
-const webhookUrl = `${base}/tg/${secret}`;
+    const webhookUrl = `${base}/tg/${TG_SECRET}`;
 
-const resp = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook`, {
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify({ url: webhookUrl, secret_token: secret }),
-});
-
+    const resp = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: webhookUrl, secret_token: TG_SECRET }),
+    });
     const data = await resp.json();
-    if (data.ok) {
-      console.log(`✅ Telegram webhook установлен: ${webhookUrl}`);
-    } else {
-      console.error("❌ Ошибка установки вебхука:", data);
-    }
+    if (data.ok) console.log(`✅ Telegram webhook установлен: ${webhookUrl}`);
+    else console.error("❌ Ошибка установки вебхука:", data);
   } catch (e) {
     console.error("❗ Ошибка setupTelegramWebhook:", e);
   }
 }
 
-// Запускаем установку при старте
 setupTelegramWebhook();
 app.listen(PORT, () => console.log(`Smart AI Listener (${VERSION}) on :${PORT}`));

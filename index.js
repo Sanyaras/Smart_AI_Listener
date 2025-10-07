@@ -25,14 +25,14 @@ app.use(bodyParser.text({
 const TG_BOT_TOKEN        = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID          = process.env.TG_CHAT_ID || "";                 // для серверных уведомлений
 const TG_WEBHOOK_SECRET   = process.env.TG_WEBHOOK_SECRET || "";          // секрет в URL для приёма апдейтов
-const TG_SECRET           = (TG_WEBHOOK_SECRET || "hook12345").trim();    // единый секрет (и для маршрута, и для setWebhook)
+const TG_SECRET           = (TG_WEBHOOK_SECRET || "hook12345").trim();    // единый секрет (маршрут + setWebhook)
 const CRM_SHARED_KEY      = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
 const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || "";             // для Whisper
 const AUTO_TRANSCRIBE     = process.env.AUTO_TRANSCRIBE === "1";          // авто-ASR для MegaPBX
 const SHOW_CONTACT_EVENTS = process.env.SHOW_CONTACT_EVENTS === "1";      // скрываем contact по умолчанию
 const RELAY_BASE_URL      = process.env.RELAY_BASE_URL || "";             // если понадобится РФ-прокси
 const TG_DIRECT_FETCH     = process.env.TG_DIRECT_FETCH === "1";          // пусть Telegram сам скачивает ссылку из MegaPBX
-const VERSION             = "railway-1.3.1";
+const VERSION             = "railway-1.3.2";
 
 /* -------------------- utils -------------------- */
 function chunkText(str, max = 3500) {
@@ -363,7 +363,6 @@ app.all("/asr", async (req, res) => {
 });
 
 /* -------------------- Telegram webhook: /tg/<secret> -------------------- */
-/* Принимаем аудиофайлы: voice, audio, document (mp3/ogg/m4a/oga/opus/wav) */
 app.post(`/tg/${TG_SECRET}`, async (req, res) => {
   try {
     const upd = req.body || {};
@@ -419,7 +418,6 @@ app.post(`/tg/${TG_SECRET}`, async (req, res) => {
     const text = await transcribeAudioFromUrl(fileUrl, { callId: "tg-file", fileName });
     if (!text) { await tgReply(chatId, "❗️ Не удалось выполнить распознавание."); return res.json({ ok:true }); }
 
-    // Отдаём транскрипт и QA
     for (const part of chunkText(text, 3500)) await tgReply(chatId, "📝 <b>Транскрипт</b>:\n<code>"+part+"</code>");
     try {
       const qa = await analyzeTranscript(text, { callId: "tg-file", brand: process.env.CALL_QA_BRAND || "" });
@@ -452,7 +450,7 @@ app.all(["/megafon", "/"], async (req, res, next) => {
     await sendTG(formatTgMessage(normalized));
 
     const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
-    if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED"))) {
+    if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
       const wrapped = wrapRecordingUrl(firstAudio);
       const cap =
         `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +

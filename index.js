@@ -374,52 +374,49 @@ app.all(["/megafon", "/"], async (req, res, next) => {
 
         await sendTG(formatTgMessage(normalized));
 
-        const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
-        if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) return; // safety guard
-        if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
-          const wrapped = wrapRecordingUrl(firstAudio);
-          const cap =
-            `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
-            `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
-            `ext: <code>${normalized.ext}</code>`;
+       const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
+if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
+  const wrapped = wrapRecordingUrl(firstAudio);
+  const cap =
+    `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
+    `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
+    `ext: <code>${normalized.ext}</code>`;
 
-          await sendTGDocument(wrapped, cap); // для превью в чате
+  await sendTGDocument(wrapped, cap); // превью в ТГ
 
-          if (AUTO_TRANSCRIBE) {
-            try {
-              let asrUrl = wrapped;
-              if (AUTO_TRANSCRIBE_VIA_TG) {
-                try {
-                  asrUrl = await tgSendUrlAndGetCdnUrl(wrapped, `🎧 Авто-ASR (relay) CallID ${normalized.callId}`);
-                } catch (e) {
-                  await sendTG("⚠️ relay через Telegram не удался, пробую скачать напрямую.\n<code>" + (e?.message||e) + "</code>");
-                  asrUrl = wrapped;
-                }
-              }
-
-              const text = await transcribeAudioFromUrl(asrUrl, { callId: normalized.callId });
-              if (text) {
-                await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
-                for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
-                try {
-                  const qa = await analyzeTranscript(text, {
-                    callId: normalized.callId, ext: normalized.ext, direction: normalized.direction,
-                    from: normalized.from, to: normalized.to, brand: process.env.CALL_QA_BRAND || ""
-                  });
-                  await sendTG(formatQaForTelegram(qa));
-                } catch (e) { await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>"); }
-              } else {
-                await sendTG("⚠️ ASR не удалось выполнить (после relay).");
-              }
-            } catch (e) {
-              await sendTG("❗️ Ошибка авто-ASR: <code>" + (e?.message || e) + "</code>");
-            }
-          }
+  if (AUTO_TRANSCRIBE) {
+    try {
+      let asrUrl = wrapped;
+      if (AUTO_TRANSCRIBE_VIA_TG) {
+        try {
+          asrUrl = await tgSendUrlAndGetCdnUrl(wrapped, `🎧 Авто-ASR (relay) CallID ${normalized.callId}`);
+        } catch (e) {
+          await sendTG("⚠️ relay через Telegram не удался, пробую напрямую.\n<code>" + (e?.message||e) + "</code>");
+          asrUrl = wrapped;
         }
-      } catch (e) {
-        await sendTG("❗️ Background task error: <code>" + (e?.message || e) + "</code>");
       }
-    })();
+
+      const text = await transcribeAudioFromUrl(asrUrl, { callId: normalized.callId });
+      if (text) {
+        await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
+        for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
+        try {
+          const qa = await analyzeTranscript(text, {
+            callId: normalized.callId, ext: normalized.ext, direction: normalized.direction,
+            from: normalized.from, to: normalized.to, brand: process.env.CALL_QA_BRAND || ""
+          });
+          await sendTG(formatQaForTelegram(qa));
+        } catch (e) {
+          await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>");
+        }
+      } else {
+        await sendTG("⚠️ ASR не удалось выполнить (после relay).");
+      }
+    } catch (e) {
+      await sendTG("❗️ Ошибка авто-ASR: <code>" + (e?.message || e) + "</code>");
+    }
+  }
+}
 
   } catch (e) {
     try { await sendTG(`❗️ <b>Webhook error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}

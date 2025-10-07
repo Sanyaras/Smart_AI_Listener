@@ -1,4 +1,5 @@
-// index.js — Railway: MegaPBX → Telegram + Telegram file ASR (no VPS)
+// index.js — Railway: MegaPBX → Telegram + Telegram file ASR via TG relay (no VPS)
+// v1.4.0
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -23,58 +24,32 @@ app.use(bodyParser.text({
 
 /* --- env --- */
 const TG_BOT_TOKEN        = process.env.TG_BOT_TOKEN || "";
-const TG_CHAT_ID          = process.env.TG_CHAT_ID || "";                 // для серверных уведомлений
-const TG_WEBHOOK_SECRET   = process.env.TG_WEBHOOK_SECRET || "";          // секрет в URL для приёма апдейтов
-const TG_SECRET           = (TG_WEBHOOK_SECRET || "hook12345").trim();    // единый секрет (маршрут + setWebhook)
+const TG_CHAT_ID          = process.env.TG_CHAT_ID || "";                   // куда слать уведомления/итоги
+const TG_WEBHOOK_SECRET   = process.env.TG_WEBHOOK_SECRET || "";            // секрет для пути вебхука
+const TG_SECRET           = (TG_WEBHOOK_SECRET || "hook12345").trim();      // единый секрет маршрута
 const CRM_SHARED_KEY      = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
-const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || "";             // для Whisper
-const AUTO_TRANSCRIBE     = process.env.AUTO_TRANSCRIBE === "1";          // авто-ASR для MegaPBX
-const SHOW_CONTACT_EVENTS = process.env.SHOW_CONTACT_EVENTS === "1";      // скрываем contact по умолчанию
-const RELAY_BASE_URL      = process.env.RELAY_BASE_URL || "";             // если понадобится РФ-прокси
-const TG_DIRECT_FETCH     = process.env.TG_DIRECT_FETCH === "1";          // пусть Telegram сам скачивает ссылку из MegaPBX
-const VERSION             = "railway-1.3.2";
+const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || "";               // Whisper
+const AUTO_TRANSCRIBE     = process.env.AUTO_TRANSCRIBE === "1";            // авто-ASR для MegaPBX
+const AUTO_TRANSCRIBE_VIA_TG = process.env.AUTO_TRANSCRIBE_VIA_TG === "1";  // релэй записи через Telegram
+const SHOW_CONTACT_EVENTS = process.env.SHOW_CONTACT_EVENTS === "1";        // скрывать contact по умолчанию
+const RELAY_BASE_URL      = process.env.RELAY_BASE_URL || "";               // если когда-то понадобится РФ-прокси
+const TG_DIRECT_FETCH     = process.env.TG_DIRECT_FETCH === "1";            // TG сам скачивает ссылку для превью
+const TG_UPLOAD_CHAT_ID   = process.env.TG_UPLOAD_CHAT_ID || TG_CHAT_ID;    // тихий чат для relay-загрузки
+const VERSION             = "railway-1.4.0";
 
 /* -------------------- utils -------------------- */
-function chunkText(str, max = 3500) {
-  const out = [];
-  for (let i = 0; i < str.length; i += max) out.push(str.slice(i, i + max));
-  return out;
-}
-function cap(s, n = 2000) {
-  const t = String(s ?? "");
-  return t.length > n ? t.slice(0, n) + "…[cut]" : t;
-}
-function safeStr(obj, n = 3500) {
-  try {
-    if (typeof obj === "string") return cap(obj, n);
-    return cap(JSON.stringify(obj, null, 2), n);
-  } catch { return "[unserializable]"; }
-}
-function fmtPhone(p) {
-  if (!p) return "-";
-  const s = String(p).trim();
-  return s.startsWith("+") ? s : ("+" + s);
-}
-function prettyType(type) {
-  const t = String(type).toUpperCase();
-  return ({
-    RINGING: "📳 RINGING (звонит)",
-    INCOMING: "🔔 INCOMING",
-    ACCEPTED: "✅ ACCEPTED (принят)",
-    COMPLETED: "🔔 COMPLETED",
-    HANGUP: "⛔️ HANGUP (завершён)",
-    MISSED: "❌ MISSED (пропущен)",
-    HISTORY: "🗂 HISTORY (итоги/запись)",
-    CANCELLED: "🚫 CANCELLED (отменён)"
-  }[t] || `🔔 ${type}`);
-}
+function chunkText(str, max = 3500) { const out=[]; for (let i=0;i<str.length;i+=max) out.push(str.slice(i,i+max)); return out; }
+function cap(s, n = 2000) { const t = String(s ?? ""); return t.length > n ? t.slice(0, n) + "…[cut]" : t; }
+function safeStr(obj, n = 3500) { try { if (typeof obj === "string") return cap(obj,n); return cap(JSON.stringify(obj,null,2),n); } catch { return "[unserializable]"; } }
+function fmtPhone(p){ if(!p) return "-"; const s=String(p).trim(); return s.startsWith("+")?s:("+"+s); }
+function prettyType(type){ const t=String(type).toUpperCase(); return ({RINGING:"📳 RINGING (звонит)",INCOMING:"🔔 INCOMING",ACCEPTED:"✅ ACCEPTED (принят)",COMPLETED:"🔔 COMPLETED",HANGUP:"⛔️ HANGUP (завершён)",MISSED:"❌ MISSED (пропущен)",HISTORY:"🗂 HISTORY (итоги/запись)",CANCELLED:"🚫 CANCELLED (отменён)"}[t]||`🔔 ${type}`); }
 
 /* --- network helper with timeout --- */
 async function fetchWithTimeout(url, opts = {}, ms = 12000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(new Error("timeout")), ms);
   try {
-    const headers = { "user-agent": "SmartAIListener/1.3 (+railway)", ...opts.headers };
+    const headers = { "user-agent": "SmartAIListener/1.4 (+railway)", ...opts.headers };
     return await fetch(url, { ...opts, headers, signal: ctrl.signal });
   } finally { clearTimeout(timer); }
 }
@@ -103,15 +78,11 @@ async function sendTGDocument(fileUrl, caption = "") {
   return true;
 }
 
-/* --- Telegram helpers (chat replies inside webhook) --- */
+/* --- Telegram helpers (chat replies & relay) --- */
 async function tgReply(chatId, text, extra = {}) {
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
   const body = { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra };
-  const r = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { "content-type":"application/json" },
-    body: JSON.stringify(body)
-  }, 12000);
+  const r = await fetchWithTimeout(url, { method: "POST", headers: { "content-type":"application/json" }, body: JSON.stringify(body) }, 12000);
   return r.ok;
 }
 async function tgSendDocument(chatId, fileUrlOrStream, caption = "", filename) {
@@ -146,14 +117,26 @@ async function tgGetFileUrl(fileId) {
   if (!path) throw new Error("file_path missing");
   return `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${path}`;
 }
+// Отправить внешний URL в Telegram, получить file_id и CDN-URL
+async function tgSendUrlAndGetCdnUrl(fileUrl, caption = "") {
+  if (!TG_UPLOAD_CHAT_ID) throw new Error("TG_UPLOAD_CHAT_ID not set");
+  const api = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
+  const payload = { chat_id: TG_UPLOAD_CHAT_ID, document: fileUrl, caption, parse_mode: "HTML", disable_content_type_detection: false };
+  const r = await fetchWithTimeout(api, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }, 20000);
+  if (!r.ok) { const t = await r.text().catch(()=> ""); throw new Error(`sendDocument http ${r.status}: ${t}`); }
+  const j = await r.json().catch(()=> ({}));
+  const fileId = j?.result?.document?.file_id || j?.result?.audio?.file_id || j?.result?.voice?.file_id;
+  if (!fileId) throw new Error("sendDocument: file_id not found");
+  return await tgGetFileUrl(fileId);
+}
 
-/* --- recording URL wrapper (relay opt-in) --- */
+/* --- recording URL wrapper (optional relay) --- */
 function wrapRecordingUrl(url) {
   if (!RELAY_BASE_URL) return url;
   try {
     const u = new URL(url);
     const rb = new URL(RELAY_BASE_URL);
-    if (u.hostname === rb.hostname && u.port === rb.port) return url; // уже обёрнут
+    if (u.hostname === rb.hostname && u.port === rb.port) return url;
   } catch {}
   return RELAY_BASE_URL + encodeURIComponent(url);
 }
@@ -298,9 +281,13 @@ app.get("/diag/env", (req, res) => {
     TG_CHAT_ID: process.env.TG_CHAT_ID ? (String(process.env.TG_CHAT_ID).slice(0,4) + "...") : "",
     OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
     CRM_SHARED_KEY: !!process.env.CRM_SHARED_KEY,
-    AUTO_TRANSCRIBE, SHOW_CONTACT_EVENTS, TG_DIRECT_FETCH,
+    AUTO_TRANSCRIBE,
+    AUTO_TRANSCRIBE_VIA_TG,
+    SHOW_CONTACT_EVENTS,
+    TG_DIRECT_FETCH,
     RELAY_BASE_URL: !!RELAY_BASE_URL,
     TG_WEBHOOK_SECRET: !!TG_WEBHOOK_SECRET,
+    TG_UPLOAD_CHAT_ID: !!TG_UPLOAD_CHAT_ID,
     ROUTE_SECRET: TG_SECRET
   });
 });
@@ -430,7 +417,7 @@ app.post(`/tg/${TG_SECRET}`, async (req, res) => {
   } catch (e) {
     console.error("TG webhook error:", e);
     try { if (TG_CHAT_ID) await sendTG("❗️ TG webhook error:\n<code>"+(e?.message||e)+"</code>"); } catch {}
-    res.status(200).json({ ok:true }); // 200, чтобы Telegram не ретраил без конца
+    res.status(200).json({ ok:true });
   }
 });
 
@@ -457,20 +444,40 @@ app.all(["/megafon", "/"], async (req, res, next) => {
         `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
         `ext: <code>${normalized.ext}</code>`;
 
-      await sendTGDocument(wrapped, cap);
+      if (TG_DIRECT_FETCH) await sendTGDocument(wrapped, cap);
+      else await sendTGDocument(wrapped, cap); // одинаково, но оставим опцию на будущее
 
       if (AUTO_TRANSCRIBE) {
-        const text = await transcribeAudioFromUrl(wrapped, { callId: normalized.callId });
-        if (text) {
-          await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
-          for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
-          try {
-            const qa = await analyzeTranscript(text, {
-              callId: normalized.callId, ext: normalized.ext, direction: normalized.direction,
-              from: normalized.from, to: normalized.to, brand: process.env.CALL_QA_BRAND || ""
-            });
-            await sendTG(formatQaForTelegram(qa));
-          } catch (e) { await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>"); }
+        try {
+          let asrUrl = wrapped;
+          if (AUTO_TRANSCRIBE_VIA_TG) {
+            try {
+              asrUrl = await tgSendUrlAndGetCdnUrl(
+                wrapped,
+                `🎧 Авто-ASR (relay) CallID ${normalized.callId}`
+              );
+            } catch (e) {
+              await sendTG("⚠️ relay через Telegram не удался, пробую скачать напрямую.\n<code>" + (e?.message||e) + "</code>");
+              asrUrl = wrapped;
+            }
+          }
+
+          const text = await transcribeAudioFromUrl(asrUrl, { callId: normalized.callId });
+          if (text) {
+            await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
+            for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
+            try {
+              const qa = await analyzeTranscript(text, {
+                callId: normalized.callId, ext: normalized.ext, direction: normalized.direction,
+                from: normalized.from, to: normalized.to, brand: process.env.CALL_QA_BRAND || ""
+              });
+              await sendTG(formatQaForTelegram(qa));
+            } catch (e) { await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>"); }
+          } else {
+            await sendTG("⚠️ ASR не удалось выполнить (после relay).");
+          }
+        } catch (e) {
+          await sendTG("❗️ Ошибка авто-ASR: <code>" + (e?.message || e) + "</code>");
         }
       }
     }
@@ -511,12 +518,9 @@ const PORT = process.env.PORT || 3000;
 async function setupTelegramWebhook() {
   try {
     if (!TG_BOT_TOKEN) { console.warn("❌ TG_BOT_TOKEN отсутствует, пропускаем setWebhook"); return; }
-
     const base = (process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_URL || process.env.RAILWAY_PROJECT_URL || "").replace(/\/+$/,"");
     if (!base) { console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука"); return; }
-
     const webhookUrl = `${base}/tg/${TG_SECRET}`;
-
     const resp = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -525,9 +529,7 @@ async function setupTelegramWebhook() {
     const data = await resp.json();
     if (data.ok) console.log(`✅ Telegram webhook установлен: ${webhookUrl}`);
     else console.error("❌ Ошибка установки вебхука:", data);
-  } catch (e) {
-    console.error("❗ Ошибка setupTelegramWebhook:", e);
-  }
+  } catch (e) { console.error("❗ Ошибка setupTelegramWebhook:", e); }
 }
 
 setupTelegramWebhook();

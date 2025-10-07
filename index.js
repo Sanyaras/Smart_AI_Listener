@@ -33,8 +33,20 @@ function chunkText(str, max = 3500) { const out=[]; for (let i=0;i<str.length;i+
 function cap(s, n = 2000) { const t = String(s ?? ""); return t.length > n ? t.slice(0, n) + "…[cut]" : t; }
 function safeStr(obj, n = 3500) { try { if (typeof obj === "string") return cap(obj,n); return cap(JSON.stringify(obj,null,2),n); } catch { return "[unserializable]"; } }
 function fmtPhone(p){ if(!p) return "-"; const s=String(p).trim(); return s.startsWith("+")?s:("+"+s); }
-function prettyType(type){ const t=String(type).toUpperCase(); return ({RINGING:"📳 RINGING (звонит)",INCOMING:"🔔 INCOMING",ACCEPTED:"✅ ACCEPTED (принят)",COMPLETED:"🔔 COMPLETED",HANGUP:"⛔️ HANGUP (завершён)",MISSED:"❌ MISSED (пропущен)",HISTORY:"🗂 HISTORY (итоги/запись)",CANCELLED:"🚫 CANCELLED (отменён)"}[t]||🔔 ${type}); }
-
+function prettyType(type) {
+  const t = String(type).toUpperCase();
+  const map = {
+    RINGING: "📳 RINGING (звонит)",
+    INCOMING: "🔔 INCOMING",
+    ACCEPTED: "✅ ACCEPTED (принят)",
+    COMPLETED: "🔔 COMPLETED",
+    HANGUP: "⛔️ HANGUP (завершён)",
+    MISSED: "❌ MISSED (пропущен)",
+    HISTORY: "🗂 HISTORY (итоги/запись)",
+    CANCELLED: "🚫 CANCELLED (отменён)"
+  };
+  return map[t] || `🔔 ${type}`;
+}
 /* --- network helper with timeout --- */
 async function fetchWithTimeout(url, opts = {}, ms = 12000) {
   const ctrl = new AbortController();

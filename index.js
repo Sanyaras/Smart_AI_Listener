@@ -33,7 +33,7 @@ function chunkText(str, max = 3500) { const out=[]; for (let i=0;i<str.length;i+
 function cap(s, n = 2000) { const t = String(s ?? ""); return t.length > n ? t.slice(0, n) + "…[cut]" : t; }
 function safeStr(obj, n = 3500) { try { if (typeof obj === "string") return cap(obj,n); return cap(JSON.stringify(obj,null,2),n); } catch { return "[unserializable]"; } }
 function fmtPhone(p){ if(!p) return "-"; const s=String(p).trim(); return s.startsWith("+")?s:("+"+s); }
-function prettyType(type){ const t=String(type).toUpperCase(); return ({RINGING:"📳 RINGING (звонит)",INCOMING:"🔔 INCOMING",ACCEPTED:"✅ ACCEPTED (принят)",COMPLETED:"🔔 COMPLETED",HANGUP:"⛔️ HANGUP (завершён)",MISSED:"❌ MISSED (пропущен)",HISTORY:"🗂 HISTORY (итоги/запись)",CANCELLED:"🚫 CANCELLED (отменён)"}[t]||`🔔 ${type}`); }
+function prettyType(type){ const t=String(type).toUpperCase(); return ({RINGING:"📳 RINGING (звонит)",INCOMING:"🔔 INCOMING",ACCEPTED:"✅ ACCEPTED (принят)",COMPLETED:"🔔 COMPLETED",HANGUP:"⛔️ HANGUP (завершён)",MISSED:"❌ MISSED (пропущен)",HISTORY:"🗂 HISTORY (итоги/запись)",CANCELLED:"🚫 CANCELLED (отменён)"}[t]||🔔 ${type}); }
 
 /* --- network helper with timeout --- */
 async function fetchWithTimeout(url, opts = {}, ms = 12000) {
@@ -48,7 +48,7 @@ async function fetchWithTimeout(url, opts = {}, ms = 12000) {
 /* --- Telegram helpers (server notifications) --- */
 async function sendTG(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) { console.warn("sendTG skipped: no TG env"); return false; }
-  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
+  const url = https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage;
   const resp = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -59,7 +59,7 @@ async function sendTG(text) {
 }
 async function sendTGDocument(fileUrl, caption = "") {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return false;
-  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
+  const url = https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument;
   const resp = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -71,26 +71,26 @@ async function sendTGDocument(fileUrl, caption = "") {
 
 /* --- Telegram helpers (chat replies & relay) --- */
 async function tgReply(chatId, text, extra = {}) {
-  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
+  const url = https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage;
   const body = { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra };
   const r = await fetchWithTimeout(url, { method: "POST", headers: { "content-type":"application/json" }, body: JSON.stringify(body) }, 12000);
   return r.ok;
 }
 async function tgGetFileUrl(fileId) {
-  const getFile = `https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile`;
+  const getFile = https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile;
   const r = await fetchWithTimeout(getFile, { method: "POST", headers: { "content-type":"application/json" }, body: JSON.stringify({ file_id: fileId }) }, 12000);
-  if (!r.ok) throw new Error(`getFile http ${r.status}`);
+  if (!r.ok) throw new Error(getFile http ${r.status});
   const j = await r.json();
   const path = j?.result?.file_path;
   if (!path) throw new Error("file_path missing");
-  return `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${path}`;
+  return https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${path};
 }
 async function tgSendUrlAndGetCdnUrl(fileUrl, caption = "") {
   if (!TG_UPLOAD_CHAT_ID) throw new Error("TG_UPLOAD_CHAT_ID not set");
-  const api = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
+  const api = https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument;
   const payload = { chat_id: TG_UPLOAD_CHAT_ID, document: fileUrl, caption, parse_mode: "HTML", disable_content_type_detection: false };
   const r = await fetchWithTimeout(api, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }, 20000);
-  if (!r.ok) { const t = await r.text().catch(()=> ""); throw new Error(`sendDocument http ${r.status}: ${t}`); }
+  if (!r.ok) { const t = await r.text().catch(()=> ""); throw new Error(sendDocument http ${r.status}: ${t}); }
   const j = await r.json().catch(()=> ({}));
   const fileId = j?.result?.document?.file_id || j?.result?.audio?.file_id || j?.result?.voice?.file_id;
   if (!fileId) throw new Error("sendDocument: file_id not found");
@@ -125,7 +125,7 @@ function extractRecordInfo(obj) {
         if (/\b(record|rec|recording|audio|file|link)\b/i.test(key) || /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(val)) pushUrl(val);
       }
       if (/\b(record(_?id)?|rec_id|file_id)\b/i.test(key)) pushId(val);
-      if ((/link|url|file/i.test(key)) && val) info.hints.push(`${k}: ${val}`);
+      if ((/link|url|file/i.test(key)) && val) info.hints.push(${k}: ${val});
     }
   }
   info.urls  = Array.from(new Set(info.urls));
@@ -164,32 +164,32 @@ function normalizeMegafon(body, headers = {}, query = {}) {
 function formatTgMessage(n) {
   const lines = [
     "📞 <b>MegaPBX → Webhook</b>",
-    `• Событие: <b>${prettyType(n.type)}</b>`,
-    `• CallID: <code>${n.callId}</code>`,
-    `• Направление: <code>${n.direction || "-"}</code>`,
-    `• От: ${fmtPhone(n.from)} → Кому: ${fmtPhone(n.to)}`,
-    `• Наш номер (telnum): ${fmtPhone(n.telnum)}`,
-    `• Внутр. (ext): <code>${n.ext}</code>`
+    • Событие: <b>${prettyType(n.type)}</b>,
+    • CallID: <code>${n.callId}</code>,
+    • Направление: <code>${n.direction || "-"}</code>,
+    • От: ${fmtPhone(n.from)} → Кому: ${fmtPhone(n.to)},
+    • Наш номер (telnum): ${fmtPhone(n.telnum)},
+    • Внутр. (ext): <code>${n.ext}</code>
   ];
-  if (n.user && n.user !== "-")            lines.push(`• Оператор (user): <code>${n.user}</code>`);
-  if (n.diversion && n.diversion !== "-")  lines.push(`• Diversion: ${fmtPhone(n.diversion)}`);
+  if (n.user && n.user !== "-")            lines.push(• Оператор (user): <code>${n.user}</code>);
+  if (n.diversion && n.diversion !== "-")  lines.push(• Diversion: ${fmtPhone(n.diversion)});
   const extras = [];
   if (n.extra) {
     const { status, duration, wait, start } = n.extra;
-    if (status && status !== "-") extras.push(`статус: <code>${status}</code>`);
-    if (duration) extras.push(`длительность: <code>${duration}s</code>`);
-    if (wait) extras.push(`ожидание: <code>${wait}s</code>`);
-    if (start) extras.push(`начало: <code>${start}</code>`);
+    if (status && status !== "-") extras.push(статус: <code>${status}</code>);
+    if (duration) extras.push(длительность: <code>${duration}s</code>);
+    if (wait) extras.push(ожидание: <code>${wait}s</code>);
+    if (start) extras.push(начало: <code>${start}</code>);
   }
   if (extras.length) lines.push("", "• " + extras.join(" · "));
   if (n.recordInfo?.urls?.length) {
     lines.push("", "🎧 <b>Запись:</b>");
-    for (const u of n.recordInfo.urls.slice(0, 5)) lines.push(`• ${u}`);
+    for (const u of n.recordInfo.urls.slice(0, 5)) lines.push(• ${u});
   } else if (n.recordInfo?.ids?.length) {
     lines.push("", "🎧 <b>ID записи:</b>");
-    for (const id of n.recordInfo.ids.slice(0, 5)) lines.push(`• <code>${id}</code>`);
+    for (const id of n.recordInfo.ids.slice(0, 5)) lines.push(• <code>${id}</code>);
   }
-  lines.push("", "<i>Raw:</i>", `<code>${safeStr(n.raw)}</code>`);
+  lines.push("", "<i>Raw:</i>", <code>${safeStr(n.raw)}</code>);
   return lines.join("\n");
 }
 
@@ -198,31 +198,31 @@ async function transcribeAudioFromUrl(fileUrl, meta = {}) {
   if (!OPENAI_API_KEY) { await sendTG("⚠️ <b>OPENAI_API_KEY не задан</b> — пропускаю транскрибацию."); return null; }
   try {
     const r = await fetchWithTimeout(fileUrl, { redirect: "follow" }, 30000);
-    if (!r.ok) { await sendTG(`❗️ Ошибка скачивания записи: HTTP <code>${r.status}</code>`); return null; }
+    if (!r.ok) { await sendTG(❗️ Ошибка скачивания записи: HTTP <code>${r.status}</code>); return null; }
     const buf = await r.arrayBuffer();
     const MAX = 60 * 1024 * 1024;
-    if (buf.byteLength > MAX) { await sendTG(`⚠️ Запись ${(buf.byteLength/1024/1024).toFixed(1)}MB слишком большая — пропуск.`); return null; }
+    if (buf.byteLength > MAX) { await sendTG(⚠️ Запись ${(buf.byteLength/1024/1024).toFixed(1)}MB слишком большая — пропуск.); return null; }
 
     const form = new FormData();
-    form.append("file", new Blob([buf]), meta.fileName || (meta.callId ? `${meta.callId}.mp3` : "audio.mp3"));
+    form.append("file", new Blob([buf]), meta.fileName || (meta.callId ? ${meta.callId}.mp3 : "audio.mp3"));
     form.append("model", "whisper-1");
     form.append("language", "ru");
     form.append("response_format", "text");
 
     const resp = await fetchWithTimeout("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      headers: { Authorization: Bearer ${OPENAI_API_KEY} },
       body: form
     }, 60000);
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
-      await sendTG(`❗️ Whisper ошибка: HTTP <code>${resp.status}</code>\n<code>${cap(errText,1000)}</code>`);
+      await sendTG(❗️ Whisper ошибка: HTTP <code>${resp.status}</code>\n<code>${cap(errText,1000)}</code>);
       return null;
     }
     const text = await resp.text();
     return text.trim();
   } catch (e) {
-    await sendTG(`❗️ Общая ошибка транскрибации: <code>${e?.message || e}</code>`);
+    await sendTG(❗️ Общая ошибка транскрибации: <code>${e?.message || e}</code>);
     return null;
   }
 }
@@ -281,20 +281,20 @@ app.all("/asr", async (req, res) => {
     const url = (req.method === "GET" ? req.query.url : (req.body?.url || req.query?.url));
     if (!url) return res.status(400).json({ ok:false, error:"no url" });
     const wrapped = wrapRecordingUrl(String(url));
-    const cap = `🎧 Запись (manual)\n<code>${wrapped}</code>`;
+    const cap = 🎧 Запись (manual)\n<code>${wrapped}</code>;
     if (TG_DIRECT_FETCH) await sendTGDocument(wrapped, cap);
     const text = await transcribeAudioFromUrl(wrapped, { callId: "manual" });
     if (!text) return res.status(502).json({ ok:false, error:"asr failed" });
     await sendTG("📝 <b>Транскрипт</b> (manual):");
-    for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
+    for (const part of chunkText(text, 3500)) await sendTG(<code>${part}</code>);
     try { const qa = await analyzeTranscript(text, { callId: "manual", brand: process.env.CALL_QA_BRAND || "" }); await sendTG(formatQaForTelegram(qa)); }
     catch (e) { await sendTG("⚠️ Ошибка анализа QA: <code>"+(e?.message||e)+"</code>"); }
     res.json({ ok:true, chars: text.length });
-  } catch (e) { await sendTG(`❗️ /asr error: <code>${e?.message||e}</code>`); res.status(500).json({ ok:false, error:String(e) }); }
+  } catch (e) { await sendTG(❗️ /asr error: <code>${e?.message||e}</code>); res.status(500).json({ ok:false, error:String(e) }); }
 });
 
 /* -------------------- Telegram webhook: /tg/<secret> -------------------- */
-app.post(`/tg/${TG_SECRET}`, async (req, res) => {
+app.post(/tg/${TG_SECRET}, async (req, res) => {
   try {
     const upd = req.body || {};
     const msg = upd.message || upd.edited_message || {};
@@ -374,52 +374,55 @@ app.all(["/megafon", "/"], async (req, res, next) => {
 
         await sendTG(formatTgMessage(normalized));
 
-       const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
-if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
-  const wrapped = wrapRecordingUrl(firstAudio);
-  const cap =
-    `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
-    `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
-    `ext: <code>${normalized.ext}</code>`;
+        const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
+        if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) return; // safety guard
+        if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
+          const wrapped = wrapRecordingUrl(firstAudio);
+          const cap =
+            🎧 Запись по звонку <code>${normalized.callId}</code>\n +
+            От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n +
+            ext: <code>${normalized.ext}</code>;
 
-  await sendTGDocument(wrapped, cap); // превью в ТГ
+          await sendTGDocument(wrapped, cap); // для превью в чате
 
-  if (AUTO_TRANSCRIBE) {
-    try {
-      let asrUrl = wrapped;
-      if (AUTO_TRANSCRIBE_VIA_TG) {
-        try {
-          asrUrl = await tgSendUrlAndGetCdnUrl(wrapped, `🎧 Авто-ASR (relay) CallID ${normalized.callId}`);
-        } catch (e) {
-          await sendTG("⚠️ relay через Telegram не удался, пробую напрямую.\n<code>" + (e?.message||e) + "</code>");
-          asrUrl = wrapped;
+          if (AUTO_TRANSCRIBE) {
+            try {
+              let asrUrl = wrapped;
+              if (AUTO_TRANSCRIBE_VIA_TG) {
+                try {
+                  asrUrl = await tgSendUrlAndGetCdnUrl(wrapped, 🎧 Авто-ASR (relay) CallID ${normalized.callId});
+                } catch (e) {
+                  await sendTG("⚠️ relay через Telegram не удался, пробую скачать напрямую.\n<code>" + (e?.message||e) + "</code>");
+                  asrUrl = wrapped;
+                }
+              }
+
+              const text = await transcribeAudioFromUrl(asrUrl, { callId: normalized.callId });
+              if (text) {
+                await sendTG(📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):);
+                for (const part of chunkText(text, 3500)) await sendTG(<code>${part}</code>);
+                try {
+                  const qa = await analyzeTranscript(text, {
+                    callId: normalized.callId, ext: normalized.ext, direction: normalized.direction,
+                    from: normalized.from, to: normalized.to, brand: process.env.CALL_QA_BRAND || ""
+                  });
+                  await sendTG(formatQaForTelegram(qa));
+                } catch (e) { await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>"); }
+              } else {
+                await sendTG("⚠️ ASR не удалось выполнить (после relay).");
+              }
+            } catch (e) {
+              await sendTG("❗️ Ошибка авто-ASR: <code>" + (e?.message || e) + "</code>");
+            }
+          }
         }
+      } catch (e) {
+        await sendTG("❗️ Background task error: <code>" + (e?.message || e) + "</code>");
       }
-
-      const text = await transcribeAudioFromUrl(asrUrl, { callId: normalized.callId });
-      if (text) {
-        await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
-        for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
-        try {
-          const qa = await analyzeTranscript(text, {
-            callId: normalized.callId, ext: normalized.ext, direction: normalized.direction,
-            from: normalized.from, to: normalized.to, brand: process.env.CALL_QA_BRAND || ""
-          });
-          await sendTG(formatQaForTelegram(qa));
-        } catch (e) {
-          await sendTG("❗️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>");
-        }
-      } else {
-        await sendTG("⚠️ ASR не удалось выполнить (после relay).");
-      }
-    } catch (e) {
-      await sendTG("❗️ Ошибка авто-ASR: <code>" + (e?.message || e) + "</code>");
-    }
-  }
-}
+    })();
 
   } catch (e) {
-    try { await sendTG(`❗️ <b>Webhook error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
+    try { await sendTG(❗️ <b>Webhook error</b>:\n<code>${(e && e.message) || e}</code>); } catch {}
     // отвечаем 200 даже при ошибке, чтобы провайдер не дудосил ретраями
     res.status(200).json({ ok: false, error: String(e) });
   }
@@ -430,8 +433,8 @@ app.all("*", async (req, res) => {
     const body = typeof req.body === "undefined" ? {} : req.body;
     const lines = [
       "📞 <b>MegaPBX → CRM webhook</b>",
-      `• Method: <code>${req.method}</code>`,
-      `• Path: <code>${req.path || req.url || "/"}</code>`,
+      • Method: <code>${req.method}</code>,
+      • Path: <code>${req.path || req.url || "/"}</code>,
       "",
       "<b>Headers</b>:\n<code>" + safeStr(req.headers) + "</code>",
       "",
@@ -442,7 +445,7 @@ app.all("*", async (req, res) => {
     if (TG_CHAT_ID) await sendTG(lines.join("\n"));
     res.json({ ok: true, note: "fallback handler" });
   } catch (e) {
-    try { await sendTG(`❗️ <b>Fallback error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
+    try { await sendTG(❗️ <b>Fallback error</b>:\n<code>${(e && e.message) || e}</code>); } catch {}
     res.status(500).send("server error");
   }
 });
@@ -456,17 +459,17 @@ async function setupTelegramWebhook() {
     if (!TG_BOT_TOKEN) { console.warn("❌ TG_BOT_TOKEN отсутствует, пропускаем setWebhook"); return; }
     const base = (process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_URL || process.env.RAILWAY_PROJECT_URL || "").replace(/\/+$/,"");
     if (!base) { console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука"); return; }
-    const webhookUrl = `${base}/tg/${TG_SECRET}`;
-    const resp = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook`, {
+    const webhookUrl = ${base}/tg/${TG_SECRET};
+    const resp = await fetch(https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ url: webhookUrl, secret_token: TG_SECRET }),
     });
     const data = await resp.json();
-    if (data.ok) console.log(`✅ Telegram webhook установлен: ${webhookUrl}`);
+    if (data.ok) console.log(✅ Telegram webhook установлен: ${webhookUrl});
     else console.error("❌ Ошибка установки вебхука:", data);
   } catch (e) { console.error("❗ Ошибка setupTelegramWebhook:", e); }
 }
 
 setupTelegramWebhook();
-app.listen(PORT, () => console.log(`Smart AI Listener (${VERSION}) on :${PORT}`));
+app.listen(PORT, () => console.log(Smart AI Listener (${VERSION}) on :${PORT}));

@@ -1,14 +1,22 @@
+```javascript name=index.js url=https://github.com/Sanyaras/Smart_AI_Listener/blob/702d0609f7cdb83c842494c480a3d58958949c58/index.js
 // index.js — Railway: MegaPBX → Telegram + Telegram relay ASR + AmoCRM, non-blocking webhooks
-// v1.6.0
+// v1.6.0 -> refactor and fixes: security, concurrency, robustness, streaming checks, single-flight refresh, graceful shutdown
+// Updated: 2025-10-20
+/* eslint-disable no-console */
 
 import express from "express";
 import bodyParser from "body-parser";
+import crypto from "crypto";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
-/* -------------------- app -------------------- */
+/* -------------------- sanity / env -------------------- */
+if (typeof fetch === "undefined") {
+  throw new Error("Global fetch is required (Node >= 18) — install a polyfill or use Node >= 18");
+}
+
 const app = express();
 
-/* --- parsers --- */
+/* --- parsers (keep verify to preserve rawBody) --- */
 app.use(bodyParser.json({ limit: "25mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(bodyParser.urlencoded({ extended: false, verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"], verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -16,9 +24,9 @@ app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"], verify: 
 /* --- env: Telegram / MegaPBX --- */
 const TG_BOT_TOKEN            = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID              = process.env.TG_CHAT_ID || "";
-const TG_WEBHOOK_SECRET       = process.env.TG_WEBHOOK_SECRET || "";
-const TG_SECRET               = (TG_WEBHOOK_SECRET || "hook12345").trim();
-const CRM_SHARED_KEY          = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
+const TG_WEBHOOK_SECRET       = (process.env.TG_WEBHOOK_SECRET || "").trim();
+let   TG_SECRET               = TG_WEBHOOK_SECRET || "";
+const CRM_SHARED_KEY          = process.env.CRM_SHARED_KEY || "";
 const OPENAI_API_KEY          = process.env.OPENAI_API_KEY || "";
 const AUTO_TRANSCRIBE         = process.env.AUTO_TRANSCRIBE === "1";
 const AUTO_TRANSCRIBE_VIA_TG  = process.env.AUTO_TRANSCRIBE_VIA_TG === "1";
@@ -26,25 +34,27 @@ const SHOW_CONTACT_EVENTS     = process.env.SHOW_CONTACT_EVENTS === "1";
 const RELAY_BASE_URL          = process.env.RELAY_BASE_URL || "";
 const TG_DIRECT_FETCH         = process.env.TG_DIRECT_FETCH === "1";
 const TG_UPLOAD_CHAT_ID       = process.env.TG_UPLOAD_CHAT_ID || TG_CHAT_ID;
+const NODE_ENV                = process.env.NODE_ENV || "development";
 
 /* --- env: AmoCRM --- */
 const AMO_BASE_URL       = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
 const AMO_CLIENT_ID      = process.env.AMO_CLIENT_ID || "";
 const AMO_CLIENT_SECRET  = process.env.AMO_CLIENT_SECRET || "";
 const AMO_REDIRECT_URI   = process.env.AMO_REDIRECT_URI || "";
-const AMO_AUTH_CODE      = process.env.AMO_AUTH_CODE || "";           // разовый код (20 минут)
-let   AMO_ACCESS_TOKEN   = process.env.AMO_ACCESS_TOKEN || "";        // если уже есть — будем использовать
-let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";       // если уже есть — будем обновлять
+const AMO_AUTH_CODE      = process.env.AMO_AUTH_CODE || "";
+let   AMO_ACCESS_TOKEN   = process.env.AMO_ACCESS_TOKEN || "";
+let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";
 
-const VERSION = "railway-1.6.0";
+const VERSION = "railway-1.6.0-refactored";
 
-/* -------------------- utils -------------------- */
-function chunkText(str, max = 3500) { const out=[]; for (let i=0;i<str.length;i+=max) out.push(str.slice(i,i+max)); return out; }
+/* -------------------- helpers -------------------- */
+function debug(...args){ if (process.env.DEBUG) console.debug(...args); }
 function cap(s, n = 2000) { const t = String(s ?? ""); return t.length > n ? t.slice(0, n) + "…[cut]" : t; }
 function safeStr(obj, n = 3500) { try { if (typeof obj === "string") return cap(obj,n); return cap(JSON.stringify(obj,null,2),n); } catch { return "[unserializable]"; } }
 function fmtPhone(p){ if(!p) return "-"; const s=String(p).trim(); return s.startsWith("+")?s:("+"+s); }
+function mask(s){ if(!s) return ""; const t=String(s); return t.length<=8? t.replace(/.(?=.{2})/g,"*") : t.slice(0,4) + "…" + t.slice(-4); }
 function prettyType(type) {
-  const t = String(type).toUpperCase();
+  const t = String(type || "").toUpperCase();
   const map = {
     RINGING: "📳 RINGING (звонит)",
     INCOMING: "🔔 INCOMING",
@@ -59,7 +69,9 @@ function prettyType(type) {
   return map[t] || `🔔 ${type}`;
 }
 
-/* --- network helper with timeout --- */
+function chunkText(str, max = 3500) { const out=[]; for (let i=0;i<str.length;i+=max) out.push(str.slice(i,i+max)); return out; }
+
+/* --- basic fetch with timeout and optional maxBytes check --- */
 async function fetchWithTimeout(url, opts = {}, ms = 12000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(new Error("timeout")), ms);
@@ -69,54 +81,109 @@ async function fetchWithTimeout(url, opts = {}, ms = 12000) {
   } finally { clearTimeout(timer); }
 }
 
-/* --- Telegram helpers (server notifications) --- */
-async function sendTG(text) {
-  if (!TG_BOT_TOKEN || !TG_CHAT_ID) { console.warn("sendTG skipped: no TG env"); return false; }
-  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-  const resp = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true })
-  }, 12000);
-  if (!resp.ok) { console.error("sendTG error:", resp.status, await resp.text().catch(()=>'')); return false; }
-  return true;
-}
-async function sendTGDocument(fileUrl, caption = "") {
-  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return false;
-  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
-  const resp = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: TG_CHAT_ID, document: fileUrl, caption, parse_mode: "HTML", disable_content_type_detection: false })
-  }, 15000);
-  if (!resp.ok) { console.error("sendTGDocument error:", resp.status, await resp.text().catch(()=>'')); return false; }
-  return true;
+/* -------------------- Telegram helpers with queue + retry -------------------- */
+/* Small serialized queue for outbound Telegram messages to reduce chance of flooding.
+   Concurrency 1, retries on transient network errors. */
+const tgQueue = [];
+let tgWorkerRunning = false;
+
+function enqueueTGTask(fn) {
+  return new Promise((resolve, reject) => {
+    tgQueue.push({ fn, resolve, reject });
+    if (!tgWorkerRunning) runTgWorker();
+  });
 }
 
-/* --- Telegram helpers (chat replies & relay) --- */
+async function runTgWorker() {
+  tgWorkerRunning = true;
+  while (tgQueue.length) {
+    const item = tgQueue.shift();
+    try {
+      const result = await item.fn();
+      item.resolve(result);
+    } catch (e) {
+      item.reject(e);
+    }
+    // small delay between messages to be polite (configurable)
+    await new Promise(r => setTimeout(r, parseInt(process.env.TG_SEND_DELAY_MS || "150", 10)));
+  }
+  tgWorkerRunning = false;
+}
+
+async function tgRequest(apiPath, bodyObj, ms = 12000) {
+  if (!TG_BOT_TOKEN) throw new Error("TG_BOT_TOKEN not set");
+  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/${apiPath}`;
+  const payload = JSON.stringify(bodyObj);
+  const attempt = async (triesLeft = 3, backoff = 250) => {
+    try {
+      const r = await fetchWithTimeout(url, { method: "POST", headers: { "content-type":"application/json" }, body: payload }, ms);
+      if (!r.ok) {
+        const text = await r.text().catch(()=>"");
+        const err = new Error(`tg ${apiPath} http ${r.status}: ${text}`);
+        if (r.status >= 500 && triesLeft > 1) {
+          await new Promise(r=>setTimeout(r, backoff));
+          return attempt(triesLeft - 1, backoff * 2);
+        }
+        throw err;
+      }
+      return await r.json().catch(()=>({ ok: true }));
+    } catch (e) {
+      if (triesLeft > 1 && (e.name === "FetchError" || String(e).includes("timeout"))) {
+        await new Promise(r=>setTimeout(r, backoff));
+        return attempt(triesLeft - 1, backoff * 2);
+      }
+      throw e;
+    }
+  };
+  return enqueueTGTask(() => attempt());
+}
+
+async function sendTG(text) {
+  try {
+    if (!TG_BOT_TOKEN || !TG_CHAT_ID) { console.warn("sendTG skipped: no TG env"); return false; }
+    const body = { chat_id: TG_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true };
+    await tgRequest("sendMessage", body, 12000);
+    return true;
+  } catch (e) {
+    console.error("sendTG error:", e?.message || e);
+    return false;
+  }
+}
+
+async function sendTGDocument(fileUrl, caption = "") {
+  try {
+    if (!TG_BOT_TOKEN || !TG_CHAT_ID) return false;
+    const body = { chat_id: TG_CHAT_ID, document: fileUrl, caption, parse_mode: "HTML", disable_content_type_detection: false };
+    await tgRequest("sendDocument", body, 20000);
+    return true;
+  } catch (e) {
+    console.error("sendTGDocument error:", e?.message || e);
+    return false;
+  }
+}
+
 async function tgReply(chatId, text, extra = {}) {
-  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-  const body = { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra };
-  const r = await fetchWithTimeout(url, { method: "POST", headers: { "content-type":"application/json" }, body: JSON.stringify(body) }, 12000);
-  return r.ok;
+  try {
+    const body = { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra };
+    await tgRequest("sendMessage", body, 12000);
+    return true;
+  } catch (e) {
+    console.error("tgReply error:", e?.message || e);
+    return false;
+  }
 }
 async function tgGetFileUrl(fileId) {
-  const getFile = `https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile`;
-  const r = await fetchWithTimeout(getFile, { method: "POST", headers: { "content-type":"application/json" }, body: JSON.stringify({ file_id: fileId }) }, 12000);
-  if (!r.ok) throw new Error(`getFile http ${r.status}`);
-  const j = await r.json();
-  const path = j?.result?.file_path;
-  if (!path) throw new Error("file_path missing");
-  return `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${path}`;
+  const getFile = `getFile`;
+  const resp = await tgRequest(getFile, { file_id: fileId }, 12000);
+  if (!resp || !resp.result || !resp.result.file_path) throw new Error(`getFile: file_path missing`);
+  return `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${resp.result.file_path}`;
 }
 async function tgSendUrlAndGetCdnUrl(fileUrl, caption = "") {
   if (!TG_UPLOAD_CHAT_ID) throw new Error("TG_UPLOAD_CHAT_ID not set");
-  const api = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument`;
+  const api = `sendDocument`;
   const payload = { chat_id: TG_UPLOAD_CHAT_ID, document: fileUrl, caption, parse_mode: "HTML", disable_content_type_detection: false };
-  const r = await fetchWithTimeout(api, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }, 20000);
-  if (!r.ok) { const t = await r.text().catch(()=> ""); throw new Error(`sendDocument http ${r.status}: ${t}`); }
-  const j = await r.json().catch(()=> ({}));
-  const fileId = j?.result?.document?.file_id || j?.result?.audio?.file_id || j?.result?.voice?.file_id;
+  const r = await tgRequest(api, payload, 20000);
+  const fileId = r?.result?.document?.file_id || r?.result?.audio?.file_id || r?.result?.voice?.file_id;
   if (!fileId) throw new Error("sendDocument: file_id not found");
   return await tgGetFileUrl(fileId);
 }
@@ -132,8 +199,8 @@ function wrapRecordingUrl(url) {
   return RELAY_BASE_URL + encodeURIComponent(url);
 }
 
-/* -------------------- AmoCRM helpers -------------------- */
-function mask(s){ if(!s) return ""; const t=String(s); return t.length<=8? t.replace(/.(?=.{2})/g,"*") : t.slice(0,4) + "…" + t.slice(-4); }
+/* -------------------- AmoCRM helpers (single-flight refresh) -------------------- */
+let amoRefreshPromise = null;
 
 function ensureAmoEnv() {
   if (!AMO_BASE_URL || !AMO_CLIENT_ID || !AMO_CLIENT_SECRET || !AMO_REDIRECT_URI) {
@@ -165,12 +232,22 @@ async function amoExchangeCode() {
   AMO_REFRESH_TOKEN = j.refresh_token || "";
   return j;
 }
+
 async function amoRefresh() {
   if (!AMO_REFRESH_TOKEN) throw new Error("AMO_REFRESH_TOKEN missing");
-  const j = await amoOAuth({ grant_type: "refresh_token", refresh_token: AMO_REFRESH_TOKEN });
-  AMO_ACCESS_TOKEN = j.access_token || "";
-  AMO_REFRESH_TOKEN = j.refresh_token || "";
-  return j;
+  // single-flight refresh
+  if (amoRefreshPromise) return amoRefreshPromise;
+  amoRefreshPromise = (async () => {
+    try {
+      const j = await amoOAuth({ grant_type: "refresh_token", refresh_token: AMO_REFRESH_TOKEN });
+      AMO_ACCESS_TOKEN = j.access_token || "";
+      AMO_REFRESH_TOKEN = j.refresh_token || "";
+      return j;
+    } finally {
+      amoRefreshPromise = null;
+    }
+  })();
+  return amoRefreshPromise;
 }
 
 async function amoFetch(path, opts = {}, ms = 15000) {
@@ -181,7 +258,7 @@ async function amoFetch(path, opts = {}, ms = 15000) {
     ...opts,
     headers: { "authorization": `Bearer ${AMO_ACCESS_TOKEN}`, "content-type":"application/json", ...(opts.headers||{}) }
   }, ms);
-  if (r.status === 401) { // try refresh once
+  if (r.status === 401) { // try refresh once with single-flight
     await amoRefresh();
     const r2 = await fetchWithTimeout(url, {
       ...opts,
@@ -279,19 +356,36 @@ function formatTgMessage(n) {
   return lines.join("\n");
 }
 
-/* -------------------- транскрибация -------------------- */
+/* -------------------- транскрибация (with HEAD check) -------------------- */
 async function transcribeAudioFromUrl(fileUrl, meta = {}) {
   if (!OPENAI_API_KEY) { await sendTG("⚠️ <b>OPENAI_API_KEY не задан</b> — пропускаю транскрибацию."); return null; }
   try {
+    // Check content-length first (HEAD). Some hosts don't support HEAD; ignore failures.
+    try {
+      const head = await fetchWithTimeout(fileUrl, { method: "HEAD", redirect: "follow" }, 8000);
+      const cl = head.headers.get("content-length");
+      const MAX = 60 * 1024 * 1024;
+      if (cl && parseInt(cl, 10) > MAX) { await sendTG(`⚠️ Запись указанного URL слишком большая (${(cl/1024/1024).toFixed(1)}MB) — пропуск.`); return null; }
+    } catch (e) {
+      debug("HEAD check failed:", e?.message || e);
+    }
+
     const r = await fetchWithTimeout(fileUrl, { redirect: "follow" }, 30000);
     if (!r.ok) { await sendTG(`❗️ Ошибка скачивания записи: HTTP <code>${r.status}</code>`); return null; }
-    const buf = await r.arrayBuffer();
     const MAX = 60 * 1024 * 1024;
+    const contentLength = r.headers.get("content-length");
+    if (contentLength && parseInt(contentLength,10) > MAX) {
+      await sendTG(`⚠️ Запись ${ (parseInt(contentLength,10)/1024/1024).toFixed(1)}MB слишком большая — пропуск.`);
+      return null;
+    }
+    const buf = await r.arrayBuffer();
     if (buf.byteLength > MAX) { await sendTG(`⚠️ Запись ${(buf.byteLength/1024/1024).toFixed(1)}MB слишком большая — пропуск.`); return null; }
 
     const form = new FormData();
-    form.append("file", new Blob([buf]), meta.fileName || (meta.callId ? `${meta.callId}.mp3` : "audio.mp3"));
+    const filename = meta.fileName || (meta.callId ? `${meta.callId}.mp3` : "audio.mp3");
+    form.append("file", new Blob([buf]), filename);
     form.append("model", "whisper-1");
+    if (meta.language) form.append("language", meta.language);
     form.append("language", "ru");
     form.append("response_format", "text");
 
@@ -299,7 +393,7 @@ async function transcribeAudioFromUrl(fileUrl, meta = {}) {
       method: "POST",
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
       body: form
-    }, 60000);
+    }, 120000);
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
       await sendTG(`❗️ Whisper ошибка: HTTP <code>${resp.status}</code>\n<code>${cap(errText,1000)}</code>`);
@@ -313,13 +407,19 @@ async function transcribeAudioFromUrl(fileUrl, meta = {}) {
   }
 }
 
-/* -------------------- security -------------------- */
+/* -------------------- security: incoming key parsing -------------------- */
 function getIncomingKey(req) {
+  const auth = req.headers["authorization"] || req.headers["Authorization"];
+  if (auth) {
+    const m = String(auth).match(/Bearer\s+(.+)/i);
+    if (m) return m[1];
+    // fallthrough return whole header
+    return String(auth).trim();
+  }
   return (
     req.headers["x-api-key"] ||
     req.headers["x-crm-key"] ||
     req.headers["x-auth-token"] ||
-    req.headers["authorization"] ||
     req.query?.key ||
     (typeof req.body === "object" ? req.body.crm_token : undefined)
   );
@@ -360,18 +460,19 @@ function trackEvent(n) {
   slot.types.add(n.type);
   slot.hasAudio = slot.hasAudio || hasAudio;
 
-  if (n.type === "COMPLETED") slot.awaitingHistory = true;
+  if (String(n.type).toUpperCase() === "COMPLETED") slot.awaitingHistory = true;
   if (String(n.type).toUpperCase() === "HISTORY") slot.awaitingHistory = false;
 
   CALLS.set(n.callId, slot);
 }
 
+/* Cleanup old CALLS entries and prevent unbounded growth */
 const HISTORY_TIMEOUT_MS = (parseInt(process.env.HISTORY_TIMEOUT_MIN || "7",10)) * 60 * 1000;
+const CALL_TTL_MS = (parseInt(process.env.CALL_TTL_MIN || "60",10)) * 60 * 1000; // remove calls not updated for CALL_TTL_MS
 setInterval(async () => {
   const now = Date.now();
   for (const [callId, slot] of CALLS.entries()) {
-    if (!slot.awaitingHistory) continue;
-    if (now - slot.lastTs > HISTORY_TIMEOUT_MS) {
+    if (slot.awaitingHistory && (now - slot.lastTs > HISTORY_TIMEOUT_MS)) {
       try {
         await sendTG(
           `⏰ <b>HISTORY не пришёл вовремя</b>\n` +
@@ -380,9 +481,13 @@ setInterval(async () => {
           `• Прошло: ${(Math.round((now-slot.lastTs)/600)/100)} мин\n` +
           `• Была ссылка на запись: <code>${slot.hasAudio ? "да" : "нет"}</code>`
         );
-      } catch {}
+      } catch (e) { debug("notify history timeout failed", e?.message || e); }
       slot.awaitingHistory = false;
       CALLS.set(callId, slot);
+    }
+    // cleanup old entries
+    if (!slot.awaitingHistory && (now - slot.lastTs > CALL_TTL_MS)) {
+      CALLS.delete(callId);
     }
   }
 }, 60 * 1000);
@@ -399,7 +504,7 @@ app.get("/diag/env", (req, res) => {
     CRM_SHARED_KEY: !!process.env.CRM_SHARED_KEY,
     AUTO_TRANSCRIBE, AUTO_TRANSCRIBE_VIA_TG, SHOW_CONTACT_EVENTS, TG_DIRECT_FETCH,
     RELAY_BASE_URL: !!RELAY_BASE_URL, TG_WEBHOOK_SECRET: !!TG_WEBHOOK_SECRET,
-    TG_UPLOAD_CHAT_ID: !!TG_UPLOAD_CHAT_ID, ROUTE_SECRET: TG_SECRET,
+    TG_UPLOAD_CHAT_ID: !!TG_UPLOAD_CHAT_ID, ROUTE_SECRET: !!TG_SECRET,
     AMO_BASE_URL: !!AMO_BASE_URL,
     AMO_CLIENT_ID: mask(AMO_CLIENT_ID),
     AMO_CLIENT_SECRET: mask(AMO_CLIENT_SECRET),
@@ -429,18 +534,53 @@ app.get("/diag/calls", (req, res) => {
   res.json({ count: items.length, items: items.slice(0, limit) });
 });
 app.get("/tg/ping", async (req, res) => { const text = req.query.msg || "ping-from-railway"; const ok = await sendTG("🔧 " + text); res.json({ ok }); });
+
 app.get("/probe-url", async (req, res) => {
   const url = req.query.url; if (!url) return res.status(400).json({ ok: false, error: "no url" });
   try {
-    let r = await fetchWithTimeout(url, { method: "HEAD", redirect: "manual" }, 8000);
+    const r = await fetchWithTimeout(url, { method: "HEAD", redirect: "manual" }, 8000);
     const head = {}; r.headers.forEach((v, k) => head[k] = v);
     let peekStatus = null, peekBytes = 0;
-    try { const rr = await fetchWithTimeout(url, { method: "GET", headers: { Range: "bytes=0-0" } }, 8000); peekStatus = rr.status; const buf = await rr.arrayBuffer(); peekBytes = buf.byteLength || 0; } catch {}
+    try {
+      const rr = await fetchWithTimeout(url, { method: "GET", headers: { Range: "bytes=0-1023" } }, 8000);
+      peekStatus = rr.status;
+      const buf = await rr.arrayBuffer();
+      peekBytes = buf.byteLength || 0;
+    } catch (e) {
+      debug("probe-url GET partial failed:", e?.message || e);
+    }
     return res.json({ ok: true, status: r.status, headers: head, peek_status: peekStatus, peek_bytes: peekBytes });
   } catch (e) { return res.status(502).json({ ok: false, error: String(e) }); }
 });
 
 /* -------------------- manual ASR / file push -------------------- */
+const ASR_CONCURRENCY = parseInt(process.env.ASR_CONCURRENCY || "2", 10);
+const asrQueue = [];
+let asrActive = 0;
+
+function enqueueAsr(taskFn) {
+  return new Promise((resolve, reject) => {
+    asrQueue.push({ taskFn, resolve, reject });
+    processAsrQueue();
+  });
+}
+
+async function processAsrQueue() {
+  if (asrActive >= ASR_CONCURRENCY) return;
+  const next = asrQueue.shift();
+  if (!next) return;
+  asrActive++;
+  try {
+    const out = await next.taskFn();
+    next.resolve(out);
+  } catch (e) {
+    next.reject(e);
+  } finally {
+    asrActive--;
+    processAsrQueue();
+  }
+}
+
 app.all("/asr", async (req, res) => {
   try {
     const inKey = getIncomingKey(req);
@@ -450,17 +590,32 @@ app.all("/asr", async (req, res) => {
     const wrapped = wrapRecordingUrl(String(url));
     const capText = `🎧 Запись (manual)\n<code>${wrapped}</code>`;
     if (TG_DIRECT_FETCH) await sendTGDocument(wrapped, capText);
-    const text = await transcribeAudioFromUrl(wrapped, { callId: "manual" });
+
+    // run transcription via queue to limit concurrency
+    const text = await enqueueAsr(() => transcribeAudioFromUrl(wrapped, { callId: "manual" }));
     if (!text) return res.status(502).json({ ok:false, error:"asr failed" });
+
     await sendTG("📝 <b>Транскрипт</b> (manual):");
     for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
-    try { const qa = await analyzeTranscript(text, { callId: "manual", brand: process.env.CALL_QA_BRAND || "" }); await sendTG(formatQaForTelegram(qa)); }
-    catch (e) { await sendTG("⚠️ Ошибка анализа QA: <code>"+(e?.message||e)+"</code>"); }
+    try {
+      const qa = await analyzeTranscript(text, { callId: "manual", brand: process.env.CALL_QA_BRAND || "" });
+      await sendTG(formatQaForTelegram(qa));
+    } catch (e) { await sendTG("⚠️ Ошибка анализа QA: <code>"+(e?.message||e)+"</code>"); }
     res.json({ ok:true, chars: text.length });
   } catch (e) { await sendTG(`❗️ /asr error: <code>${e?.message||e}</code>`); res.status(500).json({ ok:false, error:String(e) }); }
 });
 
 /* -------------------- Telegram webhook: /tg/<secret> -------------------- */
+// Ensure a webhook secret — generate if missing (but fail in production)
+if (!TG_SECRET) {
+  if (NODE_ENV === "production") {
+    throw new Error("TG_WEBHOOK_SECRET is required in production");
+  } else {
+    TG_SECRET = crypto.randomBytes(18).toString("hex");
+    console.warn("TG_WEBHOOK_SECRET not set — using ephemeral secret:", TG_SECRET);
+  }
+}
+
 app.post(`/tg/${TG_SECRET}`, async (req, res) => {
   try {
     const upd = req.body || {};
@@ -468,9 +623,12 @@ app.post(`/tg/${TG_SECRET}`, async (req, res) => {
     const chatId = msg.chat?.id;
     if (!chatId) return res.json({ ok:true });
 
-    const txt = msg.text?.trim() || "";
+    const txt = (msg.text || "").trim();
     if (txt.startsWith("/start") || txt.startsWith("/help")) {
-      await tgReply(chatId, "👋 Пришли мне аудиофайл (voice/audio/document) — я расшифрую и пришлю аналитику (РОП).\nСовместимо с .mp3/.ogg/.m4a/.wav. Максимум ~60 МБ.");
+      await tgReply(chatId,
+        "👋 Пришли мне аудиофайл (voice/audio/document) — я расшифрую и пришлю аналитику (РОП).\n" +
+        "Поддерживаемые форматы: .mp3, .m4a, .ogg, .opus, .wav. Можно также отправить ссылку через команду /asr <url>."
+      );
       return res.json({ ok:true });
     }
 
@@ -491,7 +649,7 @@ app.post(`/tg/${TG_SECRET}`, async (req, res) => {
         if (m) {
           const url = m[1];
           await tgReply(chatId, "⏳ Беру по ссылке, расшифровываю…");
-          const text = await transcribeAudioFromUrl(url, { callId: "tg-cmd", fileName: "audio.ext" });
+          const text = await enqueueAsr(() => transcribeAudioFromUrl(url, { callId: "tg-cmd", fileName: "audio.ext" }));
           if (!text) { await tgReply(chatId, "❗️ Не смог расшифровать по ссылке."); return res.json({ ok:true }); }
           await tgReply(chatId, "📝 <b>Транскрипт</b>:\n<code>" + cap(text, 3500) + "</code>");
           try { const qa = await analyzeTranscript(text, { callId: "tg-cmd", brand: process.env.CALL_QA_BRAND || "" }); await tgReply(chatId, formatQaForTelegram(qa)); }
@@ -504,8 +662,8 @@ app.post(`/tg/${TG_SECRET}`, async (req, res) => {
     }
 
     await tgReply(chatId, "⏳ Скачиваю файл из Telegram, расшифровываю…");
-    let fileUrl; try { fileUrl = await tgGetFileUrl(fileId); } catch { await tgReply(chatId, "❗️ Не удалось получить file_path из Telegram."); return res.json({ ok:true }); }
-    const text = await transcribeAudioFromUrl(fileUrl, { callId: "tg-file", fileName });
+    let fileUrl; try { fileUrl = await tgGetFileUrl(fileId); } catch (e) { await tgReply(chatId, "❗️ Не удалось получить file_path из Telegram."); return res.json({ ok:true }); }
+    const text = await enqueueAsr(() => transcribeAudioFromUrl(fileUrl, { callId: "tg-file", fileName }));
     if (!text) { await tgReply(chatId, "❗️ Не удалось выполнить распознавание."); return res.json({ ok:true }); }
     for (const part of chunkText(text, 3500)) await tgReply(chatId, "📝 <b>Транскрипт</b>:\n<code>"+part+"</code>");
     try { const qa = await analyzeTranscript(text, { callId: "tg-file", brand: process.env.CALL_QA_BRAND || "" }); await tgReply(chatId, formatQaForTelegram(qa)); }
@@ -532,17 +690,17 @@ app.all(["/megafon", "/"], async (req, res, next) => {
     pushEvent({ kind: "megafon", callId: normalized.callId, type: normalized.type, cmd: normalized.cmd });
     trackEvent(normalized);
 
-    // мгновенный ответ
+    // immediate response
     res.json({ ok: true, type: normalized.type, callId: normalized.callId });
 
-    // фоновая работа
+    // background work — use limited concurrency for expensive ops (ASR handled by queue)
     (async () => {
       try {
         if (normalized.cmd === "contact" && !SHOW_CONTACT_EVENTS) return;
 
         await sendTG(formatTgMessage(normalized));
 
-        if (normalized.type === "HISTORY" && (!normalized.recordInfo?.urls?.length)) {
+        if (String(normalized.type).toUpperCase() === "HISTORY" && (!normalized.recordInfo?.urls?.length)) {
           await sendTG(
             "⚠️ HISTORY без ссылки на запись\n" +
             `• CallID: <code>${normalized.callId}</code>\n` +
@@ -552,7 +710,7 @@ app.all(["/megafon", "/"], async (req, res, next) => {
         }
 
         const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
-        if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
+        if (firstAudio && (String(normalized.type).toUpperCase() === "HISTORY" || String(normalized.type).toUpperCase() === "COMPLETED")) {
           const wrapped = wrapRecordingUrl(firstAudio);
           const cap =
             `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
@@ -571,7 +729,8 @@ app.all(["/megafon", "/"], async (req, res, next) => {
                   asrUrl = wrapped;
                 }
               }
-              const text = await transcribeAudioFromUrl(asrUrl, { callId: normalized.callId });
+              // enqueue transcription
+              const text = await enqueueAsr(() => transcribeAudioFromUrl(asrUrl, { callId: normalized.callId }));
               if (text) {
                 await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
                 for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
@@ -695,11 +854,30 @@ async function setupTelegramWebhook() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ url: webhookUrl, secret_token: TG_SECRET }),
     });
-    const data = await resp.json();
+    const data = await resp.json().catch(()=>({}));
     if (data.ok) console.log(`✅ Telegram webhook установлен: ${webhookUrl}`);
     else console.error("❌ Ошибка установки вебхука:", data);
   } catch (e) { console.error("❗ Ошибка setupTelegramWebhook:", e); }
 }
 
 setupTelegramWebhook();
-app.listen(PORT, () => console.log(`Smart AI Listener (${VERSION}) on :${PORT}`));
+
+const server = app.listen(PORT, () => console.log(`Smart AI Listener (${VERSION}) on :${PORT}`));
+
+/* graceful shutdown: wait a short period for queues to drain */
+async function gracefulShutdown(signal) {
+  console.log(`Received ${signal}, shutting down...`);
+  server.close(() => console.log("HTTP server closed"));
+  // wait for tgQueue and asrQueue to drain or until timeout
+  const deadline = Date.now() + 15000;
+  while ((tgWorkerRunning || asrActive || tgQueue.length || asrQueue.length) && Date.now() < deadline) {
+    console.log("Waiting for background tasks to finish...", { tgQueue: tgQueue.length, asrQueue: asrQueue.length, asrActive });
+    // small tick
+    await new Promise(r => setTimeout(r, 500));
+  }
+  console.log("Shutdown complete.");
+  process.exit(0);
+}
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+```

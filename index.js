@@ -842,6 +842,24 @@ app.get("/amo/calls", async (req, res) => {
   }
 });
 
+// 4.1) последние звонки из примечаний (call_in / call_out)
+app.get("/amo/call-notes", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || "20",10), 100);
+    const page  = parseInt(req.query.page || "1",10);
+
+    // amoCRM не даёт общий список нот сразу по всем сущностям, поэтому возьмём по лидам и контактам
+    const [leads, contacts] = await Promise.all([
+      amoFetch(`/api/v4/leads/notes?filter[note_type]=call_in,call_out&limit=${limit}&page=${page}`),
+      amoFetch(`/api/v4/contacts/notes?filter[note_type]=call_in,call_out&limit=${limit}&page=${page}`)
+    ]);
+
+    res.json({ ok: true, leads, contacts });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: String(e) });
+  }
+});
+
 /* -------------------- fallback dump -------------------- */
 app.all("*", async (req, res) => {
   try {

@@ -65,7 +65,7 @@ function prettyType(type) {
     CANCELLED: "🚫 CANCELLED (отменён)",
     OUTGOING: "🔔 OUTGOING"
   };
-  // ЗАМЕНА: использована конкатенация вместо шаблонной строки — чтобы избежать ошибок в окружениях с проблемной кодировкой
+  // конкатенация вместо шаблонной строки — менее капризно в некоторых окружениях
   return map[t] || ("🔔 " + type);
 }
 
@@ -82,8 +82,6 @@ async function fetchWithTimeout(url, opts = {}, ms = 12000) {
 }
 
 /* -------------------- Telegram helpers with queue + retry -------------------- */
-/* Small serialized queue for outbound Telegram messages to reduce chance of flooding.
-   Concurrency 1, retries on transient network errors. */
 const tgQueue = [];
 let tgWorkerRunning = false;
 
@@ -104,7 +102,6 @@ async function runTgWorker() {
     } catch (e) {
       item.reject(e);
     }
-    // small delay between messages to be polite (configurable)
     await new Promise(r => setTimeout(r, parseInt(process.env.TG_SEND_DELAY_MS || "150", 10)));
   }
   tgWorkerRunning = false;
@@ -235,7 +232,6 @@ async function amoExchangeCode() {
 
 async function amoRefresh() {
   if (!AMO_REFRESH_TOKEN) throw new Error("AMO_REFRESH_TOKEN missing");
-  // single-flight refresh
   if (amoRefreshPromise) return amoRefreshPromise;
   amoRefreshPromise = (async () => {
     try {
@@ -258,7 +254,7 @@ async function amoFetch(path, opts = {}, ms = 15000) {
     ...opts,
     headers: { "authorization": `Bearer ${AMO_ACCESS_TOKEN}`, "content-type":"application/json", ...(opts.headers||{}) }
   }, ms);
-  if (r.status === 401) { // try refresh once with single-flight
+  if (r.status === 401) {
     await amoRefresh();
     const r2 = await fetchWithTimeout(url, {
       ...opts,
@@ -360,7 +356,6 @@ function formatTgMessage(n) {
 async function transcribeAudioFromUrl(fileUrl, meta = {}) {
   if (!OPENAI_API_KEY) { await sendTG("⚠️ <b>OPENAI_API_KEY не задан</b> — пропускаю транскрибацию."); return null; }
   try {
-    // Check content-length first (HEAD). Some hosts don't support HEAD; ignore failures.
     try {
       const head = await fetchWithTimeout(fileUrl, { method: "HEAD", redirect: "follow" }, 8000);
       const cl = head.headers.get("content-length");
@@ -413,7 +408,6 @@ function getIncomingKey(req) {
   if (auth) {
     const m = String(auth).match(/Bearer\s+(.+)/i);
     if (m) return m[1];
-    // fallthrough return whole header
     return String(auth).trim();
   }
   return (
@@ -468,7 +462,7 @@ function trackEvent(n) {
 
 /* Cleanup old CALLS entries and prevent unbounded growth */
 const HISTORY_TIMEOUT_MS = (parseInt(process.env.HISTORY_TIMEOUT_MIN || "7",10)) * 60 * 1000;
-const CALL_TTL_MS = (parseInt(process.env.CALL_TTL_MIN || "60",10)) * 60 * 1000; // remove calls not updated for CALL_TTL_MS
+const CALL_TTL_MS = (parseInt(process.env.CALL_TTL_MIN || "60",10)) * 60 * 1000;
 setInterval(async () => {
   const now = Date.now();
   for (const [callId, slot] of CALLS.entries()) {
@@ -485,7 +479,6 @@ setInterval(async () => {
       slot.awaitingHistory = false;
       CALLS.set(callId, slot);
     }
-    // cleanup old entries
     if (!slot.awaitingHistory && (now - slot.lastTs > CALL_TTL_MS)) {
       CALLS.delete(callId);
     }
@@ -591,7 +584,6 @@ app.all("/asr", async (req, res) => {
     const capText = `🎧 Запись (manual)\n<code>${wrapped}</code>`;
     if (TG_DIRECT_FETCH) await sendTGDocument(wrapped, capText);
 
-    // run transcription via queue to limit concurrency
     const text = await enqueueAsr(() => transcribeAudioFromUrl(wrapped, { callId: "manual" }));
     if (!text) return res.status(502).json({ ok:false, error:"asr failed" });
 
@@ -606,7 +598,6 @@ app.all("/asr", async (req, res) => {
 });
 
 /* -------------------- Telegram webhook: /tg/<secret> -------------------- */
-// Ensure a webhook secret — generate if missing (but fail in production)
 if (!TG_SECRET) {
   if (NODE_ENV === "production") {
     throw new Error("TG_WEBHOOK_SECRET is required in production");
@@ -690,10 +681,8 @@ app.all(["/megafon", "/"], async (req, res, next) => {
     pushEvent({ kind: "megafon", callId: normalized.callId, type: normalized.type, cmd: normalized.cmd });
     trackEvent(normalized);
 
-    // immediate response
     res.json({ ok: true, type: normalized.type, callId: normalized.callId });
 
-    // background work — use limited concurrency for expensive ops (ASR handled by queue)
     (async () => {
       try {
         if (normalized.cmd === "contact" && !SHOW_CONTACT_EVENTS) return;
@@ -729,7 +718,6 @@ app.all(["/megafon", "/"], async (req, res, next) => {
                   asrUrl = wrapped;
                 }
               }
-              // enqueue transcription
               const text = await enqueueAsr(() => transcribeAudioFromUrl(asrUrl, { callId: normalized.callId }));
               if (text) {
                 await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
@@ -759,15 +747,18 @@ app.all(["/megafon", "/"], async (req, res, next) => {
     res.status(200).json({ ok: false, error: String(e) });
   }
 });
+
 /* -------------------- AmoCRM OAuth callback (single) -------------------- */
 app.get("/amo/oauth/callback", async (req, res) => {
   try {
     const code = req.query.code;
     if (!code) return res.status(400).send("Missing ?code");
-    // Прямой обмен кода на токены
+
+    // Прямой обмен кода на токены — без чтения AMO_AUTH_CODE из env
     const j = await amoOAuth({ grant_type: "authorization_code", code });
     AMO_ACCESS_TOKEN  = j.access_token || "";
     AMO_REFRESH_TOKEN = j.refresh_token || "";
+
     // Страница-результат
     res.send(
       `<html><body style="font-family:sans-serif">
@@ -790,66 +781,9 @@ app.get("/amo/oauth/callback", async (req, res) => {
     res.status(500).send("OAuth error: " + String(e));
   }
 });
+
 /* -------------------- AmoCRM routes -------------------- */
-// 0) OAuth callback: принять ?code=..., обменять на токены и сохранить в памяти процесса
-app.get("/amo/oauth/callback", async (req, res) => {
-  try {
-    const code = req.query.code;
-    if (!code) return res.status(400).send("Missing ?code");
-    // прямой обмен: не требуем AMO_AUTH_CODE из env
-    const j = await amoOAuth({ grant_type: "authorization_code", code });
-    AMO_ACCESS_TOKEN  = j.access_token || "";
-    AMO_REFRESH_TOKEN = j.refresh_token || "";
-    // дружелюбная страница
-    res.send(
-      `<html><body style="font-family:sans-serif">
-         <h3>✅ AmoCRM авторизация успешна</h3>
-         <div>access: <code>${mask(j.access_token)}</code></div>
-         <div>refresh: <code>${mask(j.refresh_token)}</code></div>
-         <div>expires_in: <code>${j.expires_in}</code> сек</div>
-         <p>Теперь можно проверить <a href="/amo/account" target="_blank">/amo/account</a></p>
-       </body></html>`
-    );
-    // уведомим в ТГ
-    try {
-      await sendTG(
-        "✅ <b>AmoCRM OAuth OK</b>\n" +
-        `• access: <code>${mask(j.access_token)}</code>\n` +
-        `• refresh: <code>${mask(j.refresh_token)}</code>`
-      );
-    } catch {}
-  } catch (e) {
-    try { await sendTG(`❗️ AmoCRM OAuth callback error: <code>${e?.message||e}</code>`); } catch {}
-    res.status(500).send("OAuth error: " + String(e));
-  }
-});
-// --- OAuth callback: amoCRM -> наш сервер с ?code=... ---
-app.get("/amo/oauth/callback", async (req, res) => {
-  const code = req.query.code;
-  if (!code) return res.status(400).send("Missing ?code");
-
-  try {
-    // временно подставим код в env-переменную, чтобы переиспользовать amoExchangeCode()
-    const prev = process.env.AMO_AUTH_CODE;
-    process.env.AMO_AUTH_CODE = String(code);
-
-    const j = await amoExchangeCode(); // получаем access/refresh токены
-    await sendTG(
-      "✅ <b>AmoCRM: авторизация завершена</b>\n" +
-      `• access: <code>${(j.access_token||"").slice(0,6)}…</code>\n` +
-      `• refresh: <code>${(j.refresh_token||"").slice(0,6)}…</code>\n` +
-      `• expires_in: <code>${j.expires_in}</code>s`
-    );
-
-    if (prev !== undefined) process.env.AMO_AUTH_CODE = prev;
-
-    res.send("AmoCRM connected. You can close this tab.");
-  } catch (e) {
-    await sendTG(`❗️ AmoCRM callback error: <code>${e?.message || e}</code>`);
-    res.status(500).send("AmoCRM callback error");
-  }
-});
-// 1) обмен разового кода на токены
+// 1) обмен разового кода на токены (через AMO_AUTH_CODE из env)
 app.get("/amo/exchange", async (req, res) => {
   try {
     const j = await amoExchangeCode();
@@ -885,14 +819,14 @@ app.get("/amo/refresh", async (req, res) => {
 // 3) проверить аккаунт
 app.get("/amo/account", async (req, res) => {
   try {
-   const j = await amoFetch("/api/v4/account");
+    const j = await amoFetch("/api/v4/account");
     res.json({ ok:true, account: j });
   } catch (e) {
     res.status(500).json({ ok:false, error: String(e) });
   }
 });
 
-// 4) последние звонки (если включена сущность calls в аккаунте)
+// 4) последние звонки (если активирована сущность calls)
 app.get("/amo/calls", async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || "20",10), 250);
@@ -910,7 +844,6 @@ app.get("/amo/call-notes", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || "20",10), 100);
     const page  = parseInt(req.query.page || "1",10);
 
-    // amoCRM не даёт общий список нот сразу по всем сущностям, поэтому возьмём по лидам и контактам
     const [leads, contacts] = await Promise.all([
       amoFetch(`/api/v4/leads/notes?filter[note_type]=call_in,call_out&limit=${limit}&page=${page}`),
       amoFetch(`/api/v4/contacts/notes?filter[note_type]=call_in,call_out&limit=${limit}&page=${page}`)
@@ -949,8 +882,6 @@ app.all("*", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 /* -------------------- auto Telegram webhook setup -------------------- */
-// Improved setup + protected manual endpoint: replace previous setupTelegramWebhook() and its call with this block
-
 async function setupTelegramWebhook() {
   try {
     if (!TG_BOT_TOKEN) {
@@ -958,7 +889,6 @@ async function setupTelegramWebhook() {
       return;
     }
 
-    // try several env names that platforms commonly set
     const base = (process.env.RAILWAY_STATIC_URL ||
                   process.env.RAILWAY_URL ||
                   process.env.RAILWAY_PROJECT_URL ||
@@ -975,7 +905,6 @@ async function setupTelegramWebhook() {
     const webhookUrl = `${base}/tg/${TG_SECRET}`;
     console.log(`🔧 Попытка установки Telegram webhook на ${webhookUrl}`);
 
-    // retry logic with backoff
     const maxAttempts = 3;
     let attempt = 0;
     let lastErr = null;
@@ -999,7 +928,6 @@ async function setupTelegramWebhook() {
         lastErr = e;
         console.warn(`⚠️ setWebhook attempt ${attempt} failed:`, e?.message || e);
       }
-      // exponential backoff
       await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
     }
     console.error("❌ Не удалось установить Telegram webhook после попыток:", lastErr);
@@ -1009,7 +937,6 @@ async function setupTelegramWebhook() {
 }
 
 // Protected route to trigger webhook setup manually:
-// POST /tg/setup  (requires TG_WEBHOOK_SECRET in header x-setup-key or body.key or query.key)
 app.post("/tg/setup", async (req, res) => {
   try {
     const provided = req.headers["x-setup-key"] || req.body?.key || req.query?.key;
@@ -1033,11 +960,9 @@ const server = app.listen(PORT, () => console.log(`Smart AI Listener (${VERSION}
 async function gracefulShutdown(signal) {
   console.log(`Received ${signal}, shutting down...`);
   server.close(() => console.log("HTTP server closed"));
-  // wait for tgQueue and asrQueue to drain or until timeout
   const deadline = Date.now() + 15000;
   while ((tgWorkerRunning || asrActive || tgQueue.length || asrQueue.length) && Date.now() < deadline) {
     console.log("Waiting for background tasks to finish...", { tgQueue: tgQueue.length, asrQueue: asrQueue.length, asrActive });
-    // small tick
     await new Promise(r => setTimeout(r, 500));
   }
   console.log("Shutdown complete.");

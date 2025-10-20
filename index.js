@@ -761,6 +761,32 @@ app.all(["/megafon", "/"], async (req, res, next) => {
 });
 
 /* -------------------- AmoCRM routes -------------------- */
+// --- OAuth callback: amoCRM -> наш сервер с ?code=... ---
+app.get("/amo/oauth/callback", async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send("Missing ?code");
+
+  try {
+    // временно подставим код в env-переменную, чтобы переиспользовать amoExchangeCode()
+    const prev = process.env.AMO_AUTH_CODE;
+    process.env.AMO_AUTH_CODE = String(code);
+
+    const j = await amoExchangeCode(); // получаем access/refresh токены
+    await sendTG(
+      "✅ <b>AmoCRM: авторизация завершена</b>\n" +
+      `• access: <code>${(j.access_token||"").slice(0,6)}…</code>\n` +
+      `• refresh: <code>${(j.refresh_token||"").slice(0,6)}…</code>\n` +
+      `• expires_in: <code>${j.expires_in}</code>s`
+    );
+
+    if (prev !== undefined) process.env.AMO_AUTH_CODE = prev;
+
+    res.send("AmoCRM connected. You can close this tab.");
+  } catch (e) {
+    await sendTG(`❗️ AmoCRM callback error: <code>${e?.message || e}</code>`);
+    res.status(500).send("AmoCRM callback error");
+  }
+});
 // 1) обмен разового кода на токены
 app.get("/amo/exchange", async (req, res) => {
   try {

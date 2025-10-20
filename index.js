@@ -1,4 +1,3 @@
-```javascript name=index.js url=https://github.com/Sanyaras/Smart_AI_Listener/blob/702d0609f7cdb83c842494c480a3d58958949c58/index.js
 // index.js — Railway: MegaPBX → Telegram + Telegram relay ASR + AmoCRM, non-blocking webhooks
 // v1.6.0 -> refactor and fixes: security, concurrency, robustness, streaming checks, single-flight refresh, graceful shutdown
 // Updated: 2025-10-20
@@ -66,7 +65,8 @@ function prettyType(type) {
     CANCELLED: "🚫 CANCELLED (отменён)",
     OUTGOING: "🔔 OUTGOING"
   };
-  return map[t] || `🔔 ${type}`;
+  // ЗАМЕНА: использована конкатенация вместо шаблонной строки — чтобы избежать ошибок в окружениях с проблемной кодировкой
+  return map[t] || ("🔔 " + type);
 }
 
 function chunkText(str, max = 3500) { const out=[]; for (let i=0;i<str.length;i+=max) out.push(str.slice(i,i+max)); return out; }
@@ -880,4 +880,3 @@ async function gracefulShutdown(signal) {
 }
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-```

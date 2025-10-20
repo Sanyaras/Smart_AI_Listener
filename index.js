@@ -759,80 +759,35 @@ app.all(["/megafon", "/"], async (req, res, next) => {
     res.status(200).json({ ok: false, error: String(e) });
   }
 });
-// --- AmoCRM OAuth callback: принимает ?code=..., сразу меняет на токены и показывает результат
+/* -------------------- AmoCRM OAuth callback (single) -------------------- */
 app.get("/amo/oauth/callback", async (req, res) => {
   try {
     const code = req.query.code;
-    if (!code) {
-      return res
-        .status(400)
-        .send("AmoCRM OAuth callback: параметр ?code не передан");
-    }
-    // сохраняем код в переменную процесса (на время жизни процесса)
-    process.env.AMO_AUTH_CODE = code;
-    // обновляем локальную переменную, чтобы amoExchangeCode увидел код
-    // (она объявлена выше как const AMO_AUTH_CODE, потому создадим локальную)
-    globalThis.__AMO_AUTH_CODE_OVERRIDE__ = code;
-
-    // маленький хак: обернём amoExchangeCode так, чтобы он взял код из override
-    const _origAmoExchangeCode = amoExchangeCode;
-    const j = await (async () => {
-      // временно подменим чтение кода
-      const saved = AMO_AUTH_CODE;
-      try {
-        // @ts-ignore
-        // eslint-disable-next-line no-undef
-        AMO_AUTH_CODE = globalThis.__AMO_AUTH_CODE_OVERRIDE__ || AMO_AUTH_CODE;
-        return await _origAmoExchangeCode();
-      } finally {
-        // @ts-ignore
-        AMO_AUTH_CODE = saved;
-      }
-    })();
-
-    // успех — покажем краткий ответ
-    return res.status(200).send(
-      `<pre>OK. Tokens saved in memory.
-access_token: ${String(j.access_token || "").slice(0,4)}…${String(j.access_token || "").slice(-4)}
-refresh_token: ${String(j.refresh_token || "").slice(0,4)}…${String(j.refresh_token || "").slice(-4)}
-expires_in: ${j.expires_in}s
-Вы можете проверить /amo/account</pre>`
-    );
-  } catch (e) {
-    return res
-      .status(500)
-      .send(`AmoCRM OAuth error: ${e?.message || e}`);
-  }
-});
-
-// AmoCRM OAuth callback — принимает ?code=... и сразу меняет его на access/refresh токены
-app.get("/amo/oauth/callback", async (req, res) => {
-  try {
-    const code = req.query.code;
-    if (!code) {
-      return res.status(400).send("AmoCRM OAuth callback: не передан ?code");
-    }
-    // прямой обмен кода на токены — без зависимостей от AMO_AUTH_CODE из env
-    const j = await amoOAuth({
-      grant_type: "authorization_code",
-      code
-    });
-    AMO_ACCESS_TOKEN = j.access_token || "";
+    if (!code) return res.status(400).send("Missing ?code");
+    // Прямой обмен кода на токены
+    const j = await amoOAuth({ grant_type: "authorization_code", code });
+    AMO_ACCESS_TOKEN  = j.access_token || "";
     AMO_REFRESH_TOKEN = j.refresh_token || "";
-
-    // короткая страница-результат
-    return res
-      .status(200)
-      .send(
-        `<pre>OK — токены получены и сохранены в памяти процесса.
-access_token: ${String(j.access_token || "").slice(0,4)}…${String(j.access_token || "").slice(-4)}
-refresh_token: ${String(j.refresh_token || "").slice(0,4)}…${String(j.refresh_token || "").slice(-4)}
-expires_in: ${j.expires_in}s
-
-Теперь можно проверить /amo/account</pre>`
+    // Страница-результат
+    res.send(
+      `<html><body style="font-family:sans-serif">
+         <h3>✅ AmoCRM авторизация успешна</h3>
+         <div>access: <code>${mask(j.access_token)}</code></div>
+         <div>refresh: <code>${mask(j.refresh_token)}</code></div>
+         <div>expires_in: <code>${j.expires_in}</code> сек</div>
+         <p>Теперь можно проверить <a href="/amo/account" target="_blank">/amo/account</a></p>
+       </body></html>`
+    );
+    try {
+      await sendTG(
+        "✅ <b>AmoCRM OAuth OK</b>\n" +
+        `• access: <code>${mask(j.access_token)}</code>\n` +
+        `• refresh: <code>${mask(j.refresh_token)}</code>`
       );
+    } catch {}
   } catch (e) {
-    return res.status(500).send(`AmoCRM OAuth error: ${e?.message || e}`);
+    try { await sendTG(`❗️ AmoCRM OAuth callback error: <code>${e?.message||e}</code>`); } catch {}
+    res.status(500).send("OAuth error: " + String(e));
   }
 });
 /* -------------------- AmoCRM routes -------------------- */
@@ -930,7 +885,7 @@ app.get("/amo/refresh", async (req, res) => {
 // 3) проверить аккаунт
 app.get("/amo/account", async (req, res) => {
   try {
-    const j = await amoFetch("/api/v4/account?with=users,amojo_id");
+   const j = await amoFetch("/api/v4/account");
     res.json({ ok:true, account: j });
   } catch (e) {
     res.status(500).json({ ok:false, error: String(e) });

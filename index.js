@@ -836,6 +836,38 @@ expires_in: ${j.expires_in}s
   }
 });
 /* -------------------- AmoCRM routes -------------------- */
+// 0) OAuth callback: принять ?code=..., обменять на токены и сохранить в памяти процесса
+app.get("/amo/oauth/callback", async (req, res) => {
+  try {
+    const code = req.query.code;
+    if (!code) return res.status(400).send("Missing ?code");
+    // прямой обмен: не требуем AMO_AUTH_CODE из env
+    const j = await amoOAuth({ grant_type: "authorization_code", code });
+    AMO_ACCESS_TOKEN  = j.access_token || "";
+    AMO_REFRESH_TOKEN = j.refresh_token || "";
+    // дружелюбная страница
+    res.send(
+      `<html><body style="font-family:sans-serif">
+         <h3>✅ AmoCRM авторизация успешна</h3>
+         <div>access: <code>${mask(j.access_token)}</code></div>
+         <div>refresh: <code>${mask(j.refresh_token)}</code></div>
+         <div>expires_in: <code>${j.expires_in}</code> сек</div>
+         <p>Теперь можно проверить <a href="/amo/account" target="_blank">/amo/account</a></p>
+       </body></html>`
+    );
+    // уведомим в ТГ
+    try {
+      await sendTG(
+        "✅ <b>AmoCRM OAuth OK</b>\n" +
+        `• access: <code>${mask(j.access_token)}</code>\n` +
+        `• refresh: <code>${mask(j.refresh_token)}</code>`
+      );
+    } catch {}
+  } catch (e) {
+    try { await sendTG(`❗️ AmoCRM OAuth callback error: <code>${e?.message||e}</code>`); } catch {}
+    res.status(500).send("OAuth error: " + String(e));
+  }
+});
 // --- OAuth callback: amoCRM -> наш сервер с ?code=... ---
 app.get("/amo/oauth/callback", async (req, res) => {
   const code = req.query.code;

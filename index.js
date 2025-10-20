@@ -1,5 +1,5 @@
-// index.js — Railway: MegaPBX → Telegram + Telegram relay ASR, non-blocking webhooks
-// v1.5.1
+// index.js — Railway: MegaPBX → Telegram + Telegram relay ASR + AmoCRM, non-blocking webhooks
+// v1.6.0
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -13,20 +13,30 @@ app.use(bodyParser.json({ limit: "25mb", verify: (req, res, buf) => { req.rawBod
 app.use(bodyParser.urlencoded({ extended: false, verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"], verify: (req, res, buf) => { req.rawBody = buf; } }));
 
-/* --- env --- */
+/* --- env: Telegram / MegaPBX --- */
 const TG_BOT_TOKEN            = process.env.TG_BOT_TOKEN || "";
-const TG_CHAT_ID              = process.env.TG_CHAT_ID || "";                           // чат для уведомлений
-const TG_WEBHOOK_SECRET       = process.env.TG_WEBHOOK_SECRET || "";                    // секрет пути вебхука
-const TG_SECRET               = (TG_WEBHOOK_SECRET || "hook12345").trim();              // фактический секрет
+const TG_CHAT_ID              = process.env.TG_CHAT_ID || "";
+const TG_WEBHOOK_SECRET       = process.env.TG_WEBHOOK_SECRET || "";
+const TG_SECRET               = (TG_WEBHOOK_SECRET || "hook12345").trim();
 const CRM_SHARED_KEY          = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
-const OPENAI_API_KEY          = process.env.OPENAI_API_KEY || "";                       // Whisper
+const OPENAI_API_KEY          = process.env.OPENAI_API_KEY || "";
 const AUTO_TRANSCRIBE         = process.env.AUTO_TRANSCRIBE === "1";
-const AUTO_TRANSCRIBE_VIA_TG  = process.env.AUTO_TRANSCRIBE_VIA_TG === "1";             // relay через Telegram
+const AUTO_TRANSCRIBE_VIA_TG  = process.env.AUTO_TRANSCRIBE_VIA_TG === "1";
 const SHOW_CONTACT_EVENTS     = process.env.SHOW_CONTACT_EVENTS === "1";
 const RELAY_BASE_URL          = process.env.RELAY_BASE_URL || "";
-const TG_DIRECT_FETCH         = process.env.TG_DIRECT_FETCH === "1";                    // Telegram сам скачает ссылку
-const TG_UPLOAD_CHAT_ID       = process.env.TG_UPLOAD_CHAT_ID || TG_CHAT_ID;            // «тихий» чат для relay
-const VERSION                 = "railway-1.5.1";
+const TG_DIRECT_FETCH         = process.env.TG_DIRECT_FETCH === "1";
+const TG_UPLOAD_CHAT_ID       = process.env.TG_UPLOAD_CHAT_ID || TG_CHAT_ID;
+
+/* --- env: AmoCRM --- */
+const AMO_BASE_URL       = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
+const AMO_CLIENT_ID      = process.env.AMO_CLIENT_ID || "";
+const AMO_CLIENT_SECRET  = process.env.AMO_CLIENT_SECRET || "";
+const AMO_REDIRECT_URI   = process.env.AMO_REDIRECT_URI || "";
+const AMO_AUTH_CODE      = process.env.AMO_AUTH_CODE || "";           // разовый код (20 минут)
+let   AMO_ACCESS_TOKEN   = process.env.AMO_ACCESS_TOKEN || "";        // если уже есть — будем использовать
+let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";       // если уже есть — будем обновлять
+
+const VERSION = "railway-1.6.0";
 
 /* -------------------- utils -------------------- */
 function chunkText(str, max = 3500) { const out=[]; for (let i=0;i<str.length;i+=max) out.push(str.slice(i,i+max)); return out; }
@@ -43,7 +53,8 @@ function prettyType(type) {
     HANGUP: "⛔️ HANGUP (завершён)",
     MISSED: "❌ MISSED (пропущен)",
     HISTORY: "🗂 HISTORY (итоги/запись)",
-    CANCELLED: "🚫 CANCELLED (отменён)"
+    CANCELLED: "🚫 CANCELLED (отменён)",
+    OUTGOING: "🔔 OUTGOING"
   };
   return map[t] || `🔔 ${type}`;
 }
@@ -53,7 +64,7 @@ async function fetchWithTimeout(url, opts = {}, ms = 12000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(new Error("timeout")), ms);
   try {
-    const headers = { "user-agent": "SmartAIListener/1.5 (+railway)", ...opts.headers };
+    const headers = { "user-agent": "SmartAIListener/1.6 (+railway)", ...opts.headers };
     return await fetch(url, { ...opts, headers, signal: ctrl.signal });
   } finally { clearTimeout(timer); }
 }
@@ -119,6 +130,68 @@ function wrapRecordingUrl(url) {
     if (u.hostname === rb.hostname && u.port === rb.port) return url;
   } catch {}
   return RELAY_BASE_URL + encodeURIComponent(url);
+}
+
+/* -------------------- AmoCRM helpers -------------------- */
+function mask(s){ if(!s) return ""; const t=String(s); return t.length<=8? t.replace(/.(?=.{2})/g,"*") : t.slice(0,4) + "…" + t.slice(-4); }
+
+function ensureAmoEnv() {
+  if (!AMO_BASE_URL || !AMO_CLIENT_ID || !AMO_CLIENT_SECRET || !AMO_REDIRECT_URI) {
+    throw new Error("AMO_* env incomplete");
+  }
+}
+
+async function amoOAuth(body) {
+  ensureAmoEnv();
+  const url = `${AMO_BASE_URL}/oauth2/access_token`;
+  const resp = await fetchWithTimeout(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      client_id: AMO_CLIENT_ID,
+      client_secret: AMO_CLIENT_SECRET,
+      redirect_uri: AMO_REDIRECT_URI,
+      ...body
+    })
+  }, 20000);
+  if (!resp.ok) throw new Error(`amo oauth ${resp.status}: ${await resp.text().catch(()=> "")}`);
+  return await resp.json();
+}
+
+async function amoExchangeCode() {
+  if (!AMO_AUTH_CODE) throw new Error("AMO_AUTH_CODE missing");
+  const j = await amoOAuth({ grant_type: "authorization_code", code: AMO_AUTH_CODE });
+  AMO_ACCESS_TOKEN = j.access_token || "";
+  AMO_REFRESH_TOKEN = j.refresh_token || "";
+  return j;
+}
+async function amoRefresh() {
+  if (!AMO_REFRESH_TOKEN) throw new Error("AMO_REFRESH_TOKEN missing");
+  const j = await amoOAuth({ grant_type: "refresh_token", refresh_token: AMO_REFRESH_TOKEN });
+  AMO_ACCESS_TOKEN = j.access_token || "";
+  AMO_REFRESH_TOKEN = j.refresh_token || "";
+  return j;
+}
+
+async function amoFetch(path, opts = {}, ms = 15000) {
+  ensureAmoEnv();
+  if (!AMO_ACCESS_TOKEN) throw new Error("No AMO_ACCESS_TOKEN — run /amo/exchange first");
+  const url = `${AMO_BASE_URL}${path}`;
+  const r = await fetchWithTimeout(url, {
+    ...opts,
+    headers: { "authorization": `Bearer ${AMO_ACCESS_TOKEN}`, "content-type":"application/json", ...(opts.headers||{}) }
+  }, ms);
+  if (r.status === 401) { // try refresh once
+    await amoRefresh();
+    const r2 = await fetchWithTimeout(url, {
+      ...opts,
+      headers: { "authorization": `Bearer ${AMO_ACCESS_TOKEN}`, "content-type":"application/json", ...(opts.headers||{}) }
+    }, ms);
+    if (!r2.ok) throw new Error(`amo ${path} ${r2.status}: ${await r2.text().catch(()=> "")}`);
+    return await r2.json();
+  }
+  if (!r.ok) throw new Error(`amo ${path} ${r.status}: ${await r.text().catch(()=> "")}`);
+  return await r.json();
 }
 
 /* -------------------- MegaPBX normalizer -------------------- */
@@ -263,14 +336,13 @@ app.get("/diag/events", (_, res) => res.json({ count: LAST_EVENTS.length, items:
 /* ---- metrics / tracking ---- */
 const STATS = {
   total: 0,
-  byType: {},      // { INCOMING: n, ACCEPTED: n, ... }
-  byCmd: {},       // { event: n, contact: n, history: n }
+  byType: {},
+  byCmd: {},
   withAudioUrl: 0,
   withoutAudioUrl: 0,
   errors: 0
 };
-
-const CALLS = new Map(); // callId -> { firstTs, lastTs, types:Set, lastType, hasAudio, awaitingHistory:boolean }
+const CALLS = new Map(); // callId -> slot
 
 function trackEvent(n) {
   STATS.total++;
@@ -309,7 +381,7 @@ setInterval(async () => {
           `• Была ссылка на запись: <code>${slot.hasAudio ? "да" : "нет"}</code>`
         );
       } catch {}
-      slot.awaitingHistory = false; // чтобы не спамить
+      slot.awaitingHistory = false;
       CALLS.set(callId, slot);
     }
   }
@@ -320,23 +392,25 @@ app.get("/", (_, res) => res.send("OK"));
 app.get("/version", (_, res) => res.json({ version: VERSION }));
 app.get("/diag/env", (req, res) => {
   res.json({
+    VERSION,
     TG_BOT_TOKEN: !!process.env.TG_BOT_TOKEN,
     TG_CHAT_ID: process.env.TG_CHAT_ID ? (String(process.env.TG_CHAT_ID).slice(0,4) + "...") : "",
     OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
     CRM_SHARED_KEY: !!process.env.CRM_SHARED_KEY,
     AUTO_TRANSCRIBE, AUTO_TRANSCRIBE_VIA_TG, SHOW_CONTACT_EVENTS, TG_DIRECT_FETCH,
     RELAY_BASE_URL: !!RELAY_BASE_URL, TG_WEBHOOK_SECRET: !!TG_WEBHOOK_SECRET,
-    TG_UPLOAD_CHAT_ID: !!TG_UPLOAD_CHAT_ID, ROUTE_SECRET: TG_SECRET
+    TG_UPLOAD_CHAT_ID: !!TG_UPLOAD_CHAT_ID, ROUTE_SECRET: TG_SECRET,
+    AMO_BASE_URL: !!AMO_BASE_URL,
+    AMO_CLIENT_ID: mask(AMO_CLIENT_ID),
+    AMO_CLIENT_SECRET: mask(AMO_CLIENT_SECRET),
+    AMO_REDIRECT_URI: !!AMO_REDIRECT_URI,
+    AMO_ACCESS_TOKEN: AMO_ACCESS_TOKEN ? mask(AMO_ACCESS_TOKEN) : "",
+    AMO_REFRESH_TOKEN: AMO_REFRESH_TOKEN ? mask(AMO_REFRESH_TOKEN) : ""
   });
 });
 app.get("/diag/stats", (_, res) => {
-  res.json({
-    version: VERSION,
-    totals: STATS,
-    calls_tracked: CALLS.size,
-  });
+  res.json({ version: VERSION, totals: STATS, calls_tracked: CALLS.size });
 });
-
 app.get("/diag/calls", (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "100",10), 500);
   const items = [];
@@ -467,15 +541,15 @@ app.all(["/megafon", "/"], async (req, res, next) => {
         if (normalized.cmd === "contact" && !SHOW_CONTACT_EVENTS) return;
 
         await sendTG(formatTgMessage(normalized));
-        // HISTORY пришёл без прямой ссылки на запись — сигналим
-if (normalized.type === "HISTORY" && (!normalized.recordInfo?.urls?.length)) {
-  await sendTG(
-    "⚠️ HISTORY без ссылки на запись\n" +
-    `• CallID: <code>${normalized.callId}</code>\n` +
-    `• От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
-    `• ext: <code>${normalized.ext}</code>`
-  );
-}
+
+        if (normalized.type === "HISTORY" && (!normalized.recordInfo?.urls?.length)) {
+          await sendTG(
+            "⚠️ HISTORY без ссылки на запись\n" +
+            `• CallID: <code>${normalized.callId}</code>\n` +
+            `• От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
+            `• ext: <code>${normalized.ext}</code>`
+          );
+        }
 
         const firstAudio = normalized.recordInfo?.urls?.find(u => /\.(mp3|wav|ogg|m4a)(\?|$)/i.test(u));
         if (firstAudio && (normalized.type === "HISTORY" || normalized.type === "COMPLETED")) {
@@ -484,8 +558,7 @@ if (normalized.type === "HISTORY" && (!normalized.recordInfo?.urls?.length)) {
             `🎧 Запись по звонку <code>${normalized.callId}</code>\n` +
             `От: <code>${normalized.from}</code> → Кому: <code>${normalized.to}</code>\n` +
             `ext: <code>${normalized.ext}</code>`;
-
-          await sendTGDocument(wrapped, cap); // для превью в чате
+          await sendTGDocument(wrapped, cap);
 
           if (AUTO_TRANSCRIBE) {
             try {
@@ -498,7 +571,6 @@ if (normalized.type === "HISTORY" && (!normalized.recordInfo?.urls?.length)) {
                   asrUrl = wrapped;
                 }
               }
-
               const text = await transcribeAudioFromUrl(asrUrl, { callId: normalized.callId });
               if (text) {
                 await sendTG(`📝 <b>Транскрипт</b> (CallID <code>${normalized.callId}</code>):`);
@@ -525,11 +597,67 @@ if (normalized.type === "HISTORY" && (!normalized.recordInfo?.urls?.length)) {
 
   } catch (e) {
     try { await sendTG(`❗️ <b>Webhook error</b>:\n<code>${(e && e.message) || e}</code>`); } catch {}
-    // отвечаем 200 даже при ошибке, чтобы провайдер не дудосил ретраями
     res.status(200).json({ ok: false, error: String(e) });
   }
 });
 
+/* -------------------- AmoCRM routes -------------------- */
+// 1) обмен разового кода на токены
+app.get("/amo/exchange", async (req, res) => {
+  try {
+    const j = await amoExchangeCode();
+    await sendTG(
+      "✅ <b>AmoCRM: получены токены</b>\n" +
+      `• access: <code>${mask(j.access_token)}</code>\n` +
+      `• refresh: <code>${mask(j.refresh_token)}</code>\n` +
+      `• expires_in: <code>${j.expires_in}</code>s`
+    );
+    res.json({ ok:true, access_token: j.access_token, refresh_token: j.refresh_token, expires_in: j.expires_in });
+  } catch (e) {
+    await sendTG(`❗️ AmoCRM exchange error: <code>${e?.message || e}</code>`);
+    res.status(500).json({ ok:false, error: String(e) });
+  }
+});
+
+// 2) рефреш токена
+app.get("/amo/refresh", async (req, res) => {
+  try {
+    const j = await amoRefresh();
+    await sendTG(
+      "🔄 <b>AmoCRM: refresh OK</b>\n" +
+      `• access: <code>${mask(j.access_token)}</code>\n` +
+      `• refresh: <code>${mask(j.refresh_token)}</code>`
+    );
+    res.json({ ok:true, access_token: j.access_token, refresh_token: j.refresh_token, expires_in: j.expires_in });
+  } catch (e) {
+    await sendTG(`❗️ AmoCRM refresh error: <code>${e?.message || e}</code>`);
+    res.status(500).json({ ok:false, error: String(e) });
+  }
+});
+
+// 3) проверить аккаунт
+app.get("/amo/account", async (req, res) => {
+  try {
+    const j = await amoFetch("/api/v4/account?with=users,amojo_id");
+    res.json({ ok:true, account: j });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: String(e) });
+  }
+});
+
+// 4) последние звонки (если включена сущность calls в аккаунте)
+app.get("/amo/calls", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || "20",10), 250);
+    const page = parseInt(req.query.page || "1",10);
+    const j = await amoFetch(`/api/v4/calls?limit=${limit}&page=${page}`);
+    res.json({ ok:true, ...j });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: String(e) });
+  }
+});
+
+/* -------------------- fallback dump -------------------- */
 app.all("*", async (req, res) => {
   try {
     const body = typeof req.body === "undefined" ? {} : req.body;

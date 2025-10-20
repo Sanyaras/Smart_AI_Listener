@@ -805,6 +805,36 @@ expires_in: ${j.expires_in}s
   }
 });
 
+// AmoCRM OAuth callback — принимает ?code=... и сразу меняет его на access/refresh токены
+app.get("/amo/oauth/callback", async (req, res) => {
+  try {
+    const code = req.query.code;
+    if (!code) {
+      return res.status(400).send("AmoCRM OAuth callback: не передан ?code");
+    }
+    // прямой обмен кода на токены — без зависимостей от AMO_AUTH_CODE из env
+    const j = await amoOAuth({
+      grant_type: "authorization_code",
+      code
+    });
+    AMO_ACCESS_TOKEN = j.access_token || "";
+    AMO_REFRESH_TOKEN = j.refresh_token || "";
+
+    // короткая страница-результат
+    return res
+      .status(200)
+      .send(
+        `<pre>OK — токены получены и сохранены в памяти процесса.
+access_token: ${String(j.access_token || "").slice(0,4)}…${String(j.access_token || "").slice(-4)}
+refresh_token: ${String(j.refresh_token || "").slice(0,4)}…${String(j.refresh_token || "").slice(-4)}
+expires_in: ${j.expires_in}s
+
+Теперь можно проверить /amo/account</pre>`
+      );
+  } catch (e) {
+    return res.status(500).send(`AmoCRM OAuth error: ${e?.message || e}`);
+  }
+});
 /* -------------------- AmoCRM routes -------------------- */
 // --- OAuth callback: amoCRM -> наш сервер с ?code=... ---
 app.get("/amo/oauth/callback", async (req, res) => {

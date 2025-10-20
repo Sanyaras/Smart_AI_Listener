@@ -843,23 +843,82 @@ app.all("*", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 /* -------------------- auto Telegram webhook setup -------------------- */
+// Improved setup + protected manual endpoint: replace previous setupTelegramWebhook() and its call with this block
+
 async function setupTelegramWebhook() {
   try {
-    if (!TG_BOT_TOKEN) { console.warn("❌ TG_BOT_TOKEN отсутствует, пропускаем setWebhook"); return; }
-    const base = (process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_URL || process.env.RAILWAY_PROJECT_URL || "").replace(/\/+$/,"");
-    if (!base) { console.warn("⚠️ Не найден Railway URL, пропускаем установку вебхука"); return; }
+    if (!TG_BOT_TOKEN) {
+      console.warn("❌ TG_BOT_TOKEN отсутствует, пропускаем setWebhook");
+      return;
+    }
+
+    // try several env names that platforms commonly set
+    const base = (process.env.RAILWAY_STATIC_URL ||
+                  process.env.RAILWAY_URL ||
+                  process.env.RAILWAY_PROJECT_URL ||
+                  process.env.PUBLIC_URL ||
+                  process.env.APP_URL ||
+                  "").replace(/\/+$/,"");
+
+    if (!base) {
+      console.warn("⚠️ Не найден публичный URL в окружении (RAILWAY_URL/RAILWAY_STATIC_URL/PUBLIC_URL).");
+      console.warn("⚠️ Вызовите POST /tg/setup с TG_WEBHOOK_SECRET для ручной установки вебхука.");
+      return;
+    }
+
     const webhookUrl = `${base}/tg/${TG_SECRET}`;
-    const resp = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ url: webhookUrl, secret_token: TG_SECRET }),
-    });
-    const data = await resp.json().catch(()=>({}));
-    if (data.ok) console.log(`✅ Telegram webhook установлен: ${webhookUrl}`);
-    else console.error("❌ Ошибка установки вебхука:", data);
-  } catch (e) { console.error("❗ Ошибка setupTelegramWebhook:", e); }
+    console.log(`🔧 Попытка установки Telegram webhook на ${webhookUrl}`);
+
+    // retry logic with backoff
+    const maxAttempts = 3;
+    let attempt = 0;
+    let lastErr = null;
+    while (attempt < maxAttempts) {
+      attempt++;
+      try {
+        const resp = await fetchWithTimeout(`https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ url: webhookUrl, secret_token: TG_SECRET })
+        }, 15000);
+        const data = await resp.json().catch(()=>({}));
+        if (data && data.ok) {
+          console.log(`✅ Telegram webhook установлен: ${webhookUrl}`);
+          return;
+        } else {
+          lastErr = data || `http ${resp.status}`;
+          console.warn(`⚠️ setWebhook попытка ${attempt} вернула ошибку:`, lastErr);
+        }
+      } catch (e) {
+        lastErr = e;
+        console.warn(`⚠️ setWebhook attempt ${attempt} failed:`, e?.message || e);
+      }
+      // exponential backoff
+      await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+    }
+    console.error("❌ Не удалось установить Telegram webhook после попыток:", lastErr);
+  } catch (e) {
+    console.error("❗ Ошибка setupTelegramWebhook:", e);
+  }
 }
 
+// Protected route to trigger webhook setup manually:
+// POST /tg/setup  (requires TG_WEBHOOK_SECRET in header x-setup-key or body.key or query.key)
+app.post("/tg/setup", async (req, res) => {
+  try {
+    const provided = req.headers["x-setup-key"] || req.body?.key || req.query?.key;
+    if (!provided || !TG_WEBHOOK_SECRET || String(provided) !== String(TG_WEBHOOK_SECRET)) {
+      return res.status(401).json({ ok: false, error: "bad key" });
+    }
+    await setupTelegramWebhook();
+    return res.json({ ok: true, note: "setup attempted, check logs" });
+  } catch (e) {
+    console.error("tg/setup error:", e);
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Try to install webhook automatically on startup
 setupTelegramWebhook();
 
 const server = app.listen(PORT, () => console.log(`Smart AI Listener (${VERSION}) on :${PORT}`));

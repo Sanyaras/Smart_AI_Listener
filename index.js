@@ -759,6 +759,51 @@ app.all(["/megafon", "/"], async (req, res, next) => {
     res.status(200).json({ ok: false, error: String(e) });
   }
 });
+// --- AmoCRM OAuth callback: принимает ?code=..., сразу меняет на токены и показывает результат
+app.get("/amo/oauth/callback", async (req, res) => {
+  try {
+    const code = req.query.code;
+    if (!code) {
+      return res
+        .status(400)
+        .send("AmoCRM OAuth callback: параметр ?code не передан");
+    }
+    // сохраняем код в переменную процесса (на время жизни процесса)
+    process.env.AMO_AUTH_CODE = code;
+    // обновляем локальную переменную, чтобы amoExchangeCode увидел код
+    // (она объявлена выше как const AMO_AUTH_CODE, потому создадим локальную)
+    globalThis.__AMO_AUTH_CODE_OVERRIDE__ = code;
+
+    // маленький хак: обернём amoExchangeCode так, чтобы он взял код из override
+    const _origAmoExchangeCode = amoExchangeCode;
+    const j = await (async () => {
+      // временно подменим чтение кода
+      const saved = AMO_AUTH_CODE;
+      try {
+        // @ts-ignore
+        // eslint-disable-next-line no-undef
+        AMO_AUTH_CODE = globalThis.__AMO_AUTH_CODE_OVERRIDE__ || AMO_AUTH_CODE;
+        return await _origAmoExchangeCode();
+      } finally {
+        // @ts-ignore
+        AMO_AUTH_CODE = saved;
+      }
+    })();
+
+    // успех — покажем краткий ответ
+    return res.status(200).send(
+      `<pre>OK. Tokens saved in memory.
+access_token: ${String(j.access_token || "").slice(0,4)}…${String(j.access_token || "").slice(-4)}
+refresh_token: ${String(j.refresh_token || "").slice(0,4)}…${String(j.refresh_token || "").slice(-4)}
+expires_in: ${j.expires_in}s
+Вы можете проверить /amo/account</pre>`
+    );
+  } catch (e) {
+    return res
+      .status(500)
+      .send(`AmoCRM OAuth error: ${e?.message || e}`);
+  }
+});
 
 /* -------------------- AmoCRM routes -------------------- */
 // --- OAuth callback: amoCRM -> наш сервер с ?code=... ---

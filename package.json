@@ -1,16 +1,20 @@
 {
   "name": "smart-ai-listener",
-  "version": "1.0.1",
+  "version": "1.0.2",
+  "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": "20.11.1"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "start:debug": "NODE_OPTIONS='--trace-warnings' node index.js"
+  },
   "dependencies": {
     "body-parser": "^1.20.2",
     "express": "^4.19.2",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.2",
     "socks-proxy-agent": "^8.0.2"
-  },
-  "scripts": {
-    "start": "node index.js"
   }
 }

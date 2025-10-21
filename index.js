@@ -895,6 +895,125 @@ app.get("/amo/call-notes", async (req, res) => {
   }
 });
 
+/* -------------------- AmoCRM poller: call notes -> ASR -------------------- */
+// простая защита по ключу (используем CRM_SHARED_KEY из env)
+function assertKey(req) {
+  const got = (req.headers["authorization"] || req.headers["x-api-key"] || req.query.key || "").toString().replace(/^Bearer\s+/i,"");
+  if (CRM_SHARED_KEY && got !== CRM_SHARED_KEY) throw new Error("bad key");
+}
+
+const PROCESSED_NOTE_IDS = new Set();
+const PROCESSED_RECORD_URLS = new Set();
+const PROCESSED_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+let LAST_CLEANUP = 0;
+
+function cleanupProcessed() {
+  const now = Date.now();
+  if (now - LAST_CLEANUP < 60 * 60 * 1000) return;
+  LAST_CLEANUP = now;
+  PROCESSED_NOTE_IDS.clear();
+  PROCESSED_RECORD_URLS.clear();
+}
+
+function findRecordingLinks(note) {
+  const sources = [];
+  if (note.text) sources.push(String(note.text));
+  if (note.params && typeof note.params === "object") sources.push(JSON.stringify(note.params));
+  const blob = sources.join(" ");
+  const urls = [];
+  const re = /(https?:\/\/[^\s"'<>]+?\.(mp3|wav|ogg|m4a|opus)(\?[^\s"'<>]*)?)/ig;
+  let m;
+  while ((m = re.exec(blob))) urls.push(m[1]);
+  return Array.from(new Set(urls));
+}
+
+async function processAmoCallNotes(limit = 20) {
+  const [leads, contacts, companies] = await Promise.all([
+    amoFetch(`/api/v4/leads/notes?filter[note_type]=call_in,call_out&limit=${limit}`),
+    amoFetch(`/api/v4/contacts/notes?filter[note_type]=call_in,call_out&limit=${limit}`),
+    amoFetch(`/api/v4/companies/notes?filter[note_type]=call_in,call_out&limit=${limit}`)
+  ]);
+
+  const picked = [];
+  const pack = (entity, arr) => {
+    const items = Array.isArray(arr?._embedded?.notes) ? arr._embedded.notes : [];
+    for (const n of items) {
+      picked.push({
+        entity,
+        note_id: n.id,
+        note_type: n.note_type,
+        created_at: n.created_at,
+        entity_id: n.entity_id,
+        text: n.text || "",
+        params: n.params || n.payload || n.data || {}
+      });
+    }
+  };
+  pack("lead", leads);
+  pack("contact", contacts);
+  pack("company", companies);
+
+  picked.sort((a,b) => (b.created_at||0) - (a.created_at||0));
+
+  let started = 0, skipped = 0, withLinks = 0;
+
+  for (const note of picked) {
+    if (PROCESSED_NOTE_IDS.has(note.note_id)) { skipped++; continue; }
+    const links = findRecordingLinks(note);
+    if (!links.length) { skipped++; continue; }
+    withLinks++;
+
+    PROCESSED_NOTE_IDS.add(note.note_id);
+    const head =
+      `🎯 Нашёл запись в amo (${note.note_type})\n` +
+      `• ${note.entity} #${note.entity_id} · note #${note.note_id}\n` +
+      `• created_at: ${note.created_at}`;
+    await sendTG(head);
+
+    for (const url of links) {
+      if (PROCESSED_RECORD_URLS.has(url)) continue;
+      PROCESSED_RECORD_URLS.add(url);
+
+      const caption = `🎧 Из amo: ${note.note_type} · ${note.entity} #${note.entity_id} · note #${note.note_id}`;
+      await sendTGDocument(url, caption).catch(() => sendTG(`🎧 ${caption}\n${url}`));
+
+      try {
+        const text = await enqueueAsr(() => transcribeAudioFromUrl(url, { callId: `amo-${note.note_id}` }));
+        if (text) {
+          await sendTG(`📝 <b>Транскрипт</b> (amo note <code>${note.note_id}</code>):`);
+          for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
+          try {
+            const qa = await analyzeTranscript(text, { callId: `amo-${note.note_id}`, brand: process.env.CALL_QA_BRAND || "" });
+            await sendTG(formatQaForTelegram(qa));
+          } catch (e) {
+            await sendTG("⚠️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>");
+          }
+          started++;
+        } else {
+          await sendTG("⚠️ ASR не удалось выполнить для ссылки из amo.");
+        }
+      } catch (e) {
+        await sendTG("❗️ Ошибка скачивания/ASR по ссылке из amo: <code>"+(e?.message||e)+"</code>");
+      }
+    }
+  }
+
+  cleanupProcessed();
+  return { scanned: picked.length, withLinks, started, skipped };
+}
+
+// Роут, который будем пинговать кроном
+app.get("/amo/poll", async (req, res) => {
+  try {
+    assertKey(req);
+    const limit = Math.min(parseInt(req.query.limit || "30",10), 100);
+    const out = await processAmoCallNotes(limit);
+    res.json({ ok:true, ...out });
+  } catch (e) {
+    res.status(401).json({ ok:false, error: String(e) });
+  }
+});
+
 /* -------------------- fallback dump -------------------- */
 app.all("*", async (req, res) => {
   try {

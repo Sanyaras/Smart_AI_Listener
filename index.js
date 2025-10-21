@@ -581,8 +581,19 @@ app.all("/asr", async (req, res) => {
     const url = (req.method === "GET" ? req.query.url : (req.body?.url || req.query?.url));
     if (!url) return res.status(400).json({ ok:false, error:"no url" });
     const wrapped = wrapRecordingUrl(String(url));
-    const capText = `🎧 Запись (manual)\n<code>${wrapped}</code>`;
-    if (TG_DIRECT_FETCH) await sendTGDocument(wrapped, capText);
+    let asrUrl = wrapped;
+
+if (AUTO_TRANSCRIBE_VIA_TG) {
+  try {
+    asrUrl = await tgSendUrlAndGetCdnUrl(
+      wrapped,
+      `🎧 Авто-relay для manual ASR`
+    );
+  } catch (e) {
+    await sendTG("⚠️ relay через Telegram не удался, скачиваю напрямую.\n<code>" + (e?.message || e) + "</code>");
+    asrUrl = wrapped;
+  }
+}
 
     const text = await enqueueAsr(() => transcribeAudioFromUrl(wrapped, { callId: "manual" }));
     if (!text) return res.status(502).json({ ok:false, error:"asr failed" });

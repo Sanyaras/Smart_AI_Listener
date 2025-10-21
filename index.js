@@ -870,18 +870,19 @@ app.get("/amo/call-notes", async (req, res) => {
 
     // Нормализуем к единому списку
     const pull = (obj, kind) =>
-      (obj?._embedded?.notes || []).map(n => ({
-        entity: kind,                       // lead | contact | company
-        note_id: n.id,
-        note_type: n.note_type,
-        text: n.params?.text || "",
-        created_at: n.created_at,
-        created_by: n.created_by,
-        entity_id: n.entity_id,
-        duration: n.params?.duration,       // для звонков часто есть
-        phone: n.params?.phone || n.params?.uniq, // часто кладут номер
-        service: n.params?.service,
-      }));
+  (obj?._embedded?.notes || []).map(n => ({
+    entity: kind,
+    note_id: n.id,
+    note_type: n.note_type,
+    text: n.params?.text || "",
+    created_at: n.created_at,
+    created_by: n.created_by,
+    entity_id: n.entity_id,
+    duration: n.params?.duration,
+    phone: n.params?.phone || n.params?.uniq,
+    service: n.params?.service,
+    link: n.params?.link || n.params?.file || n.params?.record_link || "", // 👈 добавляем это
+  }));
 
     const items = [
       ...pull(leads, "lead"),

@@ -595,7 +595,7 @@ if (AUTO_TRANSCRIBE_VIA_TG) {
   }
 }
 
-    const text = await enqueueAsr(() => transcribeAudioFromUrl(wrapped, { callId: "manual" }));
+    const text = await enqueueAsr(() => transcribeAudioFromUrl(asrUrl, { callId: "manual" }));
     if (!text) return res.status(502).json({ ok:false, error:"asr failed" });
 
     await sendTG("📝 <b>Транскрипт</b> (manual):");

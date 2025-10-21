@@ -838,18 +838,58 @@ app.get("/amo/calls", async (req, res) => {
   }
 });
 
-// 4.1) последние звонки из примечаний (call_in / call_out)
+// 4.1) последние звонки из примечаний (call_in / call_out) по лидам, контактам и компаниям
 app.get("/amo/call-notes", async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit || "20",10), 100);
-    const page  = parseInt(req.query.page || "1",10);
+    const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
+    const page  = parseInt(req.query.page || "1", 10);
 
-    const [leads, contacts] = await Promise.all([
-      amoFetch(`/api/v4/leads/notes?filter[note_type]=call_in,call_out&limit=${limit}&page=${page}`),
-      amoFetch(`/api/v4/contacts/notes?filter[note_type]=call_in,call_out&limit=${limit}&page=${page}`)
+    // ВАЖНО: правильный формат фильтра — как массивы [] для note_type
+    const qs = `limit=${limit}&page=${page}&filter[note_type][]=call_in&filter[note_type][]=call_out`;
+
+    const safeGet = async (path) => {
+      // обёртка: если придёт 204/пусто — вернём предсказуемый объект
+      try {
+        const j = await amoFetch(path);
+        return j || { _embedded: { notes: [] } };
+      } catch (e) {
+        // если 204 No Content или пустой ответ — не роняем весь маршрут
+        const msg = String(e || "");
+        if (msg.includes("204") || msg.includes("Unexpected end of JSON")) {
+          return { _embedded: { notes: [] } };
+        }
+        throw e;
+      }
+    };
+
+    const [leads, contacts, companies] = await Promise.all([
+      safeGet(`/api/v4/leads/notes?${qs}`),
+      safeGet(`/api/v4/contacts/notes?${qs}`),
+      safeGet(`/api/v4/companies/notes?${qs}`)
     ]);
 
-    res.json({ ok: true, leads, contacts });
+    // Нормализуем к единому списку
+    const pull = (obj, kind) =>
+      (obj?._embedded?.notes || []).map(n => ({
+        entity: kind,                       // lead | contact | company
+        note_id: n.id,
+        note_type: n.note_type,
+        text: n.params?.text || "",
+        created_at: n.created_at,
+        created_by: n.created_by,
+        entity_id: n.entity_id,
+        duration: n.params?.duration,       // для звонков часто есть
+        phone: n.params?.phone || n.params?.uniq, // часто кладут номер
+        service: n.params?.service,
+      }));
+
+    const items = [
+      ...pull(leads, "lead"),
+      ...pull(contacts, "contact"),
+      ...pull(companies, "company"),
+    ].sort((a,b) => (b.created_at || 0) - (a.created_at || 0));
+
+    res.json({ ok: true, count: items.length, items });
   } catch (e) {
     res.status(500).json({ ok:false, error: String(e) });
   }

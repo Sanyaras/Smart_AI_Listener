@@ -1,6 +1,6 @@
 // index.js — Railway: MegaPBX → Telegram + Telegram relay ASR + AmoCRM, non-blocking webhooks
 // v1.6.0 -> refactor and fixes: security, concurrency, robustness, streaming checks, single-flight refresh, graceful shutdown
-// Updated: 2025-10-20
+// Updated: 2025-10-20 + amo responsible/auto-poll enrich
 /* eslint-disable no-console */
 
 import express from "express";
@@ -65,7 +65,6 @@ function prettyType(type) {
     CANCELLED: "🚫 CANCELLED (отменён)",
     OUTGOING: "🔔 OUTGOING"
   };
-  // конкатенация вместо шаблонной строки — менее капризно в некоторых окружениях
   return map[t] || ("🔔 " + type);
 }
 
@@ -265,6 +264,55 @@ async function amoFetch(path, opts = {}, ms = 15000) {
   }
   if (!r.ok) throw new Error(`amo ${path} ${r.status}: ${await r.text().catch(()=> "")}`);
   return await r.json();
+}
+
+/* -------------------- AmoCRM responsible helpers -------------------- */
+// cache users map to avoid spamming amo
+const AMO_USER_CACHE = new Map();
+let AMO_USER_CACHE_TS = 0;
+
+async function amoGetUsersMap() {
+  const NOW = Date.now();
+  if (NOW - AMO_USER_CACHE_TS < 10 * 60 * 1000 && AMO_USER_CACHE.size > 0) {
+    return AMO_USER_CACHE;
+  }
+  const data = await amoFetch("/api/v4/users?limit=250");
+  const arr = data?._embedded?.users || [];
+  AMO_USER_CACHE.clear();
+  for (const u of arr) {
+    AMO_USER_CACHE.set(u.id, {
+      name: [u.name, u.last_name, u.first_name].filter(Boolean).join(" ").trim() || u.name || `user#${u.id}`
+    });
+  }
+  AMO_USER_CACHE_TS = NOW;
+  return AMO_USER_CACHE;
+}
+
+async function amoGetResponsible(entity, entityId) {
+  try {
+    let path = "";
+    if (entity === "lead")     path = `/api/v4/leads/${entityId}`;
+    else if (entity === "contact") path = `/api/v4/contacts/${entityId}`;
+    else if (entity === "company") path = `/api/v4/companies/${entityId}`;
+    else return { userId: null, userName: null };
+
+    const card = await amoFetch(path);
+    const respId = card.responsible_user_id || card.responsible_user || null;
+
+    if (!respId) {
+      return { userId: null, userName: null };
+    }
+
+    const usersMap = await amoGetUsersMap();
+    const u = usersMap.get(respId);
+    return {
+      userId: respId,
+      userName: u ? u.name : `user#${respId}`
+    };
+  } catch (e) {
+    console.warn("amoGetResponsible error:", e?.message || e);
+    return { userId: null, userName: null };
+  }
 }
 
 /* -------------------- MegaPBX normalizer -------------------- */
@@ -583,17 +631,17 @@ app.all("/asr", async (req, res) => {
     const wrapped = wrapRecordingUrl(String(url));
     let asrUrl = wrapped;
 
-if (AUTO_TRANSCRIBE_VIA_TG) {
-  try {
-    asrUrl = await tgSendUrlAndGetCdnUrl(
-      wrapped,
-      `🎧 Авто-relay для manual ASR`
-    );
-  } catch (e) {
-    await sendTG("⚠️ relay через Telegram не удался, скачиваю напрямую.\n<code>" + (e?.message || e) + "</code>");
-    asrUrl = wrapped;
-  }
-}
+    if (AUTO_TRANSCRIBE_VIA_TG) {
+      try {
+        asrUrl = await tgSendUrlAndGetCdnUrl(
+          wrapped,
+          `🎧 Авто-relay для manual ASR`
+        );
+      } catch (e) {
+        await sendTG("⚠️ relay через Telegram не удался, скачиваю напрямую.\n<code>" + (e?.message || e) + "</code>");
+        asrUrl = wrapped;
+      }
+    }
 
     const text = await enqueueAsr(() => transcribeAudioFromUrl(asrUrl, { callId: "manual" }));
     if (!text) return res.status(502).json({ ok:false, error:"asr failed" });
@@ -855,16 +903,14 @@ app.get("/amo/call-notes", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
     const page  = parseInt(req.query.page || "1", 10);
 
-    // ВАЖНО: правильный формат фильтра — как массивы [] для note_type
+    // формат фильтра — note_type[]=...
     const qs = `limit=${limit}&page=${page}&filter[note_type][]=call_in&filter[note_type][]=call_out`;
 
     const safeGet = async (path) => {
-      // обёртка: если придёт 204/пусто — вернём предсказуемый объект
       try {
         const j = await amoFetch(path);
         return j || { _embedded: { notes: [] } };
       } catch (e) {
-        // если 204 No Content или пустой ответ — не роняем весь маршрут
         const msg = String(e || "");
         if (msg.includes("204") || msg.includes("Unexpected end of JSON")) {
           return { _embedded: { notes: [] } };
@@ -879,21 +925,20 @@ app.get("/amo/call-notes", async (req, res) => {
       safeGet(`/api/v4/companies/notes?${qs}`)
     ]);
 
-    // Нормализуем к единому списку
     const pull = (obj, kind) =>
-  (obj?._embedded?.notes || []).map(n => ({
-    entity: kind,
-    note_id: n.id,
-    note_type: n.note_type,
-    text: n.params?.text || "",
-    created_at: n.created_at,
-    created_by: n.created_by,
-    entity_id: n.entity_id,
-    duration: n.params?.duration,
-    phone: n.params?.phone || n.params?.uniq,
-    service: n.params?.service,
-    link: n.params?.link || n.params?.file || n.params?.record_link || "", // 👈 добавляем это
-  }));
+      (obj?._embedded?.notes || []).map(n => ({
+        entity: kind,
+        note_id: n.id,
+        note_type: n.note_type,
+        text: n.params?.text || "",
+        created_at: n.created_at,
+        created_by: n.created_by,
+        entity_id: n.entity_id,
+        duration: n.params?.duration,
+        phone: n.params?.phone || n.params?.uniq,
+        service: n.params?.service,
+        link: n.params?.link || n.params?.file || n.params?.record_link || "",
+      }));
 
     const items = [
       ...pull(leads, "lead"),
@@ -907,10 +952,12 @@ app.get("/amo/call-notes", async (req, res) => {
   }
 });
 
-/* -------------------- AmoCRM poller: call notes -> ASR -------------------- */
-// простая защита по ключу (используем CRM_SHARED_KEY из env)
+/* -------------------- AmoCRM poller: call notes -> ASR (+ответственный) -------------------- */
+// защита по ключу (CRM_SHARED_KEY из env)
 function assertKey(req) {
-  const got = (req.headers["authorization"] || req.headers["x-api-key"] || req.query.key || "").toString().replace(/^Bearer\s+/i,"");
+  const got = (req.headers["authorization"] || req.headers["x-api-key"] || req.query.key || "")
+    .toString()
+    .replace(/^Bearer\s+/i,"");
   if (CRM_SHARED_KEY && got !== CRM_SHARED_KEY) throw new Error("bad key");
 }
 
@@ -927,7 +974,9 @@ function cleanupProcessed() {
   PROCESSED_RECORD_URLS.clear();
 }
 
-function findRecordingLinks(note) {
+function findRecordingLinksInNote(note) {
+  // note.params / note.text может не быть в этой версии processAmoCallNotes,
+  // но в poll'e мы будем собирать иначе — см. ниже.
   const sources = [];
   if (note.text) sources.push(String(note.text));
   if (note.params && typeof note.params === "object") sources.push(JSON.stringify(note.params));
@@ -940,6 +989,7 @@ function findRecordingLinks(note) {
 }
 
 async function processAmoCallNotes(limit = 20) {
+  // грузим последние примечания со звонками напрямую (без safeGet)
   const [leads, contacts, companies] = await Promise.all([
     amoFetch(`/api/v4/leads/notes?filter[note_type]=call_in,call_out&limit=${limit}`),
     amoFetch(`/api/v4/contacts/notes?filter[note_type]=call_in,call_out&limit=${limit}`),
@@ -971,35 +1021,65 @@ async function processAmoCallNotes(limit = 20) {
 
   for (const note of picked) {
     if (PROCESSED_NOTE_IDS.has(note.note_id)) { skipped++; continue; }
-    const links = findRecordingLinks(note);
+    const links = findRecordingLinksInNote(note);
     if (!links.length) { skipped++; continue; }
     withLinks++;
 
     PROCESSED_NOTE_IDS.add(note.note_id);
-    const head =
-      `🎯 Нашёл запись в amo (${note.note_type})\n` +
-      `• ${note.entity} #${note.entity_id} · note #${note.note_id}\n` +
-      `• created_at: ${note.created_at}`;
-    await sendTG(head);
+
+    // ответственный менеджер
+    const respInfo = await amoGetResponsible(note.entity, note.entity_id);
+    const managerTxt = respInfo.userName ? respInfo.userName : "неизвестно";
+
+    const headLines = [
+      "🎯 Нашёл звонок в amo",
+      `• Тип: ${note.note_type}`,
+      `• ${note.entity} #${note.entity_id} · note #${note.note_id}`,
+      `• Ответственный: ${managerTxt}${respInfo.userId ? " (id "+respInfo.userId+")" : ""}`,
+      note.created_at ? `• created_at: ${note.created_at}` : ""
+    ].filter(Boolean);
+
+    await sendTG(headLines.join("\n"));
 
     for (const url of links) {
       if (PROCESSED_RECORD_URLS.has(url)) continue;
       PROCESSED_RECORD_URLS.add(url);
 
-      const caption = `🎧 Из amo: ${note.note_type} · ${note.entity} #${note.entity_id} · note #${note.note_id}`;
-      await sendTGDocument(url, caption).catch(() => sendTG(`🎧 ${caption}\n${url}`));
+      const caption =
+        `🎧 Аудио (${note.note_type})\n` +
+        `• Менеджер: ${managerTxt}\n` +
+        `${note.entity} #${note.entity_id} · note #${note.note_id}`;
+
+      await sendTGDocument(url, caption).catch(() =>
+        sendTG(`🎧 ${caption}\n${url}`)
+      );
 
       try {
-        const text = await enqueueAsr(() => transcribeAudioFromUrl(url, { callId: `amo-${note.note_id}` }));
+        const text = await enqueueAsr(() => transcribeAudioFromUrl(url, {
+          callId: `amo-${note.note_id}`
+        }));
+
         if (text) {
-          await sendTG(`📝 <b>Транскрипт</b> (amo note <code>${note.note_id}</code>):`);
-          for (const part of chunkText(text, 3500)) await sendTG(`<code>${part}</code>`);
+          await sendTG(
+            `📝 <b>Транскрипт</b> (amo note <code>${note.note_id}</code>, ${managerTxt}):`
+          );
+          for (const part of chunkText(text, 3500)) {
+            await sendTG(`<code>${part}</code>`);
+          }
+
           try {
-            const qa = await analyzeTranscript(text, { callId: `amo-${note.note_id}`, brand: process.env.CALL_QA_BRAND || "" });
+            const qa = await analyzeTranscript(text, {
+              callId: `amo-${note.note_id}`,
+              brand: process.env.CALL_QA_BRAND || "",
+              manager: managerTxt,
+              amo_entity: note.entity,
+              amo_entity_id: note.entity_id
+            });
             await sendTG(formatQaForTelegram(qa));
           } catch (e) {
             await sendTG("⚠️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>");
           }
+
           started++;
         } else {
           await sendTG("⚠️ ASR не удалось выполнить для ссылки из amo.");
@@ -1014,7 +1094,7 @@ async function processAmoCallNotes(limit = 20) {
   return { scanned: picked.length, withLinks, started, skipped };
 }
 
-// Роут, который будем пинговать кроном
+// Роут, который будем дёргать (cron/ping)
 app.get("/amo/poll", async (req, res) => {
   try {
     assertKey(req);

@@ -1,6 +1,6 @@
 {
   "name": "smart-ai-listener",
-  "version": "1.0.2",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -11,6 +11,7 @@
     "start:debug": "NODE_OPTIONS='--trace-warnings' node index.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
     "body-parser": "^1.20.2",
     "express": "^4.19.2",
     "http-proxy-agent": "^7.0.2",

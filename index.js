@@ -1286,6 +1286,58 @@ app.post("/tg/setup", async (req, res) => {
 // Авто попытка поставить вебхук на старте
 setupTelegramWebhook();
 
+/* -------------------- auto poll scheduler -------------------- */
+
+// через эту переменную мы решаем, включать ли автоопрос звонков из amo
+const AMO_POLL_MINUTES = parseInt(process.env.AMO_POLL_MINUTES || "0", 10);
+// сколько нот за проход тянуть
+const AMO_POLL_LIMIT   = parseInt(process.env.AMO_POLL_LIMIT   || "30", 10);
+
+// ставим таймер только если AMO_POLL_MINUTES > 0
+if (AMO_POLL_MINUTES > 0) {
+  console.log(
+    `⏰ Amo auto-poll enabled: каждые ${AMO_POLL_MINUTES} мин, limit=${AMO_POLL_LIMIT}`
+  );
+
+  setInterval(async () => {
+    try {
+      // safety: не даём опрашивать без ключа и без токена amo
+      if (!CRM_SHARED_KEY) {
+        console.warn("⚠️ AMO poll skipped: CRM_SHARED_KEY is missing");
+        return;
+      }
+      if (!AMO_ACCESS_TOKEN && !AMO_REFRESH_TOKEN) {
+        console.warn("⚠️ AMO poll skipped: no Amo tokens yet");
+        return;
+      }
+
+      const out = await processAmoCallNotes(AMO_POLL_LIMIT);
+      console.log("✅ amo auto-poll result:", out);
+
+      // маленький отчёт в тг, но только если реально что-то нашли
+      if (out && out.started > 0) {
+        await sendTG(
+          "📡 Авто-пулл AmoCRM:\n" +
+          `• просканировано: ${out.scanned}\n` +
+          `• с ссылкой на аудио: ${out.withLinks}\n` +
+          `• расшифровано/оценено: ${out.started}`
+        );
+      }
+    } catch (e) {
+      console.error("❗ amo auto-poll error:", e?.message || e);
+      try {
+        await sendTG(
+          "❗ Ошибка авто-пула AmoCRM:\n<code>" +
+          (e?.message || e) +
+          "</code>"
+        );
+      } catch (_) {}
+    }
+  }, AMO_POLL_MINUTES * 60 * 1000);
+} else {
+  console.log("⏸ Amo auto-poll disabled (AMO_POLL_MINUTES=0 or not set)");
+}
+
 const server = app.listen(PORT, () => console.log(`Smart AI Listener (${VERSION}) on :${PORT}`));
 
 /* graceful shutdown: даём очередям доглотать задачи */

@@ -1,6 +1,6 @@
 // index.js — Smart AI Listener
 // Архитектура с модулями: telegram / asr / amo / megapbx / supabaseStore / utils
-// v2.1.0 modular + bootstrap limiter
+// v2.2.0 modular + bootstrap limiter stable
 /* eslint-disable no-console */
 
 import express from "express";
@@ -54,7 +54,7 @@ import {
 import crypto from "crypto";
 
 /* -------------------- env -------------------- */
-const VERSION                 = "railway-2.1.0";
+const VERSION                 = "railway-2.2.0";
 
 const TG_BOT_TOKEN            = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID              = process.env.TG_CHAT_ID || "";
@@ -73,12 +73,26 @@ const TG_DIRECT_FETCH         = process.env.TG_DIRECT_FETCH === "1";
 const AMO_POLL_MINUTES        = parseInt(process.env.AMO_POLL_MINUTES || "0", 10);
 const AMO_POLL_LIMIT          = parseInt(process.env.AMO_POLL_LIMIT   || "30", 10);
 
-// bootstrap limiter: сколько "старых" звонков можно сожрать на холодном старте,
-// чтобы не залить чат историей.
-// пример: 5
-const AMO_BOOTSTRAP_LIMIT     = parseInt(process.env.AMO_BOOTSTRAP_LIMIT || "5", 10);
-// живёт в памяти процесса. после нескольких тиков станет 0.
-let   bootstrapRemaining      = AMO_BOOTSTRAP_LIMIT;
+/*
+  ANTI-SPAM / BOOTSTRAP ЛОГИКА
+
+  AMO_BOOTSTRAP_MAX — сколько "исторических" звонков мы готовы реально прогнать
+  через Whisper + отправить в Telegram после старта контейнера.
+
+  Остальные старые звонки мы просто тихо помечаем в Supabase как обработанные,
+  вообще без транскриба и без сообщений в чат.
+
+  Важно:
+  - amoBootstrapRef.val уменьшается внутри amo.js (каждый раз, когда реально что-то отправили).
+  - Как только amoBootstrapRef.val <= 0, amoBootstrapped станет true, и дальше мы зовём
+    processAmoCallNotes без bootstrapRemainingRef — то есть только новые звонки.
+*/
+const AMO_BOOTSTRAP_MAX       = parseInt(process.env.AMO_BOOTSTRAP_MAX || process.env.AMO_BOOTSTRAP_LIMIT || "5", 10);
+
+// общий разделяемый ref-объект, чтобы amo.js мог мутировать счётчик
+let amoBootstrapRef = { val: AMO_BOOTSTRAP_MAX };
+// флаг "мы прошли прогрев, теперь считаем всё остальное новым, не надо резать"
+let amoBootstrapped = false;
 
 const HISTORY_TIMEOUT_MS      = (parseInt(process.env.HISTORY_TIMEOUT_MIN || "7",10)) * 60 * 1000;
 const CALL_TTL_MS             = (parseInt(process.env.CALL_TTL_MIN || "60",10)) * 60 * 1000;
@@ -272,8 +286,9 @@ app.get("/diag/env", (req, res) => {
     SUPABASE_SERVICE_KEY: !!process.env.SUPABASE_SERVICE_KEY,
     AMO_POLL_MINUTES,
     AMO_POLL_LIMIT,
-    AMO_BOOTSTRAP_LIMIT,
-    bootstrapRemaining,
+    AMO_BOOTSTRAP_MAX,
+    amoBootstrapRefVal: amoBootstrapRef.val,
+    amoBootstrapped,
   });
 });
 
@@ -439,8 +454,8 @@ app.get("/tg/ping", async (req, res) => {
 
 
 /* -------------------- MegaPBX webhook (non-blocking)
-   (если у тебя АТС уже не шлёт сюда - можно позже выпилить полностью,
-    но я оставляю как было, просто чтобы не сломать импорты) -------------------- */
+   (если у тебя АТС уже не шлёт сюда - можно потом выпилить,
+    но оставляем чтобы не порушить импорты) -------------------- */
 
 app.all(["/megafon", "/"], async (req, res, next) => {
   if (req.method === "GET") return next();
@@ -659,32 +674,34 @@ app.get("/amo/call-notes", async (req, res) => {
   }
 });
 
-// 6) poller-роут (cron/healthcheck дергает)
+// 6) poller-роут (ручной, но с той же антиспам-логикой)
 app.get("/amo/poll", async (req, res) => {
   try {
     assertKey(req);
 
-    // если кто-то вручную дёрнул этот роут — используем те же правила лимита,
-    // что и авто-пуллер ниже
-    const maxNewToProcessThisTick = (bootstrapRemaining > 0)
-      ? bootstrapRemaining
-      : Infinity;
-
-    const limit = Math.min(parseInt(req.query.limit || String(AMO_POLL_LIMIT),10), 100);
+    const limit = Math.min(
+      parseInt(req.query.limit || String(AMO_POLL_LIMIT),10),
+      100
+    );
 
     const out = await processAmoCallNotes(
       limit,
-      maxNewToProcessThisTick
+      amoBootstrapped ? {} : { bootstrapRemainingRef: amoBootstrapRef }
     );
 
-    if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
-      bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
+    // если после вызова лимит выбился, то всё, прогрев завершён
+    if (!amoBootstrapped) {
+      if (!amoBootstrapRef || amoBootstrapRef.val <= 0) {
+        amoBootstrapped = true;
+        console.log("🎉 Bootstrap завершён через /amo/poll, теперь обрабатываем только новые звонки.");
+      }
     }
 
     res.json({
       ok:true,
       ...out,
-      bootstrapRemaining,
+      amoBootstrapRefVal: amoBootstrapRef.val,
+      amoBootstrapped,
     });
   } catch (e) {
     res.status(401).json({ ok:false, error: String(e) });
@@ -706,7 +723,7 @@ app.all("*", async (req, res) => {
       "",
       "<b>Query</b>:\n<code>" + safeStr(req.query || {}) + "</code>",
       "",
-      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>"
+      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>`
     ];
     if (TG_CHAT_ID) await sendTG(lines.join("\n"));
     res.json({ ok: true, note: "fallback handler" });
@@ -794,7 +811,7 @@ setupTelegramWebhook();
 
 if (AMO_POLL_MINUTES > 0) {
   console.log(
-    `⏰ Amo auto-poll enabled: каждые ${AMO_POLL_MINUTES} мин, limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT}`
+    `⏰ Amo auto-poll enabled: каждые ${AMO_POLL_MINUTES} мин, limit=${AMO_POLL_LIMIT}, bootstrapMax=${AMO_BOOTSTRAP_MAX}`
   );
 
   setInterval(async () => {
@@ -805,46 +822,33 @@ if (AMO_POLL_MINUTES > 0) {
         return;
       }
 
-      // считаем локальный лимит для этого прохода
-      // если bootstrapRemaining > 0, значит это ещё тёплый старт -> режем объём
-      // если уже 0, значит мы в нормальном режиме и можем хавать без ограничения
-      const maxNewToProcessThisTick = (bootstrapRemaining > 0)
-        ? bootstrapRemaining
-        : Infinity;
-
-      // processAmoCallNotes делает:
-      // - достаёт последние call_in / call_out
-      // - проверяет через supabase isAlreadyProcessed
-      // - relay аудио через Telegram
-      // - Whisper
-      // - QA
-      // - markProcessed в supabase
       const out = await processAmoCallNotes(
         AMO_POLL_LIMIT,
-        maxNewToProcessThisTick
+        amoBootstrapped ? {} : { bootstrapRemainingRef: amoBootstrapRef }
       );
 
       console.log("✅ amo auto-poll result:", {
         ...out,
-        bootstrapRemaining_before: bootstrapRemaining,
+        amoBootstrapRefVal_before: amoBootstrapRef.val,
+        amoBootstrapped_before: amoBootstrapped,
       });
 
-      // уменьшаем остаток "холодного старта"
-      if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
-        bootstrapRemaining = Math.max(
-          0,
-          bootstrapRemaining - out.started
-        );
+      // если бутстрап закончился — фиксируем это
+      if (!amoBootstrapped) {
+        if (!amoBootstrapRef || amoBootstrapRef.val <= 0) {
+          amoBootstrapped = true;
+          console.log("🎉 Bootstrap завершён (auto scheduler), теперь только новые звонки и без спама.");
+        }
       }
 
-      // маленький отчёт в тг, но только если реально что-то нашли
+      // маленький отчёт в тг, но только если реально что-то новое расшифровали
       if (out && out.started > 0) {
         await sendTG(
           "📡 Авто-пулл AmoCRM:\n" +
           `• просканировано: ${out.scanned}\n` +
           `• с ссылкой на аудио: ${out.withLinks}\n` +
           `• расшифровано/оценено: ${out.started}\n` +
-          `• bootstrapRemaining → ${bootstrapRemaining}`
+          `• осталось bootstrap слотов: ${amoBootstrapped ? 0 : amoBootstrapRef.val}`
         );
       }
     } catch (e) {

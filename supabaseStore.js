@@ -1,5 +1,13 @@
-// supabaseStore.js — Supabase лог транскрибированных звонков
-// используется таблица processed_calls (источник: amo / megafon)
+// supabaseStore.js — учёт обработанных звонков (чтобы не спамить повторно)
+// таблица: processed_calls
+// колонки:
+//   id (uuid, default uuid_generate_v4())
+//   source (text)            -> "amo_note" | "megapbx_call" | ...
+//   note_id (text)
+//   record_url (text)
+//   processed_at (timestamptz, default now())
+//   transcribed (bool, default true)
+//   qa_done (bool, default true)
 
 if (typeof fetch === "undefined") {
   throw new Error("Global fetch required (Node >=18)");
@@ -15,6 +23,7 @@ function ensureSupabaseEnv() {
   }
 }
 
+// low-level helper to call Supabase REST
 async function sbFetch(path, { method = "GET", body, signal } = {}) {
   ensureSupabaseEnv();
 
@@ -34,6 +43,7 @@ async function sbFetch(path, { method = "GET", body, signal } = {}) {
     signal
   });
 
+  // Supabase может вернуть 406 "No Content" на select без результатов — это норм
   if (res.status === 406) return [];
   if (!res.ok) {
     const txt = await res.text().catch(()=> "");
@@ -43,31 +53,43 @@ async function sbFetch(path, { method = "GET", body, signal } = {}) {
   return await res.json().catch(()=> null);
 }
 
-// Проверяем: уже обрабатывали ли эту note_id?
-export async function wasAlreadyProcessed(noteId) {
+/**
+ * Проверка: мы уже обрабатывали эту сущность?
+ * source: "amo_note" / "megapbx_call" и т.д.
+ * noteId: id заметки (amo) или callId (АТС)
+ *
+ * Возвращает true, если запись уже есть в processed_calls
+ */
+export async function isAlreadyProcessed(source, noteId) {
   try {
-    const rows = await sbFetch(`/${TABLE}?note_id=eq.${noteId}&select=note_id`);
+    const rows = await sbFetch(`/${TABLE}?source=eq.${encodeURIComponent(source)}&note_id=eq.${encodeURIComponent(noteId)}&select=id`);
     return Array.isArray(rows) && rows.length > 0;
   } catch (e) {
-    console.warn("wasAlreadyProcessed error:", e?.message || e);
-    // fail-safe: если supabase недоступен, считаем "обработано", чтобы не сжечь деньги
+    console.warn("isAlreadyProcessed error:", e?.message || e);
+    // fail-safe: если база не отвечает — считаем "уже обработано", чтобы не сжечь токены Whisper
     return true;
   }
 }
 
-// Помечаем, что нота обработана
-export async function markProcessed({ note_id, record_url, source = "amo" }) {
+/**
+ * Помечаем звонок как обработанный.
+ * source: "amo_note" / "megapbx_call"
+ * noteId: note_id или callId
+ * recordUrl: исходная ссылка на аудио (для дебага)
+ */
+export async function markProcessed(source, noteId, recordUrl) {
   try {
     await sbFetch(`/${TABLE}`, {
       method: "POST",
       body: [{
-        source,
-        note_id: String(note_id),
-        record_url,
+        source: source,
+        note_id: String(noteId),
+        record_url: recordUrl,
         transcribed: true,
-        qa_done: true
+        qa_done: true,
       }]
     });
+    console.log(`✅ Marked processed in Supabase: ${source}/${noteId}`);
   } catch (e) {
     console.warn("markProcessed error:", e?.message || e);
   }

@@ -164,7 +164,15 @@ function findRecordingLinksInNote(note) {
 }
 
 /* ------- основная логика опроса amo notes ------- */
-export async function processAmoCallNotes(limit = 20) {
+/**
+ * limit               -> сколько нот спросить у amo (пагинация /api/v4/.../notes?limit=...)
+ * maxNewToProcess     -> максимум СВЕЖИХ звонков, которые мы реально выкусим и прогоним через Whisper+QA в этом проходе
+ *
+ * Возвращаем:
+ *   { scanned, withLinks, started, skipped }
+ *   started = сколько реально ушло в транскрипт+QA (важно для лимитера)
+ */
+export async function processAmoCallNotes(limit = 20, maxNewToProcess = Infinity) {
   const qs = `limit=${limit}&filter[note_type][]=call_in&filter[note_type][]=call_out`;
 
   const [leads, contacts, companies] = await Promise.all([
@@ -197,6 +205,11 @@ export async function processAmoCallNotes(limit = 20) {
   let started = 0, skipped = 0, withLinks = 0;
 
   for (const note of picked) {
+    // если уже достигли лимит fresh-звонков в этом прогоне — просто перестаём жарить новые
+    if (started >= maxNewToProcess) {
+      break;
+    }
+
     const source_type = "amo_note";
     const source_id = String(note.note_id);
 
@@ -222,6 +235,11 @@ export async function processAmoCallNotes(limit = 20) {
     await sendTG(headLines.join("\n"));
 
     for (const origUrl of links) {
+      // снова проверка лимита тут, на случай если несколько ссылок в одной ноте
+      if (started >= maxNewToProcess) {
+        break;
+      }
+
       // relay через Telegram -> cdnUrl
       let relayCdnUrl;
       try {
@@ -233,7 +251,7 @@ export async function processAmoCallNotes(limit = 20) {
         relayCdnUrl = origUrl;
       }
 
-      // уведомим чат файлом/ссылкой
+      // уведомим чат файлом/ссылкой (оперативка для людей)
       try {
         await sendTGDocument(origUrl,
           `🎧 Аудио (${note.note_type})\n• Менеджер: ${managerTxt}\n${note.entity} #${note.entity_id} · note #${note.note_id}`
@@ -271,7 +289,7 @@ export async function processAmoCallNotes(limit = 20) {
 
         started++;
 
-        // помечаем в supabase: обработали
+        // помечаем в supabase: обработали (чтобы больше не брать)
         await markProcessed(source_type, source_id, origUrl);
       } else {
         await sendTG("⚠️ ASR не удалось выполнить для ссылки из amo.");

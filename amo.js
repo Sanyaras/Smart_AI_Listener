@@ -1,5 +1,5 @@
 // amo.js — Smart AI Listener / AmoCRM integration
-// Версия: 2.3.0 (anti-spam + ignore older calls)
+// Версия: 2.4.0 (anti-spam + ignore older calls + early TG notify)
 
 import { fetchWithTimeout, mask, chunkText } from "./utils.js";
 import { sendTG, sendTGDocument, tgRelayAudio } from "./telegram.js";
@@ -81,23 +81,39 @@ export async function amoFetch(path, opts = {}, ms = 15000) {
   const url = `${AMO_BASE_URL}${path}`;
   const r = await fetchWithTimeout(url, {
     ...opts,
-    headers: { "authorization": `Bearer ${AMO_ACCESS_TOKEN}`, "content-type":"application/json", ...(opts.headers||{}) }
+    headers: {
+      "authorization": `Bearer ${AMO_ACCESS_TOKEN}`,
+      "content-type":"application/json",
+      ...(opts.headers||{})
+    }
   }, ms);
+
   if (r.status === 401) {
     await amoRefresh();
     const r2 = await fetchWithTimeout(url, {
       ...opts,
-      headers: { "authorization": `Bearer ${AMO_ACCESS_TOKEN}`, "content-type":"application/json", ...(opts.headers||{}) }
+      headers: {
+        "authorization": `Bearer ${AMO_ACCESS_TOKEN}`,
+        "content-type":"application/json",
+        ...(opts.headers||{})
+      }
     }, ms);
     if (!r2.ok) throw new Error(`amo ${path} ${r2.status}: ${await r2.text().catch(()=> "")}`);
     return await r2.json();
   }
-  if (r.status === 204) return { _embedded: { notes: [] } };
-  if (!r.ok) throw new Error(`amo ${path} ${r.status}: ${await r.text().catch(()=> "")}`);
+
+  if (r.status === 204) {
+    return { _embedded: { notes: [] } };
+  }
+
+  if (!r.ok) {
+    throw new Error(`amo ${path} ${r.status}: ${await r.text().catch(()=> "")}`);
+  }
+
   return await r.json();
 }
 
-/* ------- ответственный менеджер ------- */
+/* ------- кеш ответственных менеджеров ------- */
 const AMO_USER_CACHE = new Map();
 let AMO_USER_CACHE_TS = 0;
 
@@ -150,7 +166,7 @@ async function amoGetResponsible(entity, entityId) {
   }
 }
 
-/* ------- парсинг ссылок из примечания ------- */
+/* ------- достаём mp3-ссылки из body заметки ------- */
 function findRecordingLinksInNote(note) {
   const sources = [];
   if (note.text) sources.push(String(note.text));
@@ -167,8 +183,29 @@ function findRecordingLinksInNote(note) {
   return Array.from(new Set(urls));
 }
 
-/* ------- основная логика опроса amo notes ------- */
-export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = Infinity) {
+/* ------- основная логика опроса amo call_in / call_out ------- */
+/**
+ * @param {number} limit - сколько нот берем из amo (20..100)
+ * @param {object|number} throttleArg - режим антиспама.
+ *   Старый формат: number maxNewToProcessThisTick (Infinity by default)
+ *   Новый формат: { bootstrapRemainingRef } - ref с полем .val
+ *
+ * Возвращает:
+ * { scanned, withLinks, started, skipped, ignored }
+ */
+export async function processAmoCallNotes(limit = 20, throttleArg = Infinity) {
+  // поддерживаем оба формата аргумента:
+  let bootstrapRef = null;
+  let maxNewToProcessThisTick = Infinity;
+  if (typeof throttleArg === "number") {
+    maxNewToProcessThisTick = throttleArg;
+  } else if (throttleArg && typeof throttleArg === "object") {
+    bootstrapRef = throttleArg.bootstrapRemainingRef || null;
+    if (bootstrapRef && typeof bootstrapRef.val === "number") {
+      maxNewToProcessThisTick = bootstrapRef.val;
+    }
+  }
+
   const qs = `limit=${limit}&filter[note_type][]=call_in&filter[note_type][]=call_out`;
 
   const [leads, contacts, companies] = await Promise.all([
@@ -185,7 +222,7 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = 
         entity,
         note_id: n.id,
         note_type: n.note_type,
-        created_at: n.created_at,
+        created_at: n.created_at,   // unix sec
         entity_id: n.entity_id,
         text: n.text || n.params?.text || "",
         params: n.params || n.payload || n.data || {}
@@ -196,6 +233,7 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = 
   pack("contact", contacts);
   pack("company", companies);
 
+  // свежие сверху
   picked.sort((a,b) => (b.created_at||0) - (a.created_at||0));
 
   const now = Date.now();
@@ -205,49 +243,117 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = 
     const source_type = "amo_note";
     const source_id = String(note.note_id);
 
+    // дубль-проверка через supabase (чтобы не обрабатывать повторно)
     const already = await isAlreadyProcessed(source_type, source_id);
-    if (already) { skipped++; continue; }
+    if (already) {
+      skipped++;
+      continue;
+    }
 
+    // слишком старый? (>3ч по умолчанию)
     const ageMs = now - (note.created_at * 1000);
     if (ageMs > IGNORE_MS) {
-      await markSeenOnly(source_id, null, source_type);
+      // запишем как seen_only, чтобы не возвращаться к нему больше
+      try {
+        await markSeenOnly(source_type, source_id, null);
+      } catch (e) {
+        console.warn("markSeenOnly fail:", e?.message || e);
+      }
       ignored++;
       continue;
     }
 
-    if (started >= maxNewToProcessThisTick) break;
+    // лимит антиспама/бутстрапа: если мы уже обработали достаточно новых за этот тик — стоп
+    if (started >= maxNewToProcessThisTick) {
+      break;
+    }
 
+    // достаем ссылки на запись
     const links = findRecordingLinksInNote(note);
-    if (!links.length) { skipped++; continue; }
+    if (!links.length) {
+      skipped++;
+      continue;
+    }
     withLinks++;
 
+    // ответственный менеджер
     const respInfo = await amoGetResponsible(note.entity, note.entity_id);
     const managerTxt = respInfo.userName ? respInfo.userName : "неизвестно";
 
+    // ✅ РАННЕЕ УВЕДОМЛЕНИЕ В ТГ, чтобы ты видел активность
+    try {
+      await sendTG(
+        [
+          "🔎 Новый свежий звонок из AmoCRM",
+          `• note_id: <code>${note.note_id}</code>`,
+          `• тип: <code>${note.note_type}</code>`,
+          `• сущность: <code>${note.entity} #${note.entity_id}</code>`,
+          `• менеджер: <code>${managerTxt}</code>`,
+          `• создано: <code>${note.created_at}</code> (unix)`
+        ].join("\n")
+      );
+    } catch (e) {
+      console.warn("early TG notify failed:", e?.message || e);
+    }
+
+    // прогоняем каждую ссылку
     for (const origUrl of links) {
+      // через tgRelayAudio, чтобы Railway мог скачать приватный mp3
       let relayCdnUrl;
       try {
-        relayCdnUrl = await tgRelayAudio(origUrl, `🎧 Аудио (${note.note_type}) • ${managerTxt}`);
+        relayCdnUrl = await tgRelayAudio(
+          origUrl,
+          `🎧 Аудио (${note.note_type}) • ${managerTxt}\n` +
+          `${note.entity} #${note.entity_id} · note #${note.note_id}`
+        );
       } catch {
         relayCdnUrl = origUrl;
       }
 
+      // транскрибируем
       const text = await enqueueAsr(() =>
         transcribeAudioFromUrl(relayCdnUrl, { callId: `amo-${note.note_id}` })
       );
 
       if (text) {
-        const qa = await analyzeTranscript(text, {
-          callId: `amo-${note.note_id}`,
-          brand: process.env.CALL_QA_BRAND || "",
-          manager: managerTxt,
-          amo_entity: note.entity,
-          amo_entity_id: note.entity_id
-        });
-        await sendTG(formatQaForTelegram(qa));
+        // прислать транскрипт кусочками в чат (удобно для дебага и реального контроля качества)
+        await sendTG(
+          `📝 <b>Транскрипт</b> (amo note <code>${note.note_id}</code>, ${managerTxt}):`
+        );
+        for (const part of chunkText(text, 3500)) {
+          await sendTG(`<code>${part}</code>`);
+        }
+
+        // оценка качества звонка
+        try {
+          const qa = await analyzeTranscript(text, {
+            callId: `amo-${note.note_id}`,
+            brand: process.env.CALL_QA_BRAND || "",
+            manager: managerTxt,
+            amo_entity: note.entity,
+            amo_entity_id: note.entity_id
+          });
+          await sendTG(formatQaForTelegram(qa));
+        } catch (e) {
+          await sendTG("⚠️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>");
+        }
+
         started++;
-        await markProcessed(source_type, source_id, origUrl);
+
+        // фиксируем в базе как "нормально обработан"
+        try {
+          await markProcessed(source_type, source_id, origUrl);
+        } catch (e) {
+          console.warn("markProcessed fail:", e?.message || e);
+        }
+
+        // вычитаем из bootstrap лимита (если он есть)
+        if (bootstrapRef && typeof bootstrapRef.val === "number") {
+          bootstrapRef.val = Math.max(0, bootstrapRef.val - 1);
+        }
+
       } else {
+        // не смогли транскрибировать
         await sendTG("⚠️ ASR не удалось выполнить для ссылки из amo.");
       }
     }

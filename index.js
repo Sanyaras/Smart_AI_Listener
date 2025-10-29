@@ -1,6 +1,6 @@
 // index.js — Smart AI Listener
 // Архитектура с модулями: telegram / asr / amo / megapbx / supabaseStore / utils
-// v2.0.0 modular
+// v2.1.0 modular + bootstrap limiter
 /* eslint-disable no-console */
 
 import express from "express";
@@ -54,7 +54,7 @@ import {
 import crypto from "crypto";
 
 /* -------------------- env -------------------- */
-const VERSION                 = "railway-2.0.0";
+const VERSION                 = "railway-2.1.0";
 
 const TG_BOT_TOKEN            = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID              = process.env.TG_CHAT_ID || "";
@@ -72,6 +72,13 @@ const TG_DIRECT_FETCH         = process.env.TG_DIRECT_FETCH === "1";
 
 const AMO_POLL_MINUTES        = parseInt(process.env.AMO_POLL_MINUTES || "0", 10);
 const AMO_POLL_LIMIT          = parseInt(process.env.AMO_POLL_LIMIT   || "30", 10);
+
+// bootstrap limiter: сколько "старых" звонков можно сожрать на холодном старте,
+// чтобы не залить чат историей.
+// пример: 5
+const AMO_BOOTSTRAP_LIMIT     = parseInt(process.env.AMO_BOOTSTRAP_LIMIT || "5", 10);
+// живёт в памяти процесса. после нескольких тиков станет 0.
+let   bootstrapRemaining      = AMO_BOOTSTRAP_LIMIT;
 
 const HISTORY_TIMEOUT_MS      = (parseInt(process.env.HISTORY_TIMEOUT_MIN || "7",10)) * 60 * 1000;
 const CALL_TTL_MS             = (parseInt(process.env.CALL_TTL_MIN || "60",10)) * 60 * 1000;
@@ -119,7 +126,7 @@ function getIncomingKey(req) {
   );
 }
 
-// optional wrapper (if ты будешь юзать RELAY_BASE_URL для прокси ссылки записи)
+// optional wrapper (если используем RELAY_BASE_URL как прокси для записи)
 function wrapRecordingUrl(url) {
   if (!RELAY_BASE_URL) return url;
   try {
@@ -265,6 +272,8 @@ app.get("/diag/env", (req, res) => {
     SUPABASE_SERVICE_KEY: !!process.env.SUPABASE_SERVICE_KEY,
     AMO_POLL_MINUTES,
     AMO_POLL_LIMIT,
+    AMO_BOOTSTRAP_LIMIT,
+    bootstrapRemaining,
   });
 });
 
@@ -428,7 +437,10 @@ app.get("/tg/ping", async (req, res) => {
   res.json({ ok });
 });
 
-/* -------------------- MegaPBX webhook (non-blocking) -------------------- */
+
+/* -------------------- MegaPBX webhook (non-blocking)
+   (если у тебя АТС уже не шлёт сюда - можно позже выпилить полностью,
+    но я оставляю как было, просто чтобы не сломать импорты) -------------------- */
 
 app.all(["/megafon", "/"], async (req, res, next) => {
   if (req.method === "GET") return next();
@@ -651,9 +663,29 @@ app.get("/amo/call-notes", async (req, res) => {
 app.get("/amo/poll", async (req, res) => {
   try {
     assertKey(req);
-    const limit = Math.min(parseInt(req.query.limit || "30",10), 100);
-    const out = await processAmoCallNotes(limit);
-    res.json({ ok:true, ...out });
+
+    // если кто-то вручную дёрнул этот роут — используем те же правила лимита,
+    // что и авто-пуллер ниже
+    const maxNewToProcessThisTick = (bootstrapRemaining > 0)
+      ? bootstrapRemaining
+      : Infinity;
+
+    const limit = Math.min(parseInt(req.query.limit || String(AMO_POLL_LIMIT),10), 100);
+
+    const out = await processAmoCallNotes(
+      limit,
+      maxNewToProcessThisTick
+    );
+
+    if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
+      bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
+    }
+
+    res.json({
+      ok:true,
+      ...out,
+      bootstrapRemaining,
+    });
   } catch (e) {
     res.status(401).json({ ok:false, error: String(e) });
   }
@@ -762,7 +794,7 @@ setupTelegramWebhook();
 
 if (AMO_POLL_MINUTES > 0) {
   console.log(
-    `⏰ Amo auto-poll enabled: каждые ${AMO_POLL_MINUTES} мин, limit=${AMO_POLL_LIMIT}`
+    `⏰ Amo auto-poll enabled: каждые ${AMO_POLL_MINUTES} мин, limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT}`
   );
 
   setInterval(async () => {
@@ -772,22 +804,47 @@ if (AMO_POLL_MINUTES > 0) {
         console.warn("⚠️ AMO poll skipped: CRM_SHARED_KEY is missing");
         return;
       }
-      // processAmoCallNotes сам сделает всю магию:
-      // - достанет последние call_in / call_out
-      // - проверит через supabase isAlreadyProcessed
+
+      // считаем локальный лимит для этого прохода
+      // если bootstrapRemaining > 0, значит это ещё тёплый старт -> режем объём
+      // если уже 0, значит мы в нормальном режиме и можем хавать без ограничения
+      const maxNewToProcessThisTick = (bootstrapRemaining > 0)
+        ? bootstrapRemaining
+        : Infinity;
+
+      // processAmoCallNotes делает:
+      // - достаёт последние call_in / call_out
+      // - проверяет через supabase isAlreadyProcessed
       // - relay аудио через Telegram
       // - Whisper
       // - QA
       // - markProcessed в supabase
-      const out = await processAmoCallNotes(AMO_POLL_LIMIT);
-      console.log("✅ amo auto-poll result:", out);
+      const out = await processAmoCallNotes(
+        AMO_POLL_LIMIT,
+        maxNewToProcessThisTick
+      );
 
+      console.log("✅ amo auto-poll result:", {
+        ...out,
+        bootstrapRemaining_before: bootstrapRemaining,
+      });
+
+      // уменьшаем остаток "холодного старта"
+      if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
+        bootstrapRemaining = Math.max(
+          0,
+          bootstrapRemaining - out.started
+        );
+      }
+
+      // маленький отчёт в тг, но только если реально что-то нашли
       if (out && out.started > 0) {
         await sendTG(
           "📡 Авто-пулл AmoCRM:\n" +
           `• просканировано: ${out.scanned}\n` +
           `• с ссылкой на аудио: ${out.withLinks}\n` +
-          `• расшифровано/оценено: ${out.started}`
+          `• расшифровано/оценено: ${out.started}\n` +
+          `• bootstrapRemaining → ${bootstrapRemaining}`
         );
       }
     } catch (e) {

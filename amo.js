@@ -1,9 +1,11 @@
-// amo.js
+// amo.js — Smart AI Listener / AmoCRM integration
+// Версия: 2.3.0 (anti-spam + ignore older calls)
+
 import { fetchWithTimeout, mask, chunkText } from "./utils.js";
 import { sendTG, sendTGDocument, tgRelayAudio } from "./telegram.js";
 import { enqueueAsr, transcribeAudioFromUrl } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
-import { isAlreadyProcessed, markProcessed } from "./supabaseStore.js";
+import { isAlreadyProcessed, markProcessed, markSeenOnly } from "./supabaseStore.js";
 
 // ---- env
 const AMO_BASE_URL       = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
@@ -14,6 +16,10 @@ const AMO_AUTH_CODE      = process.env.AMO_AUTH_CODE || "";
 let   AMO_ACCESS_TOKEN   = process.env.AMO_ACCESS_TOKEN || "";
 let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";
 
+const IGNORE_OLDER_HOURS = parseInt(process.env.AMO_IGNORE_OLDER_HOURS || "3", 10);
+const IGNORE_MS = IGNORE_OLDER_HOURS * 60 * 60 * 1000;
+
+// ---- utils
 export function getAmoTokensMask() {
   return {
     access: AMO_ACCESS_TOKEN ? mask(AMO_ACCESS_TOKEN) : "",
@@ -86,9 +92,7 @@ export async function amoFetch(path, opts = {}, ms = 15000) {
     if (!r2.ok) throw new Error(`amo ${path} ${r2.status}: ${await r2.text().catch(()=> "")}`);
     return await r2.json();
   }
-  if (r.status === 204) {
-    return { _embedded: { notes: [] } };
-  }
+  if (r.status === 204) return { _embedded: { notes: [] } };
   if (!r.ok) throw new Error(`amo ${path} ${r.status}: ${await r.text().catch(()=> "")}`);
   return await r.json();
 }
@@ -164,15 +168,7 @@ function findRecordingLinksInNote(note) {
 }
 
 /* ------- основная логика опроса amo notes ------- */
-/**
- * limit               -> сколько нот спросить у amo (пагинация /api/v4/.../notes?limit=...)
- * maxNewToProcess     -> максимум СВЕЖИХ звонков, которые мы реально выкусим и прогоним через Whisper+QA в этом проходе
- *
- * Возвращаем:
- *   { scanned, withLinks, started, skipped }
- *   started = сколько реально ушло в транскрипт+QA (важно для лимитера)
- */
-export async function processAmoCallNotes(limit = 20, maxNewToProcess = Infinity) {
+export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = Infinity) {
   const qs = `limit=${limit}&filter[note_type][]=call_in&filter[note_type][]=call_out`;
 
   const [leads, contacts, companies] = await Promise.all([
@@ -202,20 +198,24 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcess = Infinity
 
   picked.sort((a,b) => (b.created_at||0) - (a.created_at||0));
 
-  let started = 0, skipped = 0, withLinks = 0;
+  const now = Date.now();
+  let started = 0, skipped = 0, withLinks = 0, ignored = 0;
 
   for (const note of picked) {
-    // если уже достигли лимит fresh-звонков в этом прогоне — просто перестаём жарить новые
-    if (started >= maxNewToProcess) {
-      break;
-    }
-
     const source_type = "amo_note";
     const source_id = String(note.note_id);
 
-    // защитимся от повторов через supabase
     const already = await isAlreadyProcessed(source_type, source_id);
     if (already) { skipped++; continue; }
+
+    const ageMs = now - (note.created_at * 1000);
+    if (ageMs > IGNORE_MS) {
+      await markSeenOnly(source_id, null, source_type);
+      ignored++;
+      continue;
+    }
+
+    if (started >= maxNewToProcessThisTick) break;
 
     const links = findRecordingLinksInNote(note);
     if (!links.length) { skipped++; continue; }
@@ -224,42 +224,12 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcess = Infinity
     const respInfo = await amoGetResponsible(note.entity, note.entity_id);
     const managerTxt = respInfo.userName ? respInfo.userName : "неизвестно";
 
-    const headLines = [
-      "🎯 Нашёл звонок в amo",
-      `• Тип: ${note.note_type}`,
-      `• ${note.entity} #${note.entity_id} · note #${note.note_id}`,
-      `• Ответственный: ${managerTxt}${respInfo.userId ? " (id "+respInfo.userId+")" : ""}`,
-      note.created_at ? `• created_at: ${note.created_at}` : ""
-    ].filter(Boolean);
-
-    await sendTG(headLines.join("\n"));
-
     for (const origUrl of links) {
-      // снова проверка лимита тут, на случай если несколько ссылок в одной ноте
-      if (started >= maxNewToProcess) {
-        break;
-      }
-
-      // relay через Telegram -> cdnUrl
       let relayCdnUrl;
       try {
-        relayCdnUrl = await tgRelayAudio(origUrl,
-          `🎧 Аудио (${note.note_type})\n• Менеджер: ${managerTxt}\n${note.entity} #${note.entity_id} · note #${note.note_id}`
-        );
-      } catch (e) {
-        await sendTG("⚠️ relay через Telegram не удался, пробую без relay.\n<code>"+(e?.message||e)+"</code>");
-        relayCdnUrl = origUrl;
-      }
-
-      // уведомим чат файлом/ссылкой (оперативка для людей)
-      try {
-        await sendTGDocument(origUrl,
-          `🎧 Аудио (${note.note_type})\n• Менеджер: ${managerTxt}\n${note.entity} #${note.entity_id} · note #${note.note_id}`
-        );
+        relayCdnUrl = await tgRelayAudio(origUrl, `🎧 Аудио (${note.note_type}) • ${managerTxt}`);
       } catch {
-        await sendTG(
-          `🎧 Аудио (${note.note_type})\n• Менеджер: ${managerTxt}\n${note.entity} #${note.entity_id} · note #${note.note_id}\n${origUrl}`
-        );
+        relayCdnUrl = origUrl;
       }
 
       const text = await enqueueAsr(() =>
@@ -267,29 +237,15 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcess = Infinity
       );
 
       if (text) {
-        await sendTG(
-          `📝 <b>Транскрипт</b> (amo note <code>${note.note_id}</code>, ${managerTxt}):`
-        );
-        for (const part of chunkText(text, 3500)) {
-          await sendTG(`<code>${part}</code>`);
-        }
-
-        try {
-          const qa = await analyzeTranscript(text, {
-            callId: `amo-${note.note_id}`,
-            brand: process.env.CALL_QA_BRAND || "",
-            manager: managerTxt,
-            amo_entity: note.entity,
-            amo_entity_id: note.entity_id
-          });
-          await sendTG(formatQaForTelegram(qa));
-        } catch (e) {
-          await sendTG("⚠️ Ошибка анализа (РОП): <code>" + (e?.message || e) + "</code>");
-        }
-
+        const qa = await analyzeTranscript(text, {
+          callId: `amo-${note.note_id}`,
+          brand: process.env.CALL_QA_BRAND || "",
+          manager: managerTxt,
+          amo_entity: note.entity,
+          amo_entity_id: note.entity_id
+        });
+        await sendTG(formatQaForTelegram(qa));
         started++;
-
-        // помечаем в supabase: обработали (чтобы больше не брать)
         await markProcessed(source_type, source_id, origUrl);
       } else {
         await sendTG("⚠️ ASR не удалось выполнить для ссылки из amo.");
@@ -297,5 +253,5 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcess = Infinity
     }
   }
 
-  return { scanned: picked.length, withLinks, started, skipped };
+  return { scanned: picked.length, withLinks, started, skipped, ignored };
 }

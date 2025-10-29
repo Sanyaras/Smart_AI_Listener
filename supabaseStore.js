@@ -1,13 +1,6 @@
-// supabaseStore.js — учёт обработанных звонков (чтобы не спамить повторно)
-// таблица: processed_calls
-// колонки:
-//   id (uuid, default uuid_generate_v4())
-//   source (text)            -> "amo_note" | "megapbx_call" | ...
-//   note_id (text)
-//   record_url (text)
-//   processed_at (timestamptz, default now())
-//   transcribed (bool, default true)
-//   qa_done (bool, default true)
+// supabaseStore.js
+// хранение статуса обработанных звонков из amo / мегапбх
+// таблица processed_calls
 
 if (typeof fetch === "undefined") {
   throw new Error("Global fetch required (Node >=18)");
@@ -23,74 +16,110 @@ function ensureSupabaseEnv() {
   }
 }
 
-// low-level helper to call Supabase REST
 async function sbFetch(path, { method = "GET", body, signal } = {}) {
   ensureSupabaseEnv();
 
-  const url = `${SUPABASE_URL.replace(/\/+$/,"")}/rest/v1${path}`;
+  const url = `${SUPABASE_URL.replace(/\/+$/, "")}/rest/v1${path}`;
 
   const headers = {
-    "apikey": SUPABASE_SERVICE_KEY,
-    "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+    apikey: SUPABASE_SERVICE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
     "Content-Type": "application/json",
-    "Accept": "application/json"
+    Accept: "application/json",
   };
 
   const res = await fetch(url, {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
-    signal
+    signal,
   });
 
-  // Supabase может вернуть 406 "No Content" на select без результатов — это норм
   if (res.status === 406) return [];
   if (!res.ok) {
-    const txt = await res.text().catch(()=> "");
+    const txt = await res.text().catch(() => "");
     throw new Error(`supabase ${method} ${path} ${res.status}: ${txt}`);
   }
   if (res.status === 204) return null;
-  return await res.json().catch(()=> null);
+  return await res.json().catch(() => null);
 }
 
 /**
- * Проверка: мы уже обрабатывали эту сущность?
- * source: "amo_note" / "megapbx_call" и т.д.
- * noteId: id заметки (amo) или callId (АТС)
+ * Проверяем по (source_type, source_id): обрабатывали ли этот звонок?
+ * source_type:
+ *   - "amo_note"
+ *   - "megapbx_call"
  *
- * Возвращает true, если запись уже есть в processed_calls
+ * source_id:
+ *   - note.id из amo
+ *   - callId из АТС
  */
-export async function isAlreadyProcessed(source, noteId) {
+export async function isAlreadyProcessed(source_type, source_id) {
   try {
-    const rows = await sbFetch(`/${TABLE}?source=eq.${encodeURIComponent(source)}&note_id=eq.${encodeURIComponent(noteId)}&select=id`);
+    const rows = await sbFetch(
+      `/${TABLE}?source=eq.${encodeURIComponent(
+        source_type
+      )}&note_id=eq.${encodeURIComponent(
+        source_id
+      )}&select=note_id,transcribed,qa_done,seen_only`
+    );
+
     return Array.isArray(rows) && rows.length > 0;
   } catch (e) {
     console.warn("isAlreadyProcessed error:", e?.message || e);
-    // fail-safe: если база не отвечает — считаем "уже обработано", чтобы не сжечь токены Whisper
+    // fail-safe: если supabase умер — считаем, что уже обработано,
+    // чтобы не сжечь деньги/токены и не спамить
     return true;
   }
 }
 
 /**
- * Помечаем звонок как обработанный.
- * source: "amo_note" / "megapbx_call"
- * noteId: note_id или callId
- * recordUrl: исходная ссылка на аудио (для дебага)
+ * Пометить как ОБРАБОТАНО:
+ * - записали транскрипт
+ * - сделали qa
+ * - отправили в телегу
  */
-export async function markProcessed(source, noteId, recordUrl) {
+export async function markProcessed(source_type, source_id, record_url) {
   try {
     await sbFetch(`/${TABLE}`, {
       method: "POST",
-      body: [{
-        source: source,
-        note_id: String(noteId),
-        record_url: recordUrl,
-        transcribed: true,
-        qa_done: true,
-      }]
+      body: [
+        {
+          source: source_type,
+          note_id: String(source_id),
+          record_url,
+          transcribed: true,
+          qa_done: true,
+          seen_only: false,
+        },
+      ],
     });
-    console.log(`✅ Marked processed in Supabase: ${source}/${noteId}`);
   } catch (e) {
     console.warn("markProcessed error:", e?.message || e);
+  }
+}
+
+/**
+ * Пометить как "просто видел, но не обрабатывал", чтобы больше не брать.
+ * use case: звонок слишком старый (>3ч), мы не хотим его крутить,
+ * но и не хотим каждый тик думать "а вдруг".
+ */
+export async function markSeenOnly(source_type, source_id, record_url) {
+  try {
+    await sbFetch(`/${TABLE}`, {
+      method: "POST",
+      body: [
+        {
+          source: source_type,
+          note_id: String(source_id),
+          record_url,
+          transcribed: false,
+          qa_done: false,
+          seen_only: true,
+        },
+      ],
+    });
+  } catch (e) {
+    console.warn("markSeenOnly error:", e?.message || e);
   }
 }

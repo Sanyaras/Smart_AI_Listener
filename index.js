@@ -723,7 +723,7 @@ app.all("*", async (req, res) => {
       "",
       "<b>Query</b>:\n<code>" + safeStr(req.query || {}) + "</code>",
       "",
-      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>`
+      "<b>Body</b>:\n<code>" + safeStr(body) + "</code>"
     ];
     if (TG_CHAT_ID) await sendTG(lines.join("\n"));
     res.json({ ok: true, note: "fallback handler" });
@@ -732,7 +732,6 @@ app.all("*", async (req, res) => {
     res.status(500).send("server error");
   }
 });
-
 
 /* -------------------- auto Telegram webhook setup -------------------- */
 

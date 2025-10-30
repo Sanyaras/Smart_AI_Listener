@@ -267,7 +267,7 @@ function findRecordingLinksInNote(note) {
 
 /* ------- основная логика опроса amo notes ------- */
 export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = Infinity) {
-  const qs = `limit=${limit}&filter[note_type][]=call_in&filter[note_type][]=call_out`;
+  const qs = `limit=${limit}`; // берём все типы заметок, ссылки отфильтруем сами
 
   const [leads, contacts, companies] = await Promise.all([
     amoFetch(`/api/v4/leads/notes?${qs}`),

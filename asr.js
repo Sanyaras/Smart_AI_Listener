@@ -1,4 +1,4 @@
-// asr.js
+// asr.js — Smart Role-aware ASR (v2)
 import { fetchWithTimeout, cap } from "./utils.js";
 import { sendTG } from "./telegram.js";
 
@@ -40,8 +40,9 @@ export async function transcribeAudioFromUrl(fileUrl, meta = {}) {
     await sendTG("⚠️ <b>OPENAI_API_KEY не задан</b> — пропускаю транскрибацию.");
     return null;
   }
+
   try {
-    // HEAD чтобы не качать 200MB
+    // HEAD — проверяем размер файла
     try {
       const head = await fetchWithTimeout(fileUrl, { method: "HEAD", redirect: "follow" }, 8000);
       const cl = head.headers.get("content-length");
@@ -50,9 +51,7 @@ export async function transcribeAudioFromUrl(fileUrl, meta = {}) {
         await sendTG(`⚠️ Запись слишком большая (${(parseInt(cl,10)/1024/1024).toFixed(1)}MB) — пропуск.`);
         return null;
       }
-    } catch (e) {
-      // ignore head fail
-    }
+    } catch {}
 
     const r = await fetchWithTimeout(fileUrl, { redirect: "follow" }, 30000);
     if (!r.ok) {
@@ -60,14 +59,8 @@ export async function transcribeAudioFromUrl(fileUrl, meta = {}) {
       return null;
     }
 
-    const MAX = 60 * 1024 * 1024;
-    const contentLength = r.headers.get("content-length");
-    if (contentLength && parseInt(contentLength,10) > MAX) {
-      await sendTG(`⚠️ Запись ${(parseInt(contentLength,10)/1024/1024).toFixed(1)}MB слишком большая — пропуск.`);
-      return null;
-    }
-
     const buf = await r.arrayBuffer();
+    const MAX = 60 * 1024 * 1024;
     if (buf.byteLength > MAX) {
       await sendTG(`⚠️ Запись ${(buf.byteLength/1024/1024).toFixed(1)}MB слишком большая — пропуск.`);
       return null;
@@ -92,10 +85,58 @@ export async function transcribeAudioFromUrl(fileUrl, meta = {}) {
       return null;
     }
 
-    const text = await resp.text();
-    return text.trim();
+    const text = (await resp.text()).trim();
+    if (!text) return null;
+
+    // ---- Ролевая разметка ----
+    const rolePrompt = `
+Раздели этот текст телефонного звонка по ролям: автоответчик, менеджер, клиент.
+Автоответчик — стандартные фразы типа "Вы позвонили в сервисный центр".
+Менеджер — представляется ("меня зовут"), предлагает помощь, говорит о ремонте.
+Клиент — задаёт вопросы, описывает проблему.
+
+Выведи JSON вида:
+[
+  {"speaker": "autoanswer", "text": "..."},
+  {"speaker": "client", "text": "..."},
+  {"speaker": "manager", "text": "..."}
+]
+
+Текст звонка:
+${text}
+`;
+
+    const analyzeResp = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{ role: "system", content: "Ты помощник по анализу звонков." },
+                   { role: "user", content: rolePrompt }],
+        temperature: 0.3
+      })
+    }, 60000);
+
+    const j = await analyzeResp.json().catch(() => null);
+    const parsed = (() => {
+      try {
+        const txt = j?.choices?.[0]?.message?.content || "";
+        const clean = txt.replace(/```json|```/g, "").trim();
+        return JSON.parse(clean);
+      } catch { return null; }
+    })();
+
+    if (!parsed) {
+      return [{ speaker: "unknown", text }];
+    }
+
+    return parsed;
+
   } catch (e) {
-    await sendTG(`❗️ Общая ошибка транскрибации: <code>${e?.message || e}</code>`);
+    await sendTG(`❗️ Ошибка транскрибации: <code>${e?.message || e}</code>`);
     return null;
   }
 }

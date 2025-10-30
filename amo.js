@@ -408,7 +408,7 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
     // свежесть по часам (дополнительный рантайм-фильтр)
     const createdMs = (note.created_at || 0) * 1000;
     if (IGNORE_MS > 0 && (now - createdMs) > IGNORE_MS) {
-      await markSeenOnly(source_type, source_id, null);
+      await markSeenOnly(source_type, source_id, "");
       ignored++;
       continue;
     }

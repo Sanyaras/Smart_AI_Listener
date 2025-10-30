@@ -1,5 +1,5 @@
 // amo.js — Smart AI Listener / AmoCRM integration
-// Версия: 2.5.0 (stable OAuth store + pagination + wide link parse)
+// Версия: 2.6.1 (pagination + date/link/context + wide parse)
 
 import { fetchWithTimeout, mask } from "./utils.js";
 import { sendTG, tgRelayAudio } from "./telegram.js";
@@ -16,15 +16,16 @@ const AMO_AUTH_CODE      = process.env.AMO_AUTH_CODE || "";
 let   AMO_ACCESS_TOKEN   = process.env.AMO_ACCESS_TOKEN || "";
 let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";
 
-// сколько часов считаем «свежими» звонки
-const IGNORE_OLDER_HOURS = parseInt(process.env.AMO_IGNORE_OLDER_HOURS || "3", 10);
+// Часовой пояс для отображения времени заметки
+const AMO_TIMEZONE       = process.env.AMO_TIMEZONE || "Europe/Moscow";
+
+// Сколько часов считаем «свежими» звонки (0 = не ограничивать)
+const IGNORE_OLDER_HOURS = parseInt(process.env.AMO_IGNORE_OLDER_HOURS || "72", 10);
 const IGNORE_MS = IGNORE_OLDER_HOURS * 60 * 60 * 1000;
 
-// app_secrets ключи
+/* -------------------- TOKENS store -------------------- */
 const SECRET_KEY_ACCESS  = "amo_access_token";
 const SECRET_KEY_REFRESH = "amo_refresh_token";
-
-/* -------------------- TOKENS: load & persist -------------------- */
 let TOKENS_LOADED_ONCE = false;
 
 async function loadTokensFromStoreIfNeeded() {
@@ -33,9 +34,11 @@ async function loadTokensFromStoreIfNeeded() {
   let acc = await getSecret(SECRET_KEY_ACCESS);
   let ref = await getSecret(SECRET_KEY_REFRESH);
 
+  // обратная совместимость
   if (!acc) acc = await getSecret("AMO_ACCESS_TOKEN");
   if (!ref) ref = await getSecret("AMO_REFRESH_TOKEN");
 
+  // если токены не заданы через env — берём из стора
   if (!AMO_ACCESS_TOKEN && acc) AMO_ACCESS_TOKEN = acc;
   if (!AMO_REFRESH_TOKEN && ref) AMO_REFRESH_TOKEN = ref;
 
@@ -46,15 +49,16 @@ async function persistTokens(access, refresh) {
   if (access) {
     AMO_ACCESS_TOKEN = access;
     await setSecret(SECRET_KEY_ACCESS, access);
-    await setSecret("AMO_ACCESS_TOKEN", access);
+    await setSecret("AMO_ACCESS_TOKEN", access); // бэкап-ключ
   }
   if (refresh) {
     AMO_REFRESH_TOKEN = refresh;
     await setSecret(SECRET_KEY_REFRESH, refresh);
-    await setSecret("AMO_REFRESH_TOKEN", refresh);
+    await setSecret("AMO_REFRESH_TOKEN", refresh); // бэкап-ключ
   }
 }
 
+// публично — чтобы из index.js «подлить» токены после /oauth/callback
 export function injectAmoTokens(access, refresh) {
   return persistTokens(access, refresh);
 }
@@ -73,6 +77,16 @@ function ensureAmoEnv() {
   }
 }
 
+function fmtTs(tsSec) {
+  if (!tsSec) return "—";
+  try {
+    return new Date(tsSec * 1000).toLocaleString("ru-RU", { timeZone: AMO_TIMEZONE });
+  } catch {
+    return new Date(tsSec * 1000).toISOString();
+  }
+}
+
+/* -------------------- OAuth / Fetch -------------------- */
 async function amoOAuth(body) {
   ensureAmoEnv();
   const url = `${AMO_BASE_URL}/oauth2/access_token`;
@@ -90,13 +104,6 @@ async function amoOAuth(body) {
   return await resp.json();
 }
 
-export async function amoExchangeCode() {
-  if (!AMO_AUTH_CODE) throw new Error("AMO_AUTH_CODE missing");
-  const j = await amoOAuth({ grant_type: "authorization_code", code: AMO_AUTH_CODE });
-  await persistTokens(j.access_token || "", j.refresh_token || "");
-  return j;
-}
-
 let amoRefreshPromise = null;
 export async function amoRefresh() {
   await loadTokensFromStoreIfNeeded();
@@ -107,14 +114,11 @@ export async function amoRefresh() {
       const j = await amoOAuth({ grant_type: "refresh_token", refresh_token: AMO_REFRESH_TOKEN });
       await persistTokens(j.access_token || "", j.refresh_token || "");
       return j;
-    } finally {
-      amoRefreshPromise = null;
-    }
+    } finally { amoRefreshPromise = null; }
   })();
   return amoRefreshPromise;
 }
 
-/* -------------------- FETCH + PAGINATION -------------------- */
 export async function amoFetch(path, opts = {}, ms = 15000) {
   ensureAmoEnv();
   await loadTokensFromStoreIfNeeded();
@@ -125,7 +129,7 @@ export async function amoFetch(path, opts = {}, ms = 15000) {
   const doFetch = (token) =>
     fetchWithTimeout(url, {
       ...opts,
-      headers: { "authorization": `Bearer ${token}`, "content-type": "application/json", ...(opts.headers||{}) }
+      headers: { "authorization": `Bearer ${token}`, "content-type":"application/json", ...(opts.headers||{}) }
     }, ms);
 
   let r = await doFetch(AMO_ACCESS_TOKEN);
@@ -138,7 +142,7 @@ export async function amoFetch(path, opts = {}, ms = 15000) {
   return await r.json();
 }
 
-// пагинация для notes
+/* -------------------- Pagination helper -------------------- */
 async function amoFetchPaged(pathBase, perPage = 100, pagesMax = 5) {
   let page = 1;
   const all = [];
@@ -154,7 +158,7 @@ async function amoFetchPaged(pathBase, perPage = 100, pagesMax = 5) {
   return all;
 }
 
-/* -------------------- USERS -------------------- */
+/* -------------------- Users (ответственный) -------------------- */
 const AMO_USER_CACHE = new Map();
 let AMO_USER_CACHE_TS = 0;
 
@@ -168,7 +172,9 @@ async function amoGetUsersMap() {
   AMO_USER_CACHE.clear();
   for (const u of arr) {
     AMO_USER_CACHE.set(u.id, {
-      name: ([u.name, u.last_name, u.first_name, u.middle_name].filter(Boolean).join(" ").trim()) || u.name || `user#${u.id}`
+      name:
+        ([u.name, u.last_name, u.first_name, u.middle_name].filter(Boolean).join(" ").trim()) ||
+        u.name || `user#${u.id}`
     });
   }
   AMO_USER_CACHE_TS = NOW;
@@ -185,6 +191,9 @@ async function amoGetResponsible(entity, entityId) {
 
     const card = await amoFetch(path);
     const respId = card.responsible_user_id || card.responsible_user || null;
+
+    if (!respId) return { userId: null, userName: null };
+
     const usersMap = await amoGetUsersMap();
     const u = usersMap.get(respId);
     return { userId: respId, userName: u ? u.name : `user#${respId}` };
@@ -193,33 +202,47 @@ async function amoGetResponsible(entity, entityId) {
   }
 }
 
-/* -------------------- LINK PARSER -------------------- */
+/* -------------------- Link parser (wide) -------------------- */
 function findRecordingLinksInNote(note) {
   const urls = new Set();
   const urlRe = /https?:\/\/[^\s"'<>]+/ig;
+
   const pushFromText = (txt) => {
     if (!txt) return;
     const m = String(txt).match(urlRe);
     if (m) m.forEach(u => urls.add(u));
   };
+
   const collectFromObj = (obj) => {
     if (!obj || typeof obj !== "object") return;
     for (const [k, v] of Object.entries(obj)) {
-      if (typeof v === "string") pushFromText(v);
-      else if (Array.isArray(v)) v.forEach(collectFromObj);
-      else if (typeof v === "object") collectFromObj(v);
+      const key = String(k).toLowerCase();
+      if (typeof v === "string") {
+        // подсказочные названия полей
+        if (/(record|recording|audio|call|voice|download|file|storage|rec|link|url)/i.test(key)) pushFromText(v);
+        else pushFromText(v);
+      } else if (Array.isArray(v)) {
+        v.forEach(collectFromObj);
+      } else if (typeof v === "object") {
+        try { pushFromText(JSON.stringify(v)); } catch {}
+        collectFromObj(v);
+      }
     }
   };
+
   if (note?.text) pushFromText(note.text);
   if (note?.params) collectFromObj(note.params);
-  return Array.from(urls).filter(u =>
-    /(record|audio|call|voice|file|storage|mp3|wav|ogg|m4a|opus)/i.test(u) &&
-    !/\.(svg|png|jpg|gif)(\?|$)/i.test(u)
+
+  const candidates = Array.from(urls);
+  const filtered = candidates.filter(u =>
+    /(record|recording|audio|call|voice|download|file|storage|rec|mp3|wav|ogg|m4a|opus)/i.test(u)
   );
+  return Array.from(new Set(filtered)).filter(u => !/\.(svg|png|jpg|gif)(\?|$)/i.test(u));
 }
 
-/* -------------------- MAIN LOOP -------------------- */
+/* -------------------- Main loop -------------------- */
 export async function processAmoCallNotes(limit = 100, maxNewToProcessThisTick = Infinity) {
+  // Снимаем фильтр по типам заметок (иногда интеграции пишут не как call_in/out)
   const [leadNotes, contactNotes, companyNotes] = await Promise.all([
     amoFetchPaged("/api/v4/leads/notes", limit, 5),
     amoFetchPaged("/api/v4/contacts/notes", limit, 5),
@@ -252,39 +275,54 @@ export async function processAmoCallNotes(limit = 100, maxNewToProcessThisTick =
   for (const note of picked) {
     const source_type = "amo_note";
     const source_id = String(note.note_id);
+
+    // Анти-дубль
     if (await isAlreadyProcessed(source_type, source_id)) { skipped++; continue; }
 
+    // Отбрасываем слишком старые, если включено ограничение
     const ageMs = now - (note.created_at * 1000);
     if (IGNORE_OLDER_HOURS > 0 && ageMs > IGNORE_MS) {
+      // порядок аргументов: (source_type, source_id, record_url)
       await markSeenOnly(source_type, source_id, null);
       ignored++;
       continue;
     }
 
+    if (started >= maxNewToProcessThisTick) break;
+
+    // Ссылки на записи
     const links = findRecordingLinksInNote(note);
     if (!links.length) { skipped++; continue; }
     withLinks++;
 
+    // Ответственный + дата + ссылка на сущность
+    const when = fmtTs(note.created_at);
     const respInfo = await amoGetResponsible(note.entity, note.entity_id);
     const managerTxt = respInfo.userName || "неизвестно";
+    const entityUrl = `${AMO_BASE_URL}/${note.entity}s/detail/${note.entity_id}`;
 
     for (const origUrl of links) {
-      let relayCdnUrl = origUrl;
+      let relayCdnUrl;
       try {
-        relayCdnUrl = await tgRelayAudio(origUrl, `🎧 Аудио (${note.note_type}) • ${managerTxt}`);
-      } catch {}
+        // Перекидываем в TG CDN с подписью (менеджер + дата + линк на Amo)
+        const caption = `🎧 Аудио (${note.note_type}) • ${managerTxt} • ${when}\n<a href="${entityUrl}">🔗 Открыть в AmoCRM</a>`;
+        relayCdnUrl = await tgRelayAudio(origUrl, caption);
+      } catch {
+        relayCdnUrl = origUrl;
+      }
 
       const text = await enqueueAsr(() =>
-        transcribeAudioFromUrl(relayCdnUrl, { callId: `amo-${note.note_id}` })
+        transcribeAudioFromUrl(relayCdnUrl, { callId: `amo-${note.note_id}`, when })
       );
 
       if (text) {
         const qa = await analyzeTranscript(text, {
           callId: `amo-${note.note_id}`,
-          brand: process.env.CALL_QA_BRAND || "",
+          when,
           manager: managerTxt,
           amo_entity: note.entity,
-          amo_entity_id: note.entity_id
+          amo_entity_id: note.entity_id,
+          amo_entity_url: entityUrl
         });
         await sendTG(formatQaForTelegram(qa));
         started++;
@@ -293,8 +331,6 @@ export async function processAmoCallNotes(limit = 100, maxNewToProcessThisTick =
         await sendTG("⚠️ ASR не удалось выполнить для ссылки из amo.");
       }
     }
-
-    if (started >= maxNewToProcessThisTick) break;
   }
 
   return { scanned: picked.length, withLinks, started, skipped, ignored };

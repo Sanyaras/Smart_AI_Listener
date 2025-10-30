@@ -229,6 +229,7 @@ app.get("/amo/oauth/callback", async (req, res) => {
     // 1) сохраняем как «источник истины» в Supabase
     await setSecret("AMO_ACCESS_TOKEN", access);
     await setSecret("AMO_REFRESH_TOKEN", refresh);
+    
 
     // 2) подменяем в рантайме внутри amo.js (без рестарта)
     try {

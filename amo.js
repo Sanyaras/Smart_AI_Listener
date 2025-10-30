@@ -1,5 +1,5 @@
 // amo.js — Smart AI Listener / AmoCRM integration
-// Версия: 3.0.0 (reverse-scan, spam-queue, robust audio link parser, safe cursors)
+// Версия: 2.9.0 (tail-scan stable + anti-spam + robust last-page probe)
 
 // --- deps
 import { fetchWithTimeout, mask } from "./utils.js";
@@ -23,35 +23,15 @@ const AMO_AUTH_CODE      = process.env.AMO_AUTH_CODE || "";
 let   AMO_ACCESS_TOKEN   = process.env.AMO_ACCESS_TOKEN || "";
 let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";
 
-// Сколько часов считаем «свежими» звонки. 0 — выкл (берём всё).
+// Сколько часов считаем «свежими» звонки. По умолчанию ВЫКЛ (0) — берём всё.
 const IGNORE_OLDER_HOURS = parseInt(process.env.AMO_IGNORE_OLDER_HOURS || "0", 10);
 const IGNORE_MS = IGNORE_OLDER_HOURS > 0 ? IGNORE_OLDER_HOURS * 60 * 60 * 1000 : 0;
 
-// Управление сканом
-const PER_ENTITY_LIMIT   = parseInt(process.env.AMO_PER_ENTITY_LIMIT || "100", 10);
-const MAX_PAGES_BACK     = parseInt(process.env.AMO_MAX_PAGES_BACK || "6", 10); // для lead; контакт/компания ниже
-const AMO_TIMEZONE       = process.env.AMO_TIMEZONE || "Europe/Moscow";
-const AMO_DEBUG_DUMP     = (process.env.AMO_DEBUG_DUMP || "1") === "1";
+// Часовой пояс для человекочитаемой даты
+const AMO_TIMEZONE = process.env.AMO_TIMEZONE || "Europe/Moscow";
 
-// Динамические списки из ENV
-const ENV_SPAM = String(process.env.AMO_SPAM_KEYWORDS || "").trim();
-const SPAM_KEYWORDS = ENV_SPAM
-  ? ENV_SPAM.split(",").map(s => s.trim()).filter(Boolean)
-  : ["автоответ", "не отвечает", "ошибка", "системное", "service", "system", "ivr", "robot", "auto", "бот", "ботом", "тест"];
-
-// Доверенные телефонийные/хранилищные домены (можно расширять через ENV)
-const ENV_TRUST = String(process.env.AMO_TRUSTED_AUDIO_HOSTS || "").trim();
-const TRUSTED_AUDIO_HOSTS = new Set([
-  "megapbx.ru", "mega-pbx.ru", "mangotele.com", "mango-office.ru",
-  "uiscom.ru", "uiscom.net", "sipuni.com", "binotel.ua",
-  "zadarma.com", "zaddarma.com",
-  "voximplant.com", "voximplant.net",
-  "yandexcloud.net", "storage.yandexcloud.net",
-  "amazonaws.com", "s3.amazonaws.com",
-  "cloudfront.net", "backblazeb2.com"
-].concat(
-  ENV_TRUST ? ENV_TRUST.split(",").map(s => s.trim()).filter(Boolean) : []
-));
+// Включить дампы заметок без ссылок (шлёт в TG короткий отчёт о полях)
+const AMO_DEBUG_DUMP = (process.env.AMO_DEBUG_DUMP || "1") === "1";
 
 /* ==================== TOKENS store (Supabase app_secrets) ==================== */
 const SECRET_KEY_ACCESS  = "amo_access_token";
@@ -123,13 +103,6 @@ async function amoOAuth(body) {
   return await resp.json();
 }
 
-export async function amoExchangeCode() {
-  if (!AMO_AUTH_CODE) throw new Error("AMO_AUTH_CODE missing");
-  const j = await amoOAuth({ grant_type: "authorization_code", code: AMO_AUTH_CODE });
-  await persistTokens(j.access_token || "", j.refresh_token || "");
-  return j;
-}
-
 let amoRefreshPromise = null;
 export async function amoRefresh() {
   await loadTokensFromStoreIfNeeded();
@@ -145,6 +118,13 @@ export async function amoRefresh() {
     }
   })();
   return amoRefreshPromise;
+}
+
+export async function amoExchangeCode() {
+  if (!AMO_AUTH_CODE) throw new Error("AMO_AUTH_CODE missing");
+  const j = await amoOAuth({ grant_type: "authorization_code", code: AMO_AUTH_CODE });
+  await persistTokens(j.access_token || "", j.refresh_token || "");
+  return j;
 }
 
 export async function amoFetch(path, opts = {}, ms = 15000) {
@@ -180,7 +160,7 @@ export async function amoFetch(path, opts = {}, ms = 15000) {
   return await r.json();
 }
 
-/* ==================== Incremental fresh scan (reverse) ==================== */
+/* ==================== Incremental fresh scan ==================== */
 const CURSOR_KEYS = {
   lead:    "amo_cursor_lead_notes_created_at",
   contact: "amo_cursor_contact_notes_created_at",
@@ -197,16 +177,49 @@ async function setCursor(entity, sec){
   await setSecret(CURSOR_KEYS[entity], String(sec));
 }
 
-async function fetchNotesSinceCursor(entity, pathBase, perPage, maxPagesBack, sinceCreatedAtSec){
-  // Вытаскиваем lastPage и сканируем НАЗАД
+/**
+ * Надёжно определяем последнюю страницу:
+ * 1) пробуем взять _links.last.href;
+ * 2) если нет — экспоненциальный пробег (1,2,4,8...) пока есть данные;
+ * 3) затем бинпоиск между последней пустой и последней непустой.
+ */
+async function probeLastPage(pathBase, perPage, maxPageCap = 2000){
+  // 1) попытка по ссылке
   const first = await amoFetch(`${pathBase}?limit=${perPage}&page=1`);
   let lastPage = 1;
   const lastHref = first?._links?.last?.href;
   if (lastHref) {
     const m = String(lastHref).match(/(?:\?|&)page=(\d+)/i);
     if (m) lastPage = parseInt(m[1], 10) || 1;
+    if (lastPage > 1) return lastPage;
   }
 
+  // 2) экспоненциальный пробег
+  let lo = 1, hi = 1;
+  let loHas = (Array.isArray(first?._embedded?.notes) && first._embedded.notes.length>0);
+  if (!loHas) return 1;
+
+  while (hi < maxPageCap) {
+    hi *= 2;
+    const j = await amoFetch(`${pathBase}?limit=${perPage}&page=${hi}`);
+    const has = Array.isArray(j?._embedded?.notes) && j._embedded.notes.length>0;
+    if (!has) break;
+    lo = hi;
+  }
+
+  // 3) бинпоиск между (lo: непустая) и (hi: пустая)
+  let L = lo, R = Math.min(hi, maxPageCap);
+  while (L + 1 < R) {
+    const mid = Math.floor((L+R)/2);
+    const j = await amoFetch(`${pathBase}?limit=${perPage}&page=${mid}`);
+    const has = Array.isArray(j?._embedded?.notes) && j._embedded.notes.length>0;
+    if (has) L = mid; else R = mid;
+  }
+  return L;
+}
+
+async function fetchNotesSinceCursor(entity, pathBase, perPage, maxPagesBack, sinceCreatedAtSec){
+  const lastPage = await probeLastPage(pathBase, perPage);
   const collected = [];
   const startPage = Math.max(1, lastPage - maxPagesBack + 1);
 
@@ -214,18 +227,13 @@ async function fetchNotesSinceCursor(entity, pathBase, perPage, maxPagesBack, si
   for (let page = lastPage; page >= startPage; page--) {
     const j = await amoFetch(`${pathBase}?limit=${perPage}&page=${page}`);
     const arr = Array.isArray(j?._embedded?.notes) ? j._embedded.notes : [];
-    if (!arr.length) break;
-
-    // идём по странице с конца к началу (последняя — самая свежая)
-    for (let i = arr.length - 1; i >= 0; i--) {
-      const n = arr[i];
+    if (!arr.length) continue;
+    for (const n of arr) {
       const ca = parseInt(n?.created_at || 0, 10) || 0;
       if (sinceCreatedAtSec && ca <= sinceCreatedAtSec) break outer;
       collected.push(n);
     }
   }
-
-  // свежие первые
   collected.sort((a,b) => (b.created_at||0) - (a.created_at||0));
   return collected;
 }
@@ -239,7 +247,7 @@ async function amoGetUsersMap() {
   if (NOW - AMO_USER_CACHE_TS < 10 * 60 * 1000 && AMO_USER_CACHE.size > 0) {
     return AMO_USER_CACHE;
   }
-  const data = await amoFetch(`/api/v4/users?limit=250`);
+  const data = await amoFetch("/api/v4/users?limit=250");
   const arr = data?._embedded?.users || [];
   AMO_USER_CACHE.clear();
   for (const u of arr) {
@@ -280,6 +288,14 @@ function findRecordingLinksInNote(note) {
   const urls = new Set();
   const urlRe = /https?:\/\/[^\s"'<>]+/ig;
 
+  const TELEPHONY_HOSTS = [
+    "megapbx.ru","mega-pbx.ru","pbx.mega","mango-office.ru","mangotele.com",
+    "uiscom.ru","uiscom.net","sipuni.com","binotel.ua","zadarma.com","zaddarma.com",
+    "yandexcloud.net","storage.yandexcloud.net","s3.amazonaws.com","amazonaws.com",
+    "voximplant.com","voximplant.net","ringcentral.com","cloudfront.net","backblazeb2.com",
+    "cdn","storage","files","static"
+  ];
+
   const pushFromText = (txt) => {
     if (!txt) return;
     const m = String(txt).match(urlRe);
@@ -288,94 +304,55 @@ function findRecordingLinksInNote(note) {
 
   const collectFromObj = (obj) => {
     if (!obj || typeof obj !== "object") return;
-    for (const [, v] of Object.entries(obj)) {
-      if (typeof v === "string") pushFromText(v);
-      else if (Array.isArray(v)) v.forEach(collectFromObj);
-      else if (typeof v === "object") collectFromObj(v);
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === "string") {
+        pushFromText(v);
+      } else if (Array.isArray(v)) {
+        v.forEach(collectFromObj);
+      } else if (typeof v === "object") {
+        collectFromObj(v);
+      }
     }
   };
 
-  // текст + params
-  if (note?.text) pushFromText(note.text);
+  if (note?.text)  pushFromText(note.text);
   if (note?.params) collectFromObj(note.params);
 
-  // прямой link
-  if (note?.params?.link && typeof note.params.link === "string") {
-    if (note.params.link.startsWith("http")) urls.add(note.params.link);
+  // прямые link / link.href
+  if (note?.params?.link && typeof note.params.link === 'string') {
+    if (note.params.link.startsWith('http')) urls.add(note.params.link);
   }
-  if (note?.params?.link?.href && typeof note.params.link.href === "string") {
-    if (note.params.link.href.startsWith("http")) urls.add(note.params.link.href);
+  if (note?.params?.link?.href && typeof note.params.link.href === 'string') {
+    if (note.params.link.href.startsWith('http')) urls.add(note.params.link.href);
   }
 
   const candidates = Array.from(urls);
 
-  // фильтруем изображения/видео – оставляем аудио/подозрительно-аудио
   const filtered = candidates.filter(u => {
-    if (/\.(svg|png|jpg|jpeg|gif|webp|mp4|mov|mkv|avi)(\?|$)/i.test(u)) return false;
     if (/\.(mp3|wav|ogg|m4a|opus|webm|aac)(\?|$)/i.test(u)) return true;
-
-    // ключевые слова
-    if (/(record|recording|audio|call|voice|download|file|storage|rec|voip|records)/i.test(u)) return true;
-
-    // доверенные домены телефонии/CDN
+    if (/\.(svg|png|jpg|jpeg|gif|webp|mp4|mov|mkv|avi)(\?|$)/i.test(u)) return false;
+    if (/(record|recording|audio|call|voice|download|file|storage|rec|voip)/i.test(u)) return true;
     try {
       const host = new URL(u).hostname.toLowerCase().replace(/^www\./,'');
-      if (TRUSTED_AUDIO_HOSTS.has(host) ||
-          TRUSTED_AUDIO_HOSTS.has(host.split('.').slice(-2).join('.')) || // *.domain.tld
-          /pbx|sip|voip|call|tele|mango/i.test(host)) {
-        return true;
-      }
+      if (
+        TELEPHONY_HOSTS.some(h => host.endsWith(h)) ||
+        /pbx|sip|voip|call|tele/i.test(host)
+      ) return true;
     } catch {}
-
     return false;
   });
 
-  // эвристика: call_* + duration>0 — пропускаем любые некартинные
+  // Если это call_* с duration>0 — пропустим все непикчурные ссылки (некоторые cdn без ключевых слов)
   const isCall = /^call_/i.test(String(note?.note_type || ""));
   const durSec = parseInt(note?.params?.duration || 0, 10) || 0;
   if (isCall && durSec > 0) {
     const more = candidates.filter(u =>
-      !/\.(svg|png|jpg|jpeg|gif|webp|mp4|mov|mkv|avi)(\?|$)/i.test(u)
+      !/\.(svg|png|jpg|jpeg|gif|webp)(\?|$)/i.test(u)
     );
     more.forEach(u => filtered.push(u));
   }
 
   return Array.from(new Set(filtered));
-}
-
-/* ==================== Spam scoring ==================== */
-function scoreSpam(note, links) {
-  // Чем больше — тем более «спам/мусор». Всё, что >= 3 — считаем спамом и не транскрибируем.
-  let score = 0;
-  const reasons = [];
-
-  const type = String(note?.note_type || "").toLowerCase();
-  const durSec = parseInt(note?.params?.duration || 0, 10) || 0;
-  const text = (note?.text || note?.params?.text || "").toString().toLowerCase();
-
-  // 1) Не звонок или длительность 0 — частый шум
-  if (!/^call_/.test(type)) { score += 2; reasons.push("not_a_call"); }
-  if (durSec <= 0) { score += 2; reasons.push("zero_duration"); }
-
-  // 2) Явные стоп-слова
-  for (const token of SPAM_KEYWORDS) {
-    if (token && text.includes(token.toLowerCase())) { score += 2; reasons.push(`kw:${token}`); break; }
-  }
-
-  // 3) Нет годных ссылок (а это call) — подозрительно
-  if (/^call_/.test(type) && durSec > 0 && (!links || links.length === 0)) {
-    score += 1; reasons.push("call_no_links");
-  }
-
-  // 4) Слишком короткое примечание
-  if (text && text.length <= 3) { score += 1; reasons.push("too_short_note"); }
-
-  // 5) Слишком много ссылок (подозрительная разметка)
-  if (links && links.length > 4) { score += 1; reasons.push("too_many_links"); }
-
-  // Порог
-  const isSpam = score >= 3;
-  return { isSpam, score, reasons };
 }
 
 /* ==================== Helpers ==================== */
@@ -401,21 +378,38 @@ function entityCardUrl(entity, id){
   return `${AMO_BASE_URL}`;
 }
 
+/* ==================== Anti-spam guards ==================== */
+function isLikelyCallNote(note){
+  const t = String(note?.note_type || "");
+  const isCallType = /^call_/.test(t) || /call|звон/iu.test(t);
+  const durSec = parseInt(note?.params?.duration || 0, 10) || 0;
+  const hasPhone = !!note?.params?.phone;
+  return isCallType || durSec > 0 || hasPhone;
+}
+
 /* ==================== Main ==================== */
-export async function processAmoCallNotes(perEntityLimit = PER_ENTITY_LIMIT, maxNewToProcessThisTick = Infinity) {
-  // курсоры
+export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessThisTick = Infinity) {
+  // курсоры (unix sec)
   const [leadCursor, contactCursor, companyCursor] = await Promise.all([
     getCursor("lead"),
     getCursor("contact"),
     getCursor("company")
   ]);
 
-  // тянем только свежее курсора, скан с конца (reverse)
-  const [leadNotes, contactNotes, companyNotes] = await Promise.all([
-    fetchNotesSinceCursor("lead",    "/api/v4/leads/notes",     perEntityLimit, MAX_PAGES_BACK, leadCursor),
-    fetchNotesSinceCursor("contact", "/api/v4/contacts/notes",  perEntityLimit, Math.max(2, Math.floor(MAX_PAGES_BACK/1.5)), contactCursor),
-    fetchNotesSinceCursor("company", "/api/v4/companies/notes", perEntityLimit, Math.max(2, Math.floor(MAX_PAGES_BACK/3)),   companyCursor),
+  // берём с хвоста (последние страницы), ограничиваем просмотр «назад»
+  // lead:6 страниц, contact:4, company:2 — как было, но реально от хвоста
+  const [leadNotesRaw, contactNotesRaw, companyNotesRaw] = await Promise.all([
+    fetchNotesSinceCursor("lead",    "/api/v4/leads/notes",     perEntityLimit, 6, leadCursor),
+    fetchNotesSinceCursor("contact", "/api/v4/contacts/notes",  perEntityLimit, 4, contactCursor),
+    fetchNotesSinceCursor("company", "/api/v4/companies/notes", perEntityLimit, 2, companyCursor),
   ]);
+
+  // anti-spam: отсекаем очевидные «не звонки» ещё до парсинга ссылок
+  const filterSpam = (arr) => arr.filter(isLikelyCallNote);
+
+  const leadNotes    = filterSpam(leadNotesRaw);
+  const contactNotes = filterSpam(contactNotesRaw);
+  const companyNotes = filterSpam(companyNotesRaw);
 
   const picked = [];
   const pack = (entity, items) => {
@@ -435,59 +429,36 @@ export async function processAmoCallNotes(perEntityLimit = PER_ENTITY_LIMIT, max
   pack("contact", contactNotes);
   pack("company", companyNotes);
 
-  // свежие первые
+  // свежие первыми
   picked.sort((a,b) => (b.created_at||0) - (a.created_at||0));
 
   const now = Date.now();
   let started = 0, skipped = 0, withLinks = 0, ignored = 0, seenOnly = 0;
 
-  // локальные максимумы курсоров
+  // локальные максимумы курсоров — сохраним ТОЛЬКО если что-то обработали/пометили
   let maxLeadCA = leadCursor;
   let maxContactCA = contactCursor;
   let maxCompanyCA = companyCursor;
 
-  // ——— двухочередная стратегия: сначала non-spam, затем spam ———
-  const nonSpamQueue = [];
-  const spamQueue = [];
-
   for (const note of picked) {
+    const source_type = "amo_note";
+    const source_id = String(note.note_id);
+
+    const already = await isAlreadyProcessed(source_type, source_id);
+    if (already) { skipped++; continue; }
+
+    // freshness (опционально)
     const createdMs = (note.created_at || 0) * 1000;
     if (IGNORE_MS > 0 && (now - createdMs) > IGNORE_MS) {
-      // слишком старо (если включена свежесть)
-      await markSeenOnly("amo_note", String(note.note_id), "");
+      await markSeenOnly(source_type, source_id, "");
       ignored++;
       continue;
     }
 
-    const links = findRecordingLinksInNote(note);
-    const { isSpam } = scoreSpam(note, links);
-
-    // Раскладываем по очередям: свежие non-spam вперед, спам — в "хвост"
-    if (isSpam) spamQueue.push({ note, links });
-    else nonSpamQueue.push({ note, links });
-  }
-
-  // Объединяем: сначала хорошие, потом мусор
-  const processingQueue = nonSpamQueue.concat(spamQueue);
-
-  for (const item of processingQueue) {
     if (started >= maxNewToProcessThisTick) break;
 
-    const note = item.note;
-    const links = item.links || [];
-    const source_type = "amo_note";
-    const source_id = String(note.note_id);
-    const already = await isAlreadyProcessed(source_type, source_id);
-    if (already) {
-      const ca = note.created_at || 0;
-      if (note.entity === "lead")    { if (ca > maxLeadCA)    maxLeadCA = ca; }
-      if (note.entity === "contact") { if (ca > maxContactCA) maxContactCA = ca; }
-      if (note.entity === "company") { if (ca > maxCompanyCA) maxCompanyCA = ca; }
-      skipped++;
-      continue;
-    }
-
-    // если нет ссылок — дампим (по желанию) и помечаем seenOnly
+    // ссылки
+    const links = findRecordingLinksInNote(note);
     if (!links.length) {
       if (AMO_DEBUG_DUMP) {
         const paramsKeys = Object.keys(note.params||{});
@@ -508,33 +479,22 @@ export async function processAmoCallNotes(perEntityLimit = PER_ENTITY_LIMIT, max
       if (note.entity === "lead")    { if (ca > maxLeadCA)    maxLeadCA = ca; }
       if (note.entity === "contact") { if (ca > maxContactCA) maxContactCA = ca; }
       if (note.entity === "company") { if (ca > maxCompanyCA) maxCompanyCA = ca; }
+      skipped++;
       continue;
     }
     withLinks++;
-
-    // анти-спам: если это spamQueue часть — помечаем и не транскрибируем
-    const { isSpam, reasons, score } = scoreSpam(note, links);
-    if (isSpam) {
-      await markSeenOnly(source_type, source_id, `spam:${score}:${reasons.join("+")}`);
-      seenOnly++;
-      const ca = note.created_at || 0;
-      if (note.entity === "lead")    { if (ca > maxLeadCA)    maxLeadCA = ca; }
-      if (note.entity === "contact") { if (ca > maxContactCA) maxContactCA = ca; }
-      if (note.entity === "company") { if (ca > maxCompanyCA) maxCompanyCA = ca; }
-      continue;
-    }
 
     // ответственный
     const respInfo   = await amoGetResponsible(note.entity, note.entity_id);
     const managerTxt = respInfo.userName || "неизвестно";
 
-    const durSec   = note?.params?.duration || 0;
+    const durSec   = parseInt(note?.params?.duration || 0, 10) || 0;
     const phone    = note?.params?.phone || "—";
     const kindTxt  = note.note_type === "call_in" ? "📥 Входящий"
                    : note.note_type === "call_out" ? "📤 Исходящий"
                    : note.note_type || "—";
     const dealUrl  = entityCardUrl(note.entity, note.entity_id);
-    const createdH = humanDate((note.created_at || 0) * 1000);
+    const createdH = humanDate(createdMs);
 
     // пред-репорт
     await sendTG(
@@ -585,16 +545,14 @@ export async function processAmoCallNotes(perEntityLimit = PER_ENTITY_LIMIT, max
       } else {
         await sendTG("⚠️ ASR не удалось выполнить для ссылки из Amo.");
       }
-
-      if (started >= maxNewToProcessThisTick) break;
     }
   }
 
   // Обновляем курсоры, если:
   // - были реальные обработки (started>0), или
-  // - пометили заметки как seenOnly (без ссылок/спам), или
-  // - проигнорировали устаревшие по времени (ignored>0).
-  if (started > 0 || seenOnly > 0 || ignored > 0 || skipped > 0) {
+  // - мы пометили заметки как seenOnly (без ссылок), или
+  // - мы проигнорировали устаревшие по времени (ignored>0).
+  if (started > 0 || seenOnly > 0 || ignored > 0) {
     const upd = [];
     if (maxLeadCA    > leadCursor)    upd.push(setCursor("lead",    maxLeadCA));
     if (maxContactCA > contactCursor) upd.push(setCursor("contact", maxContactCA));

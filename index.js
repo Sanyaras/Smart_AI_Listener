@@ -426,37 +426,42 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
 });
 
 /* -------------------- AUTO POLLER -------------------- */
+import { processAmoCallNotes } from "./amo.js";
+
 if (AMO_POLL_MINUTES > 0) {
   console.log(
     `⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT})`
   );
-  setInterval(async () => {
+
+  const tickAmo = async () => {
     try {
-      if (!CRM_SHARED_KEY) return;
       const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining);
       if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
         bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
       }
-      console.log("Amo poll result:", out);
-      if (out.started > 0) {
+      console.log("[AMO] poll:", out);
+      if (out?.started > 0) {
         await sendTG(
-          `📡 Amo poll:\n`+
-          `• scanned ${out.scanned}\n`+
-          `• with links ${out.withLinks}\n`+
-          `• started ${out.started}\n`+
-          `• ignored ${out.ignored}\n`+
+          `📡 Amo poll:\n` +
+          `• scanned ${out.scanned}\n` +
+          `• with links ${out.withLinks}\n` +
+          `• started ${out.started}\n` +
+          `• ignored ${out.ignored}\n` +
           `• bootstrapRemaining ${bootstrapRemaining}`
         );
       }
     } catch (e) {
-      console.error("poll error:", e);
+      console.error("[AMO] poll error:", e);
       try { await sendTG("❗️ poll error: " + (e?.message || e)); } catch {}
     }
-  }, AMO_POLL_MINUTES * 60 * 1000);
+  };
+
+  // первый запуск сразу, чтобы не ждать N минут
+  tickAmo();
+  setInterval(tickAmo, AMO_POLL_MINUTES * 60 * 1000);
 } else {
   console.log("⏸ auto-poll disabled");
 }
-
 /* -------------------- START -------------------- */
 const server = app.listen(PORT, () =>
   console.log(`Smart AI Listener (${VERSION}) listening on ${PORT}`)

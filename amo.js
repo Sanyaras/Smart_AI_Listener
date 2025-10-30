@@ -1,5 +1,5 @@
 // amo.js — Smart AI Listener / AmoCRM integration
-// Версия: 2.8.0 (no-cursor-drift + aggressive link finder + optional freshness + debug dumps)
+// Версия: 2.8.1 (no-cursor-drift + aggressive link finder + optional freshness + debug dumps)
 
 // --- deps
 import { fetchWithTimeout, mask } from "./utils.js";
@@ -378,9 +378,9 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
   picked.sort((a,b) => (b.created_at||0) - (a.created_at||0));
 
   const now = Date.now();
-  let started = 0, skipped = 0, withLinks = 0, ignored = 0;
+  let started = 0, skipped = 0, withLinks = 0, ignored = 0, seenOnly = 0;
 
-  // локальные максимумы курсоров — мы их сохраним ТОЛЬКО если реально что-то обработали
+  // локальные максимумы курсоров — мы их сохраним ТОЛЬКО если реально что-то обработали/пометили
   let maxLeadCA = leadCursor;
   let maxContactCA = contactCursor;
   let maxCompanyCA = companyCursor;
@@ -420,6 +420,14 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
           ].join("\n")
         );
       }
+      // помечаем как «увидели без полезной ссылки», чтобы не застревать
+      await markSeenOnly(source_type, source_id, "no_links");
+      seenOnly++;
+      // проталкиваем локальные курсоры вперёд, чтобы не зацикливаться
+      const ca = note.created_at || 0;
+      if (note.entity === "lead")    { if (ca > maxLeadCA)    maxLeadCA = ca; }
+      if (note.entity === "contact") { if (ca > maxContactCA) maxContactCA = ca; }
+      if (note.entity === "company") { if (ca > maxCompanyCA) maxCompanyCA = ca; }
       skipped++;
       continue;
     }
@@ -489,8 +497,11 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
     }
   }
 
-  // защищаемся от «уехавших курсоров»: обновляем их ТОЛЬКО если реально что-то обработали
-  if (started > 0) {
+  // Обновляем курсоры, если:
+  // - были реальные обработки (started>0), или
+  // - мы пометили заметки как seenOnly (без ссылок), или
+  // - мы проигнорировали устаревшие по времени (ignored>0).
+  if (started > 0 || seenOnly > 0 || ignored > 0) {
     const upd = [];
     if (maxLeadCA    > leadCursor)    upd.push(setCursor("lead",    maxLeadCA));
     if (maxContactCA > contactCursor) upd.push(setCursor("contact", maxContactCA));
@@ -504,10 +515,13 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
     started,
     skipped,
     ignored,
+    seenOnly,
     cursors: {
-      lead_prev: leadCursor,    lead_next: started>0 ? maxLeadCA    : leadCursor,
-      contact_prev: contactCursor, contact_next: started>0 ? maxContactCA : contactCursor,
-      company_prev: companyCursor, company_next: started>0 ? maxCompanyCA : companyCursor
+      lead_prev: leadCursor,    lead_next: (started>0 || seenOnly>0 || ignored>0) ? maxLeadCA    : leadCursor,
+      contact_prev: contactCursor, contact_next: (started>0 || seenOnly>0 || ignored>0) ? maxContactCA : contactCursor,
+      company_prev: companyCursor, company_next: (started>0 || seenOnly>0 || ignored>0) ? maxCompanyCA : companyCursor
     }
   };
 }
+
+

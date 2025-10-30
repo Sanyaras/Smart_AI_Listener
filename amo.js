@@ -478,7 +478,14 @@ export async function processAmoCallNotes(perEntityLimit = PER_ENTITY_LIMIT, max
     const source_type = "amo_note";
     const source_id = String(note.note_id);
     const already = await isAlreadyProcessed(source_type, source_id);
-    if (already) { skipped++; continue; }
+    if (already) {
+      const ca = note.created_at || 0;
+      if (note.entity === "lead")    { if (ca > maxLeadCA)    maxLeadCA = ca; }
+      if (note.entity === "contact") { if (ca > maxContactCA) maxContactCA = ca; }
+      if (note.entity === "company") { if (ca > maxCompanyCA) maxCompanyCA = ca; }
+      skipped++;
+      continue;
+    }
 
     // если нет ссылок — дампим (по желанию) и помечаем seenOnly
     if (!links.length) {
@@ -587,7 +594,7 @@ export async function processAmoCallNotes(perEntityLimit = PER_ENTITY_LIMIT, max
   // - были реальные обработки (started>0), или
   // - пометили заметки как seenOnly (без ссылок/спам), или
   // - проигнорировали устаревшие по времени (ignored>0).
-  if (started > 0 || seenOnly > 0 || ignored > 0) {
+  if (started > 0 || seenOnly > 0 || ignored > 0 || skipped > 0) {
     const upd = [];
     if (maxLeadCA    > leadCursor)    upd.push(setCursor("lead",    maxLeadCA));
     if (maxContactCA > contactCursor) upd.push(setCursor("contact", maxContactCA));

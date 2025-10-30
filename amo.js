@@ -209,21 +209,60 @@ async function amoGetResponsible(entity, entityId) {
   }
 }
 
-/* ------- парсинг ссылок из примечания ------- */
+/* ------- парсинг ссылок из примечания (расширенный) ------- */
 function findRecordingLinksInNote(note) {
-  const sources = [];
-  if (note.text) sources.push(String(note.text));
-  if (note.params && typeof note.params === "object") {
-    sources.push(JSON.stringify(note.params));
-  }
-  const blob = sources.join(" ");
-  const urls = [];
-  const re = /(https?:\/\/[^\s"'<>]+?\.(mp3|wav|ogg|m4a|opus)(\?[^\s"'<>]*)?)/ig;
-  let m;
-  while ((m = re.exec(blob))) {
-    urls.push(m[1]);
-  }
-  return Array.from(new Set(urls));
+  const urls = new Set();
+
+  // 1) Общий регэксп для любых https-URL (без требования на .mp3 и т.п.)
+  const urlRe = /https?:\/\/[^\s"'<>]+/ig;
+
+  const pushFromText = (txt) => {
+    if (!txt) return;
+    const m = String(txt).match(urlRe);
+    if (m) m.forEach(u => urls.add(u));
+  };
+
+  // 2) Рекурсивно обходим объект и собираем ссылки из типовых полей
+  const collectFromObj = (obj) => {
+    if (!obj || typeof obj !== "object") return;
+    for (const [k, v] of Object.entries(obj)) {
+      const key = String(k).toLowerCase();
+
+      // если значение строка — проверяем и как явный URL, и как текст с URL
+      if (typeof v === "string") {
+        // подсказки в имени поля — почти точно про запись
+        if (/(record|recording|audio|call|voice|download|file|storage|rec|link|url)/i.test(key)) {
+          pushFromText(v);
+        } else {
+          pushFromText(v);
+        }
+      } else if (Array.isArray(v)) {
+        v.forEach(collectFromObj);
+      } else if (typeof v === "object") {
+        // некоторые интеграции кладут структуру в строковый JSON
+        try { pushFromText(JSON.stringify(v)); } catch {}
+        collectFromObj(v);
+      }
+    }
+  };
+
+  // Источники: note.text + note.params
+  if (note?.text) pushFromText(note.text);
+  if (note?.params) collectFromObj(note.params);
+
+  // 3) Фильтрация кандидатов по "смысловым" словам (но не требуем расширения)
+  const candidates = Array.from(urls);
+  const filtered = candidates.filter(u =>
+    /(record|recording|audio|call|voice|download|file|storage|rec|mp3|wav|ogg|m4a|opus)/i.test(u)
+  );
+
+  // 4) Убираем очевидный мусор и дубли
+  const out = Array.from(new Set(filtered)).filter(u => {
+    // отрезаем пиктограммы/иконки/анонимные счетчики и т.п. при желании
+    return !/\.(svg|png|jpg|gif)(\?|$)/i.test(u);
+  });
+
+  return out;
 }
 
 /* ------- основная логика опроса amo notes ------- */

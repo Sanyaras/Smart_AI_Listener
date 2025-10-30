@@ -287,6 +287,12 @@ async function amoGetResponsible(entity, entityId) {
 function findRecordingLinksInNote(note) {
   const urls = new Set();
   const urlRe = /https?:\/\/[^\s"'<>]+/ig;
+// домены телефонии/CDN, где часто лежат записи без «говорящих» слов
+ const TELEPHONY_HOSTS = [
+   "megapbx.ru", "mango-office.ru", "uiscom.ru", "uiscom.net",
+   "yandexcloud.net", "storage.yandexcloud.net", "s3.amazonaws.com",
+   "voximplant.com", "sipuni.com", "binotel.ua", "zaddarma.com", "zadarma.com"
+ ];
 
   const pushFromText = (txt) => {
     if (!txt) return;
@@ -312,10 +318,20 @@ function findRecordingLinksInNote(note) {
 
   // смысловая фильтрация, но без требования расширения
   const candidates = Array.from(urls);
-  const filtered = candidates.filter(u =>
-    /(record|recording|audio|call|voice|download|file|storage|rec|mp3|wav|ogg|m4a|opus)/i.test(u)
-    && !/\.(svg|png|jpg|gif)(\?|$)/i.test(u)
-  );
+  const filtered = candidates.filter(u => {
+   // явные аудио-расширения — пропускаем
+   if (/\.(mp3|wav|ogg|m4a|opus)(\?|$)/i.test(u)) return true;
+   // отбрасываем очевидную графику
+   if (/\.(svg|png|jpg|jpeg|gif|webp)(\?|$)/i.test(u)) return false;
+   // ключевые слова — пропускаем
+   if (/(record|recording|audio|call|voice|download|file|storage|rec)/i.test(u)) return true;
+   // домены телефонии/CDN — пропускаем
+   try {
+     const host = new URL(u).hostname.replace(/^www\./,'');
+     if (TELEPHONY_HOSTS.some(h => host.endsWith(h))) return true;
+   } catch {}
+   return false;
+ });
   return Array.from(new Set(filtered));
 }
 
@@ -352,6 +368,7 @@ function entityCardUrl(entity, id){
  * @param {number} perEntityLimit - limit/страница (до 250)
  * @param {number} maxNewToProcessThisTick - защитный максимум новых за тик
  */
+const AMO_DEBUG_DUMP = (process.env.AMO_DEBUG_DUMP || "0") === "1";
 export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessThisTick = Infinity) {
   // читаем курсоры
   const [leadCursor, contactCursor, companyCursor] = await Promise.all([
@@ -417,7 +434,20 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
 
     // линки записи
     const links = findRecordingLinksInNote(note);
-    if (!links.length) { skipped++; continue; }
+    if (!links.length) {
+      if (AMO_DEBUG_DUMP) {
+        // разовый мини-дамп, чтобы увидеть, где реально лежит ссылка
+        await sendTG(
+          [
+            "🧪 <b>AMO DEBUG</b> — ссылка не найдена, показываю params/text",
+            `📌 entity: ${note.entity} • id: ${note.entity_id} • note_id: ${note.note_id}`,
+            note.text ? `📝 <b>text:</b> <code>${mask(note.text).slice(0, 500)}</code>` : "📝 text: —",
+            `<b>params.keys:</b> <code>${Object.keys(note.params||{}).join(", ")}</code>`
+          ].join("\n")
+        );
+      }
+      skipped++; continue;
+    }
     withLinks++;
 
     // ответственный

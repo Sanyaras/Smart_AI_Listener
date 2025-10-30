@@ -426,7 +426,6 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
 });
 
 /* -------------------- AUTO POLLER -------------------- */
-import { processAmoCallNotes } from "./amo.js";
 
 if (AMO_POLL_MINUTES > 0) {
   console.log(

@@ -227,8 +227,8 @@ app.get("/amo/oauth/callback", async (req, res) => {
     if (!access || !refresh) throw new Error("empty tokens in response");
 
     // 1) сохраняем как «источник истины» в Supabase
-    await setSecret("amo_access_token", access);
-    await setSecret("amo_refresh_token", refresh);
+    await setSecret("AMO_ACCESS_TOKEN", access);
+    await setSecret("AMO_REFRESH_TOKEN", refresh);
 
     // 2) подменяем в рантайме внутри amo.js (без рестарта)
     try {

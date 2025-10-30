@@ -1,5 +1,5 @@
 // amo.js — Smart AI Listener / AmoCRM integration
-// Версия: 2.4.0 (persist tokens + anti-spam + ignore older calls)
+// Версия: 2.4.1 (persist tokens w/ unified keys + anti-spam + ignore older calls)
 
 import { fetchWithTimeout, mask } from "./utils.js";
 import { sendTG, tgRelayAudio } from "./telegram.js";
@@ -16,30 +16,53 @@ const AMO_AUTH_CODE      = process.env.AMO_AUTH_CODE || "";
 let   AMO_ACCESS_TOKEN   = process.env.AMO_ACCESS_TOKEN || "";
 let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";
 
+// сколько часов считаем «свежими» звонки из amo
 const IGNORE_OLDER_HOURS = parseInt(process.env.AMO_IGNORE_OLDER_HOURS || "3", 10);
 const IGNORE_MS = IGNORE_OLDER_HOURS * 60 * 60 * 1000;
+
+// ---- app_secrets keys (единый стандарт)
+const SECRET_KEY_ACCESS  = "amo_access_token";
+const SECRET_KEY_REFRESH = "amo_refresh_token";
 
 // ---- tokens persistence (app_secrets)
 let TOKENS_LOADED_ONCE = false;
 
 async function loadTokensFromStoreIfNeeded() {
   if (TOKENS_LOADED_ONCE) return;
-  const acc = AMO_ACCESS_TOKEN || (await getSecret("AMO_ACCESS_TOKEN"));
-  const ref = AMO_REFRESH_TOKEN || (await getSecret("AMO_REFRESH_TOKEN"));
-  if (acc) AMO_ACCESS_TOKEN = acc;
-  if (ref) AMO_REFRESH_TOKEN = ref;
+
+  // канонические ключи
+  let acc = await getSecret(SECRET_KEY_ACCESS);
+  let ref = await getSecret(SECRET_KEY_REFRESH);
+
+  // обратная совместимость со старыми именами (если вдруг остались)
+  if (!acc) acc = await getSecret("AMO_ACCESS_TOKEN");
+  if (!ref) ref = await getSecret("AMO_REFRESH_TOKEN");
+
+  // env имеет приоритет, если задан
+  if (!AMO_ACCESS_TOKEN && acc) AMO_ACCESS_TOKEN = acc;
+  if (!AMO_REFRESH_TOKEN && ref) AMO_REFRESH_TOKEN = ref;
+
   TOKENS_LOADED_ONCE = true;
 }
 
 async function persistTokens(access, refresh) {
+  // сохраняем и в рантайм, и в Supabase (канонические ключи)
   if (access) {
     AMO_ACCESS_TOKEN = access;
+    await setSecret(SECRET_KEY_ACCESS, access);
+    // на всякий случай — бэкап в старые ключи
     await setSecret("AMO_ACCESS_TOKEN", access);
   }
   if (refresh) {
     AMO_REFRESH_TOKEN = refresh;
+    await setSecret(SECRET_KEY_REFRESH, refresh);
     await setSecret("AMO_REFRESH_TOKEN", refresh);
   }
+}
+
+/** Публичная точка для индекса — «подлить» токены (из OAuth callback) и сохранить их. */
+export function injectAmoTokens(access, refresh) {
+  return persistTokens(access, refresh);
 }
 
 // ---- utils
@@ -74,6 +97,7 @@ async function amoOAuth(body) {
 }
 
 export async function amoExchangeCode() {
+  // старый путь (через переменную AMO_AUTH_CODE) — оставляем для совместимости
   if (!AMO_AUTH_CODE) throw new Error("AMO_AUTH_CODE missing");
   const j = await amoOAuth({ grant_type: "authorization_code", code: AMO_AUTH_CODE });
   await persistTokens(j.access_token || "", j.refresh_token || "");
@@ -100,23 +124,35 @@ export async function amoRefresh() {
 export async function amoFetch(path, opts = {}, ms = 15000) {
   ensureAmoEnv();
   await loadTokensFromStoreIfNeeded();
-  if (!AMO_ACCESS_TOKEN) throw new Error("No AMO_ACCESS_TOKEN — run /amo/exchange first");
+
+  if (!AMO_ACCESS_TOKEN) throw new Error("No AMO_ACCESS_TOKEN — do OAuth at /amo/oauth/start");
+
   const url = `${AMO_BASE_URL}${path}`;
-  const r = await fetchWithTimeout(url, {
-    ...opts,
-    headers: { "authorization": `Bearer ${AMO_ACCESS_TOKEN}`, "content-type":"application/json", ...(opts.headers||{}) }
-  }, ms);
-  if (r.status === 401) {
-    await amoRefresh();
-    const r2 = await fetchWithTimeout(url, {
+  const doFetch = (token) =>
+    fetchWithTimeout(url, {
       ...opts,
-      headers: { "authorization": `Bearer ${AMO_ACCESS_TOKEN}`, "content-type":"application/json", ...(opts.headers||{}) }
+      headers: { "authorization": `Bearer ${token}`, "content-type":"application/json", ...(opts.headers||{}) }
     }, ms);
-    if (!r2.ok) throw new Error(`amo ${path} ${r2.status}: ${await r2.text().catch(()=> "")}`);
-    return await r2.json();
+
+  // первая попытка
+  let r = await doFetch(AMO_ACCESS_TOKEN);
+  if (r.status === 401) {
+    // пробуем рефреш
+    try {
+      await amoRefresh();
+    } catch (e) {
+      const body = await r.text().catch(()=> "");
+      throw new Error(`amo ${path} 401 and refresh failed: ${body || e?.message || e}`);
+    }
+    // вторая попытка уже с новым access
+    r = await doFetch(AMO_ACCESS_TOKEN);
   }
+
   if (r.status === 204) return { _embedded: { notes: [] } };
-  if (!r.ok) throw new Error(`amo ${path} ${r.status}: ${await r.text().catch(()=> "")}`);
+  if (!r.ok) {
+    const t = await r.text().catch(()=> "");
+    throw new Error(`amo ${path} ${r.status}: ${t}`);
+  }
   return await r.json();
 }
 
@@ -219,6 +255,7 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = 
   pack("contact", contacts);
   pack("company", companies);
 
+  // свежие — первыми
   picked.sort((a,b) => (b.created_at||0) - (a.created_at||0));
 
   const now = Date.now();
@@ -228,12 +265,14 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = 
     const source_type = "amo_note";
     const source_id = String(note.note_id);
 
+    // анти-двойная обработка
     const already = await isAlreadyProcessed(source_type, source_id);
     if (already) { skipped++; continue; }
 
+    // отбрасываем старше N часов
     const ageMs = now - (note.created_at * 1000);
     if (ageMs > IGNORE_MS) {
-      // ВАЖНО: правильный порядок аргументов
+      // ВАЖНО: порядок аргументов (source_type, source_id, record_url)
       await markSeenOnly(source_type, source_id, null);
       ignored++;
       continue;
@@ -241,6 +280,7 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = 
 
     if (started >= maxNewToProcessThisTick) break;
 
+    // вытаскиваем ссылки на записи
     const links = findRecordingLinksInNote(note);
     if (!links.length) { skipped++; continue; }
     withLinks++;

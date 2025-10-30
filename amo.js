@@ -1,5 +1,5 @@
 // amo.js — Smart AI Listener / AmoCRM integration
-// Версия: 2.4.1 (persist tokens w/ unified keys + anti-spam + ignore older calls)
+// Версия: 2.4.2 (stable OAuth store + wide link parse + ignore older calls)
 
 import { fetchWithTimeout, mask } from "./utils.js";
 import { sendTG, tgRelayAudio } from "./telegram.js";
@@ -7,7 +7,7 @@ import { enqueueAsr, transcribeAudioFromUrl } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 import { isAlreadyProcessed, markProcessed, markSeenOnly, getSecret, setSecret } from "./supabaseStore.js";
 
-// ---- env
+/* -------------------- ENV -------------------- */
 const AMO_BASE_URL       = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
 const AMO_CLIENT_ID      = process.env.AMO_CLIENT_ID || "";
 const AMO_CLIENT_SECRET  = process.env.AMO_CLIENT_SECRET || "";
@@ -20,25 +20,25 @@ let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";
 const IGNORE_OLDER_HOURS = parseInt(process.env.AMO_IGNORE_OLDER_HOURS || "3", 10);
 const IGNORE_MS = IGNORE_OLDER_HOURS * 60 * 60 * 1000;
 
-// ---- app_secrets keys (единый стандарт)
+// app_secrets ключи (канонические)
 const SECRET_KEY_ACCESS  = "amo_access_token";
 const SECRET_KEY_REFRESH = "amo_refresh_token";
 
-// ---- tokens persistence (app_secrets)
+/* -------------------- TOKENS: load & persist -------------------- */
 let TOKENS_LOADED_ONCE = false;
 
 async function loadTokensFromStoreIfNeeded() {
   if (TOKENS_LOADED_ONCE) return;
 
-  // канонические ключи
+  // основной источник правды — app_secrets
   let acc = await getSecret(SECRET_KEY_ACCESS);
   let ref = await getSecret(SECRET_KEY_REFRESH);
 
-  // обратная совместимость со старыми именами (если вдруг остались)
+  // обратная совместимость со старыми именами
   if (!acc) acc = await getSecret("AMO_ACCESS_TOKEN");
   if (!ref) ref = await getSecret("AMO_REFRESH_TOKEN");
 
-  // env имеет приоритет, если задан
+  // env имеет приоритет если уже задан
   if (!AMO_ACCESS_TOKEN && acc) AMO_ACCESS_TOKEN = acc;
   if (!AMO_REFRESH_TOKEN && ref) AMO_REFRESH_TOKEN = ref;
 
@@ -46,31 +46,29 @@ async function loadTokensFromStoreIfNeeded() {
 }
 
 async function persistTokens(access, refresh) {
-  // сохраняем и в рантайм, и в Supabase (канонические ключи)
   if (access) {
     AMO_ACCESS_TOKEN = access;
     await setSecret(SECRET_KEY_ACCESS, access);
-    // на всякий случай — бэкап в старые ключи
-    await setSecret("AMO_ACCESS_TOKEN", access);
+    await setSecret("AMO_ACCESS_TOKEN", access); // бэкап
   }
   if (refresh) {
     AMO_REFRESH_TOKEN = refresh;
     await setSecret(SECRET_KEY_REFRESH, refresh);
-    await setSecret("AMO_REFRESH_TOKEN", refresh);
+    await setSecret("AMO_REFRESH_TOKEN", refresh); // бэкап
   }
 }
 
-/** Публичная точка для индекса — «подлить» токены (из OAuth callback) и сохранить их. */
+/** Публичная точка для индекса — «подлить» токены из OAuth callback и сохранить их. */
 export function injectAmoTokens(access, refresh) {
   return persistTokens(access, refresh);
 }
 
-// ---- utils
+/* -------------------- UTILS -------------------- */
 export function getAmoTokensMask() {
   return {
     access: AMO_ACCESS_TOKEN ? mask(AMO_ACCESS_TOKEN) : "",
     refresh: AMO_REFRESH_TOKEN ? mask(AMO_REFRESH_TOKEN) : ""
-  }
+  };
 }
 
 function ensureAmoEnv() {
@@ -97,7 +95,7 @@ async function amoOAuth(body) {
 }
 
 export async function amoExchangeCode() {
-  // старый путь (через переменную AMO_AUTH_CODE) — оставляем для совместимости
+  // legacy путь (через переменную AMO_AUTH_CODE) — оставлен для совместимости
   if (!AMO_AUTH_CODE) throw new Error("AMO_AUTH_CODE missing");
   const j = await amoOAuth({ grant_type: "authorization_code", code: AMO_AUTH_CODE });
   await persistTokens(j.access_token || "", j.refresh_token || "");
@@ -156,7 +154,7 @@ export async function amoFetch(path, opts = {}, ms = 15000) {
   return await r.json();
 }
 
-/* ------- ответственный менеджер ------- */
+/* -------------------- Ответственный менеджер -------------------- */
 const AMO_USER_CACHE = new Map();
 let AMO_USER_CACHE_TS = 0;
 
@@ -209,11 +207,11 @@ async function amoGetResponsible(entity, entityId) {
   }
 }
 
-/* ------- парсинг ссылок из примечания (расширенный) ------- */
+/* -------------------- Парсер ссылок из заметок (расширенный) -------------------- */
 function findRecordingLinksInNote(note) {
   const urls = new Set();
 
-  // 1) Общий регэксп для любых https-URL (без требования на .mp3 и т.п.)
+  // общий регэксп для любых https-URL (без требования на .mp3 и т.п.)
   const urlRe = /https?:\/\/[^\s"'<>]+/ig;
 
   const pushFromText = (txt) => {
@@ -222,15 +220,14 @@ function findRecordingLinksInNote(note) {
     if (m) m.forEach(u => urls.add(u));
   };
 
-  // 2) Рекурсивно обходим объект и собираем ссылки из типовых полей
+  // рекурсивно обходим объект и собираем ссылки из типовых полей
   const collectFromObj = (obj) => {
     if (!obj || typeof obj !== "object") return;
     for (const [k, v] of Object.entries(obj)) {
       const key = String(k).toLowerCase();
 
-      // если значение строка — проверяем и как явный URL, и как текст с URL
       if (typeof v === "string") {
-        // подсказки в имени поля — почти точно про запись
+        // поля, которые часто содержат ссылку на запись
         if (/(record|recording|audio|call|voice|download|file|storage|rec|link|url)/i.test(key)) {
           pushFromText(v);
         } else {
@@ -239,35 +236,32 @@ function findRecordingLinksInNote(note) {
       } else if (Array.isArray(v)) {
         v.forEach(collectFromObj);
       } else if (typeof v === "object") {
-        // некоторые интеграции кладут структуру в строковый JSON
         try { pushFromText(JSON.stringify(v)); } catch {}
         collectFromObj(v);
       }
     }
   };
 
-  // Источники: note.text + note.params
+  // источники: note.text + note.params
   if (note?.text) pushFromText(note.text);
   if (note?.params) collectFromObj(note.params);
 
-  // 3) Фильтрация кандидатов по "смысловым" словам (но не требуем расширения)
+  // фильтрация кандидатов по «смысловым» словам (не требуем расширения)
   const candidates = Array.from(urls);
   const filtered = candidates.filter(u =>
     /(record|recording|audio|call|voice|download|file|storage|rec|mp3|wav|ogg|m4a|opus)/i.test(u)
   );
 
-  // 4) Убираем очевидный мусор и дубли
-  const out = Array.from(new Set(filtered)).filter(u => {
-    // отрезаем пиктограммы/иконки/анонимные счетчики и т.п. при желании
-    return !/\.(svg|png|jpg|gif)(\?|$)/i.test(u);
-  });
+  // убираем очевидный мусор и дубли
+  const out = Array.from(new Set(filtered)).filter(u => !/\.(svg|png|jpg|gif)(\?|$)/i.test(u));
 
   return out;
 }
 
-/* ------- основная логика опроса amo notes ------- */
+/* -------------------- Основная логика опроса заметок -------------------- */
 export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = Infinity) {
-  const qs = `limit=${limit}`; // берём все типы заметок, ссылки отфильтруем сами
+  // снимаем фильтр по типам заметок — иногда звонки не лежат как call_in/out
+  const qs = `limit=${limit}`;
 
   const [leads, contacts, companies] = await Promise.all([
     amoFetch(`/api/v4/leads/notes?${qs}`),
@@ -311,7 +305,7 @@ export async function processAmoCallNotes(limit = 20, maxNewToProcessThisTick = 
     // отбрасываем старше N часов
     const ageMs = now - (note.created_at * 1000);
     if (ageMs > IGNORE_MS) {
-      // ВАЖНО: порядок аргументов (source_type, source_id, record_url)
+      // ВАЖНО: правильный порядок аргументов (source_type, source_id, record_url)
       await markSeenOnly(source_type, source_id, null);
       ignored++;
       continue;

@@ -1,5 +1,5 @@
 // amo.js — Smart AI Listener / AmoCRM integration
-// Версия: 2.6.0 (stable OAuth store + reverse pagination + rich report + TZ + freshness)
+// Версия: 2.7.0 (incremental fresh-only scan + stable OAuth store + rich report + TZ)
 
 // --- deps
 import { fetchWithTimeout, mask } from "./utils.js";
@@ -23,7 +23,7 @@ const AMO_AUTH_CODE      = process.env.AMO_AUTH_CODE || "";
 let   AMO_ACCESS_TOKEN   = process.env.AMO_ACCESS_TOKEN || "";
 let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";
 
-// Сколько часов считаем «свежими» звонки (можно 72)
+// Сколько часов считаем «свежими» звонки (например, 72). 0 — отключить ограничение.
 const IGNORE_OLDER_HOURS = parseInt(process.env.AMO_IGNORE_OLDER_HOURS || "3", 10);
 const IGNORE_MS = IGNORE_OLDER_HOURS > 0 ? IGNORE_OLDER_HOURS * 60 * 60 * 1000 : 0;
 
@@ -167,14 +167,42 @@ export async function amoFetch(path, opts = {}, ms = 15000) {
   return await r.json();
 }
 
-/* ==================== Reverse pagination ==================== */
+/* ==================== Incremental fresh scan ==================== */
 /**
- * Берём заметки с конца (самые новые страницы → старые), чтобы свежие были первыми.
- * @param {string} pathBase - например "/api/v4/leads/notes"
- * @param {number} perPage  - limit на страницу (до 250 у amo)
- * @param {number} maxPages - максимум страниц назад от последней
+ * Ключи курсоров по сущностям.
+ * Храним последний обработанный created_at (секунды UNIX).
  */
-async function amoFetchPagedReverse(pathBase, perPage = 100, maxPages = 5) {
+const CURSOR_KEYS = {
+  lead:    "amo_cursor_lead_notes_created_at",
+  contact: "amo_cursor_contact_notes_created_at",
+  company: "amo_cursor_company_notes_created_at",
+};
+
+/**
+ * Получить/сохранить курсор (created_at сек).
+ */
+async function getCursor(entity){
+  const raw = await getSecret(CURSOR_KEYS[entity]);
+  const v = parseInt(raw || "0", 10);
+  return Number.isFinite(v) ? v : 0;
+}
+async function setCursor(entity, sec){
+  if (!sec || !Number.isFinite(sec)) return;
+  await setSecret(CURSOR_KEYS[entity], String(sec));
+}
+
+/**
+ * Тянем страницы с конца, но **останавливаемся**, когда достигли уже виденного created_at.
+ * Это резко сокращает работу на каждом тике.
+ *
+ * @param {"lead"|"contact"|"company"} entity
+ * @param {string} pathBase  - например "/api/v4/leads/notes"
+ * @param {number} perPage   - limit/страница (до 250)
+ * @param {number} maxPagesBack - максимум страниц назад от последней (safety)
+ * @param {number} sinceCreatedAtSec - курсор created_at (обрабатываем только > него)
+ * @returns {Array<object>} — только новые элементы (created_at > cursor), в порядке убывания created_at
+ */
+async function fetchNotesSinceCursor(entity, pathBase, perPage, maxPagesBack, sinceCreatedAtSec){
   // выясняем последнюю страницу
   const first = await amoFetch(`${pathBase}?limit=${perPage}&page=1`);
   let lastPage = 1;
@@ -184,15 +212,30 @@ async function amoFetchPagedReverse(pathBase, perPage = 100, maxPages = 5) {
     if (m) lastPage = parseInt(m[1], 10) || 1;
   }
 
-  const all = [];
-  const startPage = Math.max(1, lastPage - maxPages + 1);
+  const collected = [];
+  const startPage = Math.max(1, lastPage - maxPagesBack + 1);
+
+  // идём от самой последней страницы к более ранним
+  outer:
   for (let page = lastPage; page >= startPage; page--) {
     const j = await amoFetch(`${pathBase}?limit=${perPage}&page=${page}`);
     const arr = Array.isArray(j?._embedded?.notes) ? j._embedded.notes : [];
-    all.push(...arr);
-    if (arr.length === 0) break; // на всякий
+    if (!arr.length) break;
+
+    // Берём только то, что новее курсора; если встретили старое/равное — можем прервать цикл целиком
+    for (const n of arr) {
+      const ca = parseInt(n?.created_at || 0, 10) || 0;
+      if (sinceCreatedAtSec && ca <= sinceCreatedAtSec) {
+        // Мы дошли до старых — дальше страницы только старее, можно завершать внешний цикл
+        break outer;
+      }
+      collected.push(n);
+    }
   }
-  return all;
+
+  // Приводим к убыванию по created_at (самые свежие первее)
+  collected.sort((a,b) => (b.created_at||0) - (a.created_at||0));
+  return collected;
 }
 
 /* ==================== USERS ==================== */
@@ -301,18 +344,27 @@ function entityCardUrl(entity, id){
 
 /* ==================== Main ==================== */
 /**
- * Сканирует заметки (lead/contact/company) с конца, отбрасывает старые,
- * вытаскивает аудиоссылки, шлёт подробный отчёт в TG, делает ASR+QA.
+ * Сканирует заметки (lead/contact/company) **инкрементально**:
+ * - тянем только то, что новее сохранённого курсора created_at;
+ * - берём страницы от конца, но останавливаемся при достижении курсора;
+ * - вытаскиваем аудиоссылки, шлём отчёт в TG, делаем ASR+QA;
  *
  * @param {number} perEntityLimit - limit/страница (до 250)
  * @param {number} maxNewToProcessThisTick - защитный максимум новых за тик
  */
 export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessThisTick = Infinity) {
-  // Берём последние страницы по всем сущностям
+  // читаем курсоры
+  const [leadCursor, contactCursor, companyCursor] = await Promise.all([
+    getCursor("lead"),
+    getCursor("contact"),
+    getCursor("company")
+  ]);
+
+  // Тянем только **свежее курсора** (и ограничиваем глубину страниц на всякий)
   const [leadNotes, contactNotes, companyNotes] = await Promise.all([
-    amoFetchPagedReverse("/api/v4/leads/notes", perEntityLimit, 6),     // до 6 страниц назад
-    amoFetchPagedReverse("/api/v4/contacts/notes", perEntityLimit, 4),  // чуть меньше
-    amoFetchPagedReverse("/api/v4/companies/notes", perEntityLimit, 2), // обычно мало
+    fetchNotesSinceCursor("lead",    "/api/v4/leads/notes",     perEntityLimit, 6, leadCursor),
+    fetchNotesSinceCursor("contact", "/api/v4/contacts/notes",  perEntityLimit, 4, contactCursor),
+    fetchNotesSinceCursor("company", "/api/v4/companies/notes", perEntityLimit, 2, companyCursor),
   ]);
 
   // Собираем унифицированный список
@@ -334,11 +386,16 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
   pack("contact", contactNotes);
   pack("company", companyNotes);
 
-  // финально сортируем по убыванию created_at
+  // финально сортируем по убыванию created_at (самые свежие первыми)
   picked.sort((a,b) => (b.created_at||0) - (a.created_at||0));
 
   const now = Date.now();
   let started = 0, skipped = 0, withLinks = 0, ignored = 0;
+
+  // будем обновлять курсоры только значениями реально «запущенных» заметок
+  let maxLeadCA = leadCursor;
+  let maxContactCA = contactCursor;
+  let maxCompanyCA = companyCursor;
 
   for (const note of picked) {
     const source_type = "amo_note";
@@ -348,7 +405,7 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
     const already = await isAlreadyProcessed(source_type, source_id);
     if (already) { skipped++; continue; }
 
-    // свежесть
+    // свежесть по часам (дополнительный рантайм-фильтр)
     const createdMs = (note.created_at || 0) * 1000;
     if (IGNORE_MS > 0 && (now - createdMs) > IGNORE_MS) {
       await markSeenOnly(source_type, source_id, null);
@@ -376,7 +433,7 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
     const dealUrl  = entityCardUrl(note.entity, note.entity_id);
     const createdH = humanDate(createdMs);
 
-    // отправляем «пред-репорт» (чтобы увидеть звонок сразу)
+    // пред-репорт в TG
     await sendTG(
       [
         "🎧 <b>Новый звонок из Amo</b>",
@@ -421,11 +478,35 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
         await sendTG(formatQaForTelegram(qa));
         started++;
         await markProcessed(source_type, source_id, origUrl);
+
+        // двигаем локальный максимум курсора для нужной сущности
+        const ca = note.created_at || 0;
+        if (note.entity === "lead")    { if (ca > maxLeadCA)    maxLeadCA = ca; }
+        if (note.entity === "contact") { if (ca > maxContactCA) maxContactCA = ca; }
+        if (note.entity === "company") { if (ca > maxCompanyCA) maxCompanyCA = ca; }
       } else {
         await sendTG("⚠️ ASR не удалось выполнить для ссылки из Amo.");
       }
     }
   }
 
-  return { scanned: picked.length, withLinks, started, skipped, ignored };
+  // сохраняем обновлённые курсоры (только если они увеличились)
+  const cursorUpdates = [];
+  if (maxLeadCA    > leadCursor)    cursorUpdates.push(setCursor("lead",    maxLeadCA));
+  if (maxContactCA > contactCursor) cursorUpdates.push(setCursor("contact", maxContactCA));
+  if (maxCompanyCA > companyCursor) cursorUpdates.push(setCursor("company", maxCompanyCA));
+  if (cursorUpdates.length) await Promise.all(cursorUpdates);
+
+  return {
+    scanned: picked.length,
+    withLinks,
+    started,
+    skipped,
+    ignored,
+    cursors: {
+      lead_prev: leadCursor,    lead_next: maxLeadCA,
+      contact_prev: contactCursor, contact_next: maxContactCA,
+      company_prev: companyCursor, company_next: maxCompanyCA
+    }
+  };
 }

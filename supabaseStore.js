@@ -123,3 +123,35 @@ export async function markSeenOnly(source_type, source_id, record_url) {
     console.warn("markSeenOnly error:", e?.message || e);
   }
 }
+// ===== secrets storage (app_secrets) =====
+export async function getSecret(key) {
+  try {
+    const rows = await sbFetch(`/app_secrets?key=eq.${encodeURIComponent(key)}&select=val&limit=1`);
+    if (Array.isArray(rows) && rows.length > 0) return rows[0].val || null;
+    return null;
+  } catch (e) {
+    console.warn("getSecret error:", e?.message || e);
+    return null;
+  }
+}
+
+export async function setSecret(key, val) {
+  try {
+    const existing = await sbFetch(`/app_secrets?key=eq.${encodeURIComponent(key)}&select=key&limit=1`);
+    if (Array.isArray(existing) && existing.length > 0) {
+      await sbFetch(`/app_secrets?key=eq.${encodeURIComponent(key)}`, {
+        method: "PATCH",
+        body: { val, updated_at: new Date().toISOString() }
+      });
+      return true;
+    }
+    await sbFetch(`/app_secrets`, {
+      method: "POST",
+      body: [{ key, val, updated_at: new Date().toISOString() }]
+    });
+    return true;
+  } catch (e) {
+    console.warn("setSecret error:", e?.message || e);
+    return false;
+  }
+}

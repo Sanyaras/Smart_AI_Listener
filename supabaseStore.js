@@ -104,7 +104,7 @@ export async function markProcessed(source_type, source_id, record_url) {
  * use case: звонок слишком старый (>3ч), мы не хотим его крутить,
  * но и не хотим каждый тик думать "а вдруг".
  */
-export async function markSeenOnly(source_type, source_id, record_url) {
+export async function markSeenOnly(source_type, source_id, record_url = "") {
   try {
     await sbFetch(`/${TABLE}`, {
       method: "POST",

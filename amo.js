@@ -283,6 +283,15 @@ function findRecordingLinksInNote(note) {
 
   if (note?.text)  pushFromText(note.text);
   if (note?.params) collectFromObj(note.params);
+// 💡 добавляем прямой доступ к note.params.link
+  if (note?.params?.link && typeof note.params.link === 'string') {
+    if (note.params.link.startsWith('http')) urls.add(note.params.link);
+  }
+
+  // некоторые телефонии могут класть объект { link: { href: "..." } }
+  if (note?.params?.link?.href && typeof note.params.link.href === 'string') {
+    if (note.params.link.href.startsWith('http')) urls.add(note.params.link.href);
+  }
 
   const candidates = Array.from(urls);
 

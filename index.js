@@ -280,6 +280,65 @@ app.get("/amo/poll", async (req, res) => {
     res.status(401).json({ ok: false, error: String(e) });
   }
 });
+/* ---- AMO DEBUG ---- */
+// Быстрый дамп последних заметок по всем сущностям без фильтра по типу.
+// Помогает увидеть реальные поля params/payload/data и понять, где лежат ссылки/файлы.
+app.get("/amo/debug/notes", async (req, res) => {
+  try {
+    assertKey(req);
+    const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
+
+    const [leads, contacts, companies] = await Promise.all([
+      amoFetch(`/api/v4/leads/notes?limit=${limit}`),
+      amoFetch(`/api/v4/contacts/notes?limit=${limit}`),
+      amoFetch(`/api/v4/companies/notes?limit=${limit}`),
+    ]);
+
+    const pick = (entity, arr) => {
+      const items = Array.isArray(arr?._embedded?.notes) ? arr._embedded.notes : [];
+      return items.map(n => ({
+        entity,
+        id: n.id,
+        note_type: n.note_type,
+        created_at: n.created_at,
+        // краткие подсказки, чтобы не лить мегабайты:
+        has_text: !!(n.text || n.params?.text),
+        param_keys: n.params ? Object.keys(n.params).slice(0, 20) : [],
+        // небольшой срез params для понимания структуры
+        params_preview: (() => {
+          try {
+            const s = JSON.stringify(n.params || {}).slice(0, 600);
+            return s;
+          } catch { return ""; }
+        })(),
+      }));
+    };
+
+    const out = [
+      ...pick("lead", leads),
+      ...pick("contact", contacts),
+      ...pick("company", companies),
+    ].sort((a,b) => (b.created_at||0) - (a.created_at||0));
+
+    res.json({ ok: true, count: out.length, items: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Низкоуровневая ручка: дернуть любой путь AmoCRM (на свой риск), чтобы посмотреть ответ как есть.
+// Пример: /amo/debug/raw?path=/api/v4/leads/notes?limit=10
+app.get("/amo/debug/raw", async (req, res) => {
+  try {
+    assertKey(req);
+    const path = String(req.query.path || "");
+    if (!path.startsWith("/")) return res.status(400).json({ ok:false, error:"path must start with /" });
+    const j = await amoFetch(path);
+    res.json(j);
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e) });
+  }
+});
 
 /* -------------------- TELEGRAM WEBHOOK -------------------- */
 app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {

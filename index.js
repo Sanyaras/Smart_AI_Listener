@@ -1,34 +1,32 @@
-// index.js — Smart AI Listener (v2.4.2-IRAZBIL safe-cursors)
+// index.js — Smart AI Listener (v2.5.0-IRAZBIL)
 // архитектура: telegram / asr / amo / megapbx / supabaseStore / utils
+// изменения: надёжный ручной поллер с опциями force/since/bootstrap, фиксы OAuth-callback
 
 import express from "express";
 import bodyParser from "body-parser";
 import crypto from "crypto";
 
-// ---- QA ----
+// ---- QA (аналитика звонков) ----
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
-// ---- Telegram ----
+// ---- Telegram helpers ----
 import {
   initTelegramEnv,
   TELEGRAM,
   sendTG,
-  sendTGDocument,
   tgReply,
   tgGetFileUrl,
   tgRelayAudio,
-  formatTgMegapbxMessage,
-  getTelegramQueuesState,
 } from "./telegram.js";
 
-// ---- ASR ----
+// ---- ASR очередь/распознавание ----
 import {
   enqueueAsr,
   transcribeAudioFromUrl,
   getAsrState,
 } from "./asr.js";
 
-// ---- AmoCRM ----
+// ---- AmoCRM интеграция ----
 import {
   processAmoCallNotes,
   amoFetch,
@@ -37,28 +35,23 @@ import {
   injectAmoTokens,
 } from "./amo.js";
 
-// ---- Megapbx ----
+// ---- Megafon/Megapbx utils ----
 import { normalizeMegafon } from "./megapbx.js";
 
-// ---- Utils ----
+// ---- Утилиты/сетевые ----
 import {
-  debug,
   cap,
-  safeStr,
   mask,
-  chunkText,
   fetchWithTimeout,
 } from "./utils.js";
 
-// ---- Supabase ----
+// ---- Supabase tokens/flags ----
 import {
-  isAlreadyProcessed,
-  markProcessed,
-  setSecret,
+  setSecret, // для OAuth-секретов
 } from "./supabaseStore.js";
 
 /* -------------------- ENV -------------------- */
-const VERSION = "railway-2.4.2-irazbil";
+const VERSION = "railway-2.5.0-irazbil";
 
 const TG_BOT_TOKEN       = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID         = process.env.TG_CHAT_ID || "";
@@ -66,21 +59,21 @@ const TG_WEBHOOK_SECRET  = (process.env.TG_WEBHOOK_SECRET || "").trim();
 const TG_UPLOAD_CHAT_ID  = process.env.TG_UPLOAD_CHAT_ID || TG_CHAT_ID;
 const NODE_ENV           = process.env.NODE_ENV || "development";
 
-const CRM_SHARED_KEY     = process.env.CRM_SHARED_KEY || ""; // use: boxfield-qa-2025
+const CRM_SHARED_KEY     = process.env.CRM_SHARED_KEY || ""; // пример: boxfield-qa-2025
 const OPENAI_API_KEY     = process.env.OPENAI_API_KEY || "";
 
 const AUTO_TRANSCRIBE    = process.env.AUTO_TRANSCRIBE === "1";
-const SHOW_CONTACT_EVENTS= process.env.SHOW_CONTACT_EVENTS === "1";
 const RELAY_BASE_URL     = process.env.RELAY_BASE_URL || "";
 const TG_DIRECT_FETCH    = process.env.TG_DIRECT_FETCH === "1";
 
 const AMO_POLL_MINUTES   = parseInt(process.env.AMO_POLL_MINUTES || "0", 10);
 const AMO_POLL_LIMIT     = parseInt(process.env.AMO_POLL_LIMIT   || "30", 10);
 
+// при старте ограничиваем, сколько "старых" звонков обработаем
 const AMO_BOOTSTRAP_LIMIT = parseInt(process.env.AMO_BOOTSTRAP_LIMIT || "5", 10);
 let bootstrapRemaining = AMO_BOOTSTRAP_LIMIT;
 
-// OAuth конфиг
+// OAuth конфиг (Railway)
 const AMO_BASE_URL      = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
 const AMO_CLIENT_ID     = process.env.AMO_CLIENT_ID || "";
 const AMO_CLIENT_SECRET = process.env.AMO_CLIENT_SECRET || "";
@@ -92,11 +85,6 @@ function ensureAmoOauthEnv() {
     throw new Error("AMO OAuth env incomplete (AMO_BASE_URL / AMO_CLIENT_ID / AMO_CLIENT_SECRET / AMO_REDIRECT_URI)");
   }
 }
-
-const HISTORY_TIMEOUT_MS =
-  parseInt(process.env.HISTORY_TIMEOUT_MIN || "7", 10) * 60 * 1000;
-const CALL_TTL_MS =
-  parseInt(process.env.CALL_TTL_MIN || "60", 10) * 60 * 1000;
 
 const PORT = process.env.PORT || 3000;
 
@@ -115,15 +103,6 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"] }));
 
 /* -------------------- HELPERS -------------------- */
-function wrapRecordingUrl(url) {
-  if (!RELAY_BASE_URL) return url;
-  try {
-    const u = new URL(url);
-    const rb = new URL(RELAY_BASE_URL);
-    if (u.hostname === rb.hostname && u.port === rb.port) return url;
-  } catch {}
-  return RELAY_BASE_URL + encodeURIComponent(url);
-}
 function assertKey(req) {
   const got =
     (req.headers["authorization"] ||
@@ -134,9 +113,10 @@ function assertKey(req) {
   if (CRM_SHARED_KEY && key !== CRM_SHARED_KEY) throw new Error("bad key");
 }
 
-/* -------------------- DIAG -------------------- */
+/* -------------------- DIАГНОСТИКА -------------------- */
 app.get("/", (_, res) => res.send("OK"));
 app.get("/version", (_, res) => res.json({ version: VERSION }));
+
 app.get("/diag/env", (_, res) =>
   res.json({
     version: VERSION,
@@ -150,7 +130,8 @@ app.get("/diag/env", (_, res) =>
   })
 );
 
-/* -------------------- AMO OAuth -------------------- */
+/* -------------------- AMO: Stable OAuth flow -------------------- */
+// 1) Старт авторизации: редиректим на AmoCRM OAuth
 app.get("/amo/oauth/start", async (req, res) => {
   try {
     ensureAmoOauthEnv();
@@ -162,6 +143,7 @@ app.get("/amo/oauth/start", async (req, res) => {
       `&response_type=code` +
       `&mode=post_message` +
       `&state=${encodeURIComponent(state)}`;
+
     res.redirect(url);
   } catch (e) {
     await sendTG(`❗️ OAuth start error: <code>${e?.message || e}</code>`);
@@ -169,6 +151,7 @@ app.get("/amo/oauth/start", async (req, res) => {
   }
 });
 
+// 2) Callback AmoCRM: code → access/refresh, сохранить в Supabase и инжектнуть в рантайм
 app.get("/amo/oauth/callback", async (req, res) => {
   try {
     ensureAmoOauthEnv();
@@ -201,10 +184,14 @@ app.get("/amo/oauth/callback", async (req, res) => {
     const refresh = j.refresh_token || "";
     if (!access || !refresh) throw new Error("empty tokens in response");
 
+    // 1) сохраняем как «источник истины» в Supabase
     await setSecret("AMO_ACCESS_TOKEN", access);
     await setSecret("AMO_REFRESH_TOKEN", refresh);
-    try { await injectAmoTokens(access, refresh); } catch {}
 
+    // 2) подменяем в рантайме внутри amo.js (без рестарта)
+    try { injectAmoTokens(access, refresh); } catch {}
+
+    // 3) нотификация
     await sendTG(
       "✅ <b>AmoCRM авторизация завершена</b>\n" +
       `• access: <code>${mask(access)}</code>\n` +
@@ -222,6 +209,7 @@ app.get("/amo/oauth/callback", async (req, res) => {
   }
 });
 
+/* -------------------- AMO вспомогательные -------------------- */
 app.get("/amo/refresh", async (_, res) => {
   try {
     const j = await amoRefresh();
@@ -233,102 +221,28 @@ app.get("/amo/refresh", async (_, res) => {
   }
 });
 
-/* ---- safe cursor tools ---- */
-app.post("/amo/cursors/reset", async (req, res) => {
-  try {
-    assertKey(req);
-    await Promise.all([
-      setSecret("amo_cursor_lead_notes_created_at", "0"),
-      setSecret("amo_cursor_contact_notes_created_at", "0"),
-      setSecret("amo_cursor_company_notes_created_at", "0"),
-    ]);
-    await sendTG("♻️ Amo cursors reset to 0 (lead/contact/company).");
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: String(e) });
-  }
-});
-app.post("/amo/cursors/soft-backfill", async (req, res) => {
-  try {
-    assertKey(req);
-    const hours = Math.max(1, Math.min(parseInt(req.query.hours || "24", 10), 168));
-    const targetSec = Math.floor(Date.now()/1000) - hours*3600;
-    await Promise.all([
-      setSecret("amo_cursor_lead_notes_created_at", String(targetSec)),
-      setSecret("amo_cursor_contact_notes_created_at", String(targetSec)),
-      setSecret("amo_cursor_company_notes_created_at", String(targetSec)),
-    ]);
-    await sendTG(`⏪ Soft-backfill cursors set to -${hours}h.`);
-    res.json({ ok: true, targetSec });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: String(e) });
-  }
-});
-
-/* ---- manual poll ---- */
+/* ---- Ручной поллер Amo ---- */
+// Пример: /amo/poll?key=boxfield-qa-2025&limit=200&force=1&since=1753800000&bootstrap=300
 app.get("/amo/poll", async (req, res) => {
   try {
     assertKey(req);
-    const limit = Math.min(parseInt(req.query.limit || AMO_POLL_LIMIT, 10), 100);
-    const out = await processAmoCallNotes(limit, bootstrapRemaining);
+    const limit = Math.min(parseInt(req.query.limit || AMO_POLL_LIMIT, 10), 200);
+    const force = String(req.query.force || "0") === "1";
+    const since = req.query.since ? parseInt(String(req.query.since), 10) : null; // unix seconds
+    const bootstrap = req.query.bootstrap ? Math.min(parseInt(String(req.query.bootstrap), 10), 500) : null;
+
+    const out = await processAmoCallNotes(limit, bootstrapRemaining, {
+      force,
+      sinceEpochSec: Number.isFinite(since) ? since : null,
+      bootstrapLimit: bootstrap ?? null,
+    });
+
     if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
       bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
     }
     res.json({ ok: true, ...out, bootstrapRemaining });
   } catch (e) {
     res.status(401).json({ ok: false, error: String(e) });
-  }
-});
-
-/* ---- AMO DEBUG ---- */
-app.get("/amo/debug/notes", async (req, res) => {
-  try {
-    assertKey(req);
-    const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
-
-    const [leads, contacts, companies] = await Promise.all([
-      amoFetch(`/api/v4/leads/notes?limit=${limit}`),
-      amoFetch(`/api/v4/contacts/notes?limit=${limit}`),
-      amoFetch(`/api/v4/companies/notes?limit=${limit}`),
-    ]);
-
-    const pick = (entity, arr) => {
-      const items = Array.isArray(arr?._embedded?.notes) ? arr._embedded.notes : [];
-      return items.map(n => ({
-        entity,
-        id: n.id,
-        note_type: n.note_type,
-        created_at: n.created_at,
-        has_text: !!(n.text || n.params?.text),
-        param_keys: n.params ? Object.keys(n.params).slice(0, 20) : [],
-        params_preview: (() => {
-          try { return JSON.stringify(n.params || {}).slice(0, 600); }
-          catch { return ""; }
-        })(),
-      }));
-    };
-
-    const out = [
-      ...pick("lead", leads),
-      ...pick("contact", contacts),
-      ...pick("company", companies),
-    ].sort((a,b) => (b.created_at||0) - (a.created_at||0));
-
-    res.json({ ok: true, count: out.length, items: out });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.get("/amo/debug/raw", async (req, res) => {
-  try {
-    assertKey(req);
-    const path = String(req.query.path || "");
-    if (!path.startsWith("/")) return res.status(400).json({ ok:false, error:"path must start with /" });
-    const j = await amoFetch(path);
-    res.json(j);
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e) });
   }
 });
 
@@ -342,7 +256,10 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
 
     const txt = (msg.text || "").trim();
     if (txt.startsWith("/start") || txt.startsWith("/help")) {
-      await tgReply(chatId, "👋 Пришли аудио (voice/audio/document) — я расшифрую и пришлю аналитику.");
+      await tgReply(
+        chatId,
+        "👋 Пришли аудио (voice/audio/document) — я расшифрую и пришлю аналитику."
+      );
       return res.json({ ok: true });
     }
 
@@ -369,7 +286,11 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
           const inUrl = m[1];
           await tgReply(chatId, "⏳ Беру по ссылке, расшифровываю…");
           let relayCdnUrl;
-          try { relayCdnUrl = await tgRelayAudio(inUrl, `🎧 tg /asr relay`); } catch { relayCdnUrl = inUrl; }
+          try {
+            relayCdnUrl = await tgRelayAudio(inUrl, `🎧 tg /asr relay`);
+          } catch {
+            relayCdnUrl = inUrl;
+          }
           const text = await enqueueAsr(() =>
             transcribeAudioFromUrl(relayCdnUrl, { callId: "tg-cmd", fileName: "audio.ext" })
           );
@@ -384,6 +305,7 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
           return res.json({ ok: true });
         }
       }
+
       await tgReply(chatId, "🧩 Отправь аудиофайл, чтобы я расшифровал.");
       return res.json({ ok: true });
     }
@@ -412,10 +334,13 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
 
 /* -------------------- AUTO POLLER -------------------- */
 if (AMO_POLL_MINUTES > 0) {
-  console.log(`⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT})`);
+  console.log(
+    `⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT})`
+  );
+
   const tickAmo = async () => {
     try {
-      const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining);
+      const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining, {});
       if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
         bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
       }
@@ -424,9 +349,11 @@ if (AMO_POLL_MINUTES > 0) {
         await sendTG(
           `📡 Amo poll:\n` +
           `• scanned ${out.scanned}\n` +
-          `• with links ${out.withLinks}\n` +
+          `• withLinks ${out.withLinks}\n` +
           `• started ${out.started}\n` +
+          `• skipped ${out.skipped}\n` +
           `• ignored ${out.ignored}\n` +
+          `• seenOnly ${out.seenOnly}\n` +
           `• bootstrapRemaining ${bootstrapRemaining}`
         );
       }
@@ -435,6 +362,8 @@ if (AMO_POLL_MINUTES > 0) {
       try { await sendTG("❗️ poll error: " + (e?.message || e)); } catch {}
     }
   };
+
+  // первый запуск сразу, чтобы не ждать N минут
   tickAmo();
   setInterval(tickAmo, AMO_POLL_MINUTES * 60 * 1000);
 } else {
@@ -442,6 +371,6 @@ if (AMO_POLL_MINUTES > 0) {
 }
 
 /* -------------------- START -------------------- */
-const server = app.listen(PORT, () =>
+app.listen(PORT, () =>
   console.log(`Smart AI Listener (${VERSION}) listening on ${PORT}`)
 );

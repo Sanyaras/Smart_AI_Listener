@@ -1,4 +1,4 @@
-// index.js — Smart AI Listener (v2.6.2-IRAZBIL)
+// index.js — Smart AI Listener (v2.6.3-IRAZBIL)
 // Архитектура: telegram / asr / amo / supabaseStore / utils / qa_assistant
 // Фичи:
 //  • Автопуллер Amo по расписанию (AMO_POLL_MINUTES) + self-HTTP тик
@@ -52,7 +52,7 @@ import {
 } from "./supabaseStore.js";
 
 /* -------------------- ENV -------------------- */
-const VERSION             = "railway-2.6.2-irazbil";
+const VERSION             = "railway-2.6.3-irazbil";
 
 const TG_BOT_TOKEN        = process.env.TG_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT_ID          = process.env.TG_CHAT_ID || "";
@@ -102,6 +102,8 @@ function ensureAmoOauthEnv() {
     throw new Error("AMO OAuth env incomplete (AMO_BASE_URL / AMO_CLIENT_ID / AMO_CLIENT_SECRET / AMO_REDIRECT_URI)");
   }
 }
+function nowIso(){ return new Date().toISOString(); }
+function minutes(ms){ return Math.floor(ms/60000); }
 
 /* -------------------- BASIC/DIAG -------------------- */
 app.get("/", (_, res) => res.send("OK"));
@@ -164,20 +166,21 @@ app.get("/amo/oauth/callback", async (req, res) => {
     }
     const j = JSON.parse(text);
     const access  = j.access_token  || "";
-    const refresh = j.refresh_token || "";
-    if (!access || !refresh) throw new Error("empty tokens in response");
-
-    await setSecret("AMO_ACCESS_TOKEN", access).catch(()=>{});
-    await setSecret("AMO_REFRESH_TOKEN", refresh).catch(()=>{});
-    try { await injectAmoTokens(access, refresh); } catch {}
-
-    try {
-      await sendTG(
-        "✅ <b>AmoCRM авторизация завершена</b>\n" +
-        `• access: <code>${mask(access)}</code>\n` +
-        `• refresh: <code>${mask(refresh)}</code>`
-      );
-    } catch {}
+    the_refresh:
+    {
+      const refresh = j.refresh_token || "";
+      if (!access || !refresh) throw new Error("empty tokens in response");
+      await setSecret("AMO_ACCESS_TOKEN", access).catch(()=>{});
+      await setSecret("AMO_REFRESH_TOKEN", refresh).catch(()=>{});
+      try { await injectAmoTokens(access, refresh); } catch {}
+      try {
+        await sendTG(
+          "✅ <b>AmoCRM авторизация завершена</b>\n" +
+          `• access: <code>${mask(access)}</code>\n` +
+          `• refresh: <code>${mask(refresh)}</code>`
+        );
+      } catch {}
+    }
     res.send(`<html><body style="font-family:system-ui"><h3>Готово ✅</h3><p>Токены сохранены, слушатель подключён.</p></body></html>`);
   } catch (e) {
     try { await sendTG(`❗️ OAuth callback error: <code>${e?.message || e}</code>`); } catch {}
@@ -396,8 +399,6 @@ async function runHttpSelfPoll() {
   }
 }
 
-function minutes(ms){ return Math.floor(ms/60000); }
-
 if (AMO_POLL_MINUTES > 0) {
   console.log(`⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${bootstrapRemaining})`);
 
@@ -459,9 +460,30 @@ if (AMO_POLL_MINUTES > 0) {
   console.log("⏸ auto-poll disabled");
 }
 
+/* -------------------- DIAG/HEALTH -------------------- */
+// Диагностика тиков: удобно быстро увидеть, «живо» ли всё
+app.get("/amo/diag", (_req, res) => {
+  const now = Date.now();
+  const diag = {
+    ok: true,
+    version: VERSION,
+    now: nowIso(),
+    poll_minutes: AMO_POLL_MINUTES,
+    poll_limit: AMO_POLL_LIMIT,
+    bootstrapRemaining,
+    lastTickAt,
+    lastWithLinksAt,
+    lastStartedAt,
+    since: {
+      lastTickMinAgo: lastTickAt ? minutes(now - lastTickAt) : null,
+      lastWithLinksMinAgo: lastWithLinksAt ? minutes(now - lastWithLinksAt) : null,
+      lastStartedMinAgo: lastStartedAt ? minutes(now - lastStartedAt) : null,
+    }
+  };
+  res.json(diag);
+});
+
 /* -------------------- SERVER -------------------- */
 app.listen(PORT, () => {
   console.log(`Smart AI Listener (${VERSION}) listening on ${PORT}`);
 });
-
- 

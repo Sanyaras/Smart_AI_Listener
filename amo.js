@@ -1,8 +1,6 @@
-// amo.js — AmoCRM интеграция + надёжный поллер
-// v3.4-IRAZBIL (passport upsert + suppress_alert + tokens-from-store)
-//
-// Совместимо с index.js v2.6.x-IRAZBIL
-// Экспортирует: processAmoCallNotes, amoFetch, amoRefresh, getAmoTokensMask, injectAmoTokens
+// amo.js — AmoCRM интеграция + надёжный поллер (v3.4-IRAZBIL)
+// Совместимо с index.js v2.6.x-IRAZBIL (processAmoCallNotes(limit, bootstrapRemaining, options))
+// Фичи: tail-scan + overlap/healing, анти-спам, алерты (c гейтингом non-scoring), Supabase upsert (расширенный), токены из Supabase
 
 import crypto from "crypto";
 import { fetchWithTimeout, mask, cap } from "./utils.js";
@@ -46,6 +44,9 @@ const SUPABASE_TABLE = process.env.SUPABASE_CALLS_QA_TABLE || "calls_qa";
 const CURSOR_OVERLAP_MIN = parseInt(process.env.AMO_CURSOR_OVERLAP_MIN || "180", 10); // 3h overlap
 const BACKFILL_MAX_HOURS = parseInt(process.env.AMO_BACKFILL_MAX_HOURS || "72", 10);  // heal up to 72h
 
+// Версия пайплайна QA (пишем в БД)
+const QA_VERSION = "v4.3-IRAZBIL";
+
 // ==================== Tokens & Secrets ====================
 import {
   isAlreadyProcessed,
@@ -62,11 +63,10 @@ let TOKENS_LOADED_ONCE = false;
 async function loadTokensFromStoreIfNeeded() {
   if (TOKENS_LOADED_ONCE) return;
   try {
-    // приоритет: явные ключи → бэкапные имена
-    const acc = (await getSecret(SECRET_KEY_ACCESS)) || (await getSecret("AMO_ACCESS_TOKEN")) || "";
-    const ref = (await getSecret(SECRET_KEY_REFRESH)) || (await getSecret("AMO_REFRESH_TOKEN")) || "";
-    if (!AMO_ACCESS_TOKEN && acc)  AMO_ACCESS_TOKEN  = acc;
-    if (!AMO_REFRESH_TOKEN && ref) AMO_REFRESH_TOKEN = ref;
+    const acc = await getSecret(SECRET_KEY_ACCESS);
+    const ref = await getSecret(SECRET_KEY_REFRESH);
+    if (acc) AMO_ACCESS_TOKEN = acc;
+    if (ref) AMO_REFRESH_TOKEN = ref;
   } catch {}
   TOKENS_LOADED_ONCE = true;
 }
@@ -129,6 +129,7 @@ export async function amoRefresh() {
   })();
   return amoRefreshPromise;
 }
+// На случай первичного обмена кодом (не используется из index.js, но оставим)
 export async function amoExchangeCode() {
   if (!AMO_AUTH_CODE) throw new Error("AMO_AUTH_CODE missing");
   const j = await amoOAuth({ grant_type: "authorization_code", code: AMO_AUTH_CODE });
@@ -317,7 +318,7 @@ function findRecordingLinksInNote(note) {
 
   const durSec = parseInt(note?.params?.duration || 0, 10) || 0;
   if (durSec > 0) {
-    const more = candidates.filter(u => !/\.(svg|png|jpg|jpeg|gif|webp)/i.test(u));
+    const more = candidates.filter(u => !/\.(svg|png|jpg|jpeg|gif|webp)(\?|$)/i.test(u));
     more.forEach(u => filtered.push(u));
   }
   return Array.from(new Set(filtered));
@@ -351,6 +352,27 @@ function isLikelyCallNote(note){
 function sha256(s){ return crypto.createHash("sha256").update(String(s)).digest("hex"); }
 function tgSpoiler(s){ return `<span class="tg-spoiler">${s}</span>`; }
 
+// non-scoring классификация на основании QA + длительности
+function deriveCallTypeAndScored(qa, durSec) {
+  const d = Number.isFinite(+durSec) ? +durSec : null;
+  const summary = (qa?.summary || "").toLowerCase();
+  const quotesStr = JSON.stringify(qa?.quotes || []).toLowerCase();
+
+  // IVR-доминанта или совсем короткие
+  const ivrHints = ["ivr", "автоинформатор", "оставайтесь на линии", "вам ответит первый"];
+  const ivrDom = ivrHints.some(h => summary.includes(h) || quotesStr.includes(h));
+  if (ivrDom || (d !== null && d < 15)) return { call_type_norm: "na", scored: false };
+
+  // сервисные короткие (мало контента)
+  if (d !== null && d < 60) return { call_type_norm: "service_short", scored: false };
+
+  const intent = String(qa?.intent || "").toLowerCase();
+  if (intent === "sales")   return { call_type_norm: "sales", scored: true };
+  if (intent === "support") return { call_type_norm: "support", scored: true };
+
+  return { call_type_norm: "support", scored: true };
+}
+
 // Alerts прямым вызовом Telegram API
 async function sendAlert(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_ALERT_CHAT_ID) return;
@@ -383,7 +405,7 @@ async function upsertCallQaToSupabase(row){
   }
 }
 
-// ==================== Main Poller (совместим с index.js) ====================
+// ==================== Main Poller ====================
 // signature: processAmoCallNotes(limit, bootstrapRemaining, options)
 // options: { force?: boolean, sinceEpochSec?: number|null, bootstrapLimit?: number|null }
 let _zeroScansStreak = 0;
@@ -529,11 +551,11 @@ export async function processAmoCallNotes(limit = 30, bootstrapRemaining = 0, op
       ].filter(Boolean).join("\n")
     );
 
-    // Обработка одной (первой) валидной ссылки
+    // Обработка ссылок (по первой валидной, остальные можно добавить по желанию)
     const origUrl = links[0];
     let relayCdnUrl = origUrl;
     try { relayCdnUrl = await tgRelayAudio(origUrl, `🎧 Аудио (${note.note_type}) • ${managerTxt}`); } catch {
-      // локальный fallback — если Telegram-релей недоступен
+      // локальный fallback
       try {
         const u = new URL(origUrl);
         if (RELAY_BASE_URL && !String(origUrl).startsWith(RELAY_BASE_URL)) {
@@ -559,30 +581,25 @@ export async function processAmoCallNotes(limit = 30, bootstrapRemaining = 0, op
           amo_entity_id: note.entity_id,
           created_at: note.created_at || null,
           phone: phone || null,
-          duration_sec: durSec || 0,
-          note_type: note.note_type || ""
+          duration_sec: durSec || 0
         });
 
         const qaCard = formatQaForTelegram(qa);
         const spoiler = tgSpoiler(text.slice(0, 1600));
         await sendTG(`${qaCard}\n\n<b>Транскрипт (свернуть):</b>\n${spoiler}`);
 
-        // Alerts — с учётом suppress_alert
+        // --- non-scoring классификация и версия
+        const { call_type_norm, scored } = deriveCallTypeAndScored(qa, durSec);
+        const qaVersion = QA_VERSION;
+
+        // Alerts (только scored)
         try {
-          const suppress = !!qa?.passport?.suppress_alert;
-          const total = qa?.score?.total ?? null;
+          const total = qa?.score?.total ?? 0;
           const pe    = qa?.psycho_emotional || {};
           const sent  = typeof pe.customer_sentiment === "number" ? pe.customer_sentiment : 0;
           const esc   = !!pe.escalate_flag;
 
-          const shouldAlert =
-            !suppress && (
-              (typeof total === "number" && total < ALERT_MIN_TOTAL) ||
-              (sent <= ALERT_MIN_SENTIMENT) ||
-              (ALERT_IF_ESCALATE && esc)
-            );
-
-          if (shouldAlert) {
+          if (scored && ((total < ALERT_MIN_TOTAL) || (sent <= ALERT_MIN_SENTIMENT) || (ALERT_IF_ESCALATE && esc))) {
             const intent = qa?.intent || "-";
             await sendAlert(
               [
@@ -590,6 +607,7 @@ export async function processAmoCallNotes(limit = 30, bootstrapRemaining = 0, op
                 `• Intent: <b>${intent}</b> · Total: <b>${total}</b> · Sentiment: <b>${sent}</b> ${esc ? "· Escalate: <b>yes</b>" : ""}`,
                 `• Менеджер: <b>${managerTxt}</b> · Длительность: <b>${fmtDuration(durSec)}</b>`,
                 dealUrl ? `• Карта: ${dealUrl}` : null,
+                `• call_type: <b>${call_type_norm}</b> · scored: <b>${scored ? "yes" : "no"}</b>`,
                 `• note_id: ${note.note_id}`,
                 "",
                 "<i>Короткий транскрипт:</i>",
@@ -599,7 +617,7 @@ export async function processAmoCallNotes(limit = 30, bootstrapRemaining = 0, op
           }
         } catch {}
 
-        // Supabase upsert (+ паспорт пайплайна)
+        // Supabase upsert (расширенный)
         try {
           await upsertCallQaToSupabase({
             source_type: "amo_note",
@@ -610,30 +628,31 @@ export async function processAmoCallNotes(limit = 30, bootstrapRemaining = 0, op
             amo_entity_id: note.entity_id,
             note_type: note.note_type || null,
             phone: phone || null,
+
             duration_sec: durSec || 0,
             created_at_ts: note.created_at || null,
             created_at_iso: new Date(createdMs).toISOString(),
             manager_name: managerTxt,
 
+            // Новые поля
+            qa_version: qaVersion,
             intent: qa?.intent || null,
+            call_type_norm,             // 'na' | 'service_short' | 'sales' | 'support'
+            scored,                     // boolean
+            score_total: qa?.score?.total ?? null,
+            scores: qa?.score || null,  // jsonb
+            techniques: qa?.techniques || null,
+            psycho_emotional: qa?.psycho_emotional || null,
+
+            // Совместимость/старые поля (если используются где-то)
             customer_sentiment: qa?.psycho_emotional?.customer_sentiment ?? null,
             manager_tone: qa?.psycho_emotional?.manager_tone ?? null,
             empathy: qa?.psycho_emotional?.manager_empathy ?? null,
             escalate_flag: qa?.psycho_emotional?.escalate_flag ?? null,
 
-            score_total: qa?.score?.total ?? null,
-            score_per_dimension: qa?.score?.per_dimension || null,
-
             transcript: text,
             transcript_hash: tHash,
-            qa_json: qa,
-
-            // паспорт пайплайна для трассировки версий
-            qa_model: qa?.passport?.qa_model || null,
-            qa_rubric_version: qa?.passport?.qa_rubric_version || null,
-            alert_rules_version: qa?.passport?.alert_rules_version || null,
-            config_hash: qa?.passport?.config_hash || null,
-            suppress_alert: qa?.passport?.suppress_alert ?? null
+            qa_json: qa
           });
         } catch (e) {
           console.warn("upsertCallQaToSupabase error:", e?.message || e);

@@ -1,3 +1,4 @@
+
 // index.js — Smart AI Listener (v2.4.1-IRAZBIL)
 // архитектура: telegram / asr / amo / megapbx / supabaseStore / utils
 // изменения: удалён повторный импорт processAmoCallNotes; мелкие фиксы/логирование

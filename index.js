@@ -219,9 +219,7 @@ app.get("/amo/oauth/callback", async (req, res) => {
     }
     const j = JSON.parse(text);
 
-    const access  = j.access_token  || "";
-    the_refresh:
-    const refresh = j.refresh_token || "";
+   const { access_token: access = "", refresh_token: refresh = "" } = j;
     if (!access || !refresh) throw new Error("empty tokens in response");
 
     // 1) сохраняем как «источник истины» в Supabase

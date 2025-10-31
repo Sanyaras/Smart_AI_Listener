@@ -1,11 +1,15 @@
-// index.js — Smart AI Listener
+// index.js — Smart AI Listener (v2.4.1-IRAZBIL)
 // архитектура: telegram / asr / amo / megapbx / supabaseStore / utils
-// версия: 2.4.0 (stable OAuth + anti-spam 3h + bootstrap)
+// изменения: удалён повторный импорт processAmoCallNotes; мелкие фиксы/логирование
 
 import express from "express";
 import bodyParser from "body-parser";
+import crypto from "crypto";
+
+// ---- QA (аналитика звонков) ----
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
+// ---- Telegram helpers ----
 import {
   initTelegramEnv,
   TELEGRAM,
@@ -18,23 +22,26 @@ import {
   getTelegramQueuesState,
 } from "./telegram.js";
 
+// ---- ASR очередь/распознавание ----
 import {
   enqueueAsr,
   transcribeAudioFromUrl,
   getAsrState,
 } from "./asr.js";
 
+// ---- AmoCRM интеграция ----
 import {
   processAmoCallNotes,
   amoFetch,
   amoRefresh,
   getAmoTokensMask,
-  // ⬇️ нужен мини-пэтч в amo.js (см. ниже)
   injectAmoTokens,
 } from "./amo.js";
 
+// ---- Megafon/Megapbx utils ----
 import { normalizeMegafon } from "./megapbx.js";
 
+// ---- Утилиты/сетевые ----
 import {
   debug,
   cap,
@@ -44,40 +51,38 @@ import {
   fetchWithTimeout,
 } from "./utils.js";
 
+// ---- Supabase tokens/flags ----
 import {
   isAlreadyProcessed,
   markProcessed,
-  // для OAuth-секретов
-  setSecret,
+  setSecret, // для OAuth-секретов
 } from "./supabaseStore.js";
 
-import crypto from "crypto";
-
 /* -------------------- ENV -------------------- */
-const VERSION = "railway-2.4.0";
+const VERSION = "railway-2.4.1-irazbil";
 
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
-const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
-const TG_WEBHOOK_SECRET = (process.env.TG_WEBHOOK_SECRET || "").trim();
-const TG_UPLOAD_CHAT_ID = process.env.TG_UPLOAD_CHAT_ID || TG_CHAT_ID;
-const NODE_ENV = process.env.NODE_ENV || "development";
+const TG_BOT_TOKEN       = process.env.TG_BOT_TOKEN || "";
+const TG_CHAT_ID         = process.env.TG_CHAT_ID || "";
+const TG_WEBHOOK_SECRET  = (process.env.TG_WEBHOOK_SECRET || "").trim();
+const TG_UPLOAD_CHAT_ID  = process.env.TG_UPLOAD_CHAT_ID || TG_CHAT_ID;
+const NODE_ENV           = process.env.NODE_ENV || "development";
 
-const CRM_SHARED_KEY = process.env.CRM_SHARED_KEY || "";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const CRM_SHARED_KEY     = process.env.CRM_SHARED_KEY || ""; // пример: boxfield-qa-2025
+const OPENAI_API_KEY     = process.env.OPENAI_API_KEY || "";
 
-const AUTO_TRANSCRIBE = process.env.AUTO_TRANSCRIBE === "1";
-const SHOW_CONTACT_EVENTS = process.env.SHOW_CONTACT_EVENTS === "1";
-const RELAY_BASE_URL = process.env.RELAY_BASE_URL || "";
-const TG_DIRECT_FETCH = process.env.TG_DIRECT_FETCH === "1";
+const AUTO_TRANSCRIBE    = process.env.AUTO_TRANSCRIBE === "1";
+const SHOW_CONTACT_EVENTS= process.env.SHOW_CONTACT_EVENTS === "1";
+const RELAY_BASE_URL     = process.env.RELAY_BASE_URL || "";
+const TG_DIRECT_FETCH    = process.env.TG_DIRECT_FETCH === "1";
 
-const AMO_POLL_MINUTES = parseInt(process.env.AMO_POLL_MINUTES || "0", 10);
-const AMO_POLL_LIMIT   = parseInt(process.env.AMO_POLL_LIMIT   || "30", 10);
+const AMO_POLL_MINUTES   = parseInt(process.env.AMO_POLL_MINUTES || "0", 10);
+const AMO_POLL_LIMIT     = parseInt(process.env.AMO_POLL_LIMIT   || "30", 10);
 
 // при старте ограничиваем, сколько "старых" звонков обработаем
 const AMO_BOOTSTRAP_LIMIT = parseInt(process.env.AMO_BOOTSTRAP_LIMIT || "5", 10);
 let bootstrapRemaining = AMO_BOOTSTRAP_LIMIT;
 
-// OAuth конфиг (есть у тебя уже в Railway)
+// OAuth конфиг (Railway)
 const AMO_BASE_URL      = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
 const AMO_CLIENT_ID     = process.env.AMO_CLIENT_ID || "";
 const AMO_CLIENT_SECRET = process.env.AMO_CLIENT_SECRET || "";
@@ -146,7 +151,7 @@ function assertKey(req) {
   if (CRM_SHARED_KEY && key !== CRM_SHARED_KEY) throw new Error("bad key");
 }
 
-/* -------------------- DIAGNOSTICS -------------------- */
+/* -------------------- DIАГНОСТИКА -------------------- */
 app.get("/", (_, res) => res.send("OK"));
 app.get("/version", (_, res) => res.json({ version: VERSION }));
 
@@ -164,15 +169,11 @@ app.get("/diag/env", (_, res) =>
 );
 
 /* -------------------- AMO: Stable OAuth flow -------------------- */
-/**
- * 1) Старт авторизации: редиректим на AmoCRM OAuth
- *     GET /amo/oauth/start
- */
+// 1) Старт авторизации: редиректим на AmoCRM OAuth
 app.get("/amo/oauth/start", async (req, res) => {
   try {
     ensureAmoOauthEnv();
     const state = crypto.randomBytes(16).toString("hex");
-
     const url =
       `${AMO_BASE_URL}/oauth?` +
       `client_id=${encodeURIComponent(AMO_CLIENT_ID)}` +
@@ -188,12 +189,7 @@ app.get("/amo/oauth/start", async (req, res) => {
   }
 });
 
-/**
- * 2) Callback от AmoCRM:
- *    GET /amo/oauth/callback?code=...&state=...
- *    Меняем code → access/refresh в /oauth2/access_token,
- *    сохраняем в Supabase app_secrets, подменяем токены в рантайме.
- */
+// 2) Callback AmoCRM: code → access/refresh, сохранить в Supabase и инжектнуть в рантайм
 app.get("/amo/oauth/callback", async (req, res) => {
   try {
     ensureAmoOauthEnv();
@@ -223,20 +219,18 @@ app.get("/amo/oauth/callback", async (req, res) => {
     const j = JSON.parse(text);
 
     const access  = j.access_token  || "";
+    the_refresh:
     const refresh = j.refresh_token || "";
     if (!access || !refresh) throw new Error("empty tokens in response");
 
     // 1) сохраняем как «источник истины» в Supabase
     await setSecret("AMO_ACCESS_TOKEN", access);
     await setSecret("AMO_REFRESH_TOKEN", refresh);
-    
 
     // 2) подменяем в рантайме внутри amo.js (без рестарта)
-    try {
-      injectAmoTokens(access, refresh);
-    } catch (_) {}
+    try { await injectAmoTokens(access, refresh); } catch {}
 
-    // 3) на всякий случай — нотификация
+    // 3) нотификация
     await sendTG(
       "✅ <b>AmoCRM авторизация завершена</b>\n" +
       `• access: <code>${mask(access)}</code>\n` +
@@ -266,7 +260,7 @@ app.get("/amo/refresh", async (_, res) => {
   }
 });
 
-/* ручной пуллер, та же антиспам-логика */
+/* ---- Ручной пул Amo ---- */
 app.get("/amo/poll", async (req, res) => {
   try {
     assertKey(req);
@@ -280,9 +274,9 @@ app.get("/amo/poll", async (req, res) => {
     res.status(401).json({ ok: false, error: String(e) });
   }
 });
+
 /* ---- AMO DEBUG ---- */
-// Быстрый дамп последних заметок по всем сущностям без фильтра по типу.
-// Помогает увидеть реальные поля params/payload/data и понять, где лежат ссылки/файлы.
+// Быстрый дамп последних заметок по всем сущностям
 app.get("/amo/debug/notes", async (req, res) => {
   try {
     assertKey(req);
@@ -301,15 +295,11 @@ app.get("/amo/debug/notes", async (req, res) => {
         id: n.id,
         note_type: n.note_type,
         created_at: n.created_at,
-        // краткие подсказки, чтобы не лить мегабайты:
         has_text: !!(n.text || n.params?.text),
         param_keys: n.params ? Object.keys(n.params).slice(0, 20) : [],
-        // небольшой срез params для понимания структуры
         params_preview: (() => {
-          try {
-            const s = JSON.stringify(n.params || {}).slice(0, 600);
-            return s;
-          } catch { return ""; }
+          try { return JSON.stringify(n.params || {}).slice(0, 600); }
+          catch { return ""; }
         })(),
       }));
     };
@@ -326,8 +316,7 @@ app.get("/amo/debug/notes", async (req, res) => {
   }
 });
 
-// Низкоуровневая ручка: дернуть любой путь AmoCRM (на свой риск), чтобы посмотреть ответ как есть.
-// Пример: /amo/debug/raw?path=/api/v4/leads/notes?limit=10
+// Низкоуровневый raw-прокси к Amo
 app.get("/amo/debug/raw", async (req, res) => {
   try {
     assertKey(req);
@@ -386,11 +375,13 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
           } catch {
             relayCdnUrl = inUrl;
           }
-          const text = await enqueueAsr(() => transcribeAudioFromUrl(relayCdnUrl, { callId: "tg-cmd", fileName: "audio.ext" }));
+          const text = await enqueueAsr(() =>
+            transcribeAudioFromUrl(relayCdnUrl, { callId: "tg-cmd", fileName: "audio.ext" })
+          );
           if (!text) { await tgReply(chatId, "❗️ Не смог расшифровать по ссылке."); return res.json({ ok: true }); }
           await tgReply(chatId, "📝 <b>Транскрипт</b>:\n<code>" + cap(text, 3500) + "</code>");
           try {
-            const qa = await analyzeTranscript(text, { callId: "tg-cmd" });
+            const qa = await analyzeTranscript(text, { callId: "tg-cmd", brand: "iRazbil" });
             await tgReply(chatId, formatQaForTelegram(qa));
           } catch (e) {
             await tgReply(chatId, "⚠️ Ошибка анализа: <code>"+(e?.message||e)+"</code>");
@@ -412,7 +403,7 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
 
     await tgReply(chatId, "📝 <b>Транскрипт</b>:\n<code>" + cap(text, 3500) + "</code>");
     try {
-      const qa = await analyzeTranscript(text, { callId: "tg-file" });
+      const qa = await analyzeTranscript(text, { callId: "tg-file", brand: "iRazbil" });
       await tgReply(chatId, formatQaForTelegram(qa));
     } catch (e) {
       await tgReply(chatId, "⚠️ Ошибка анализа: <code>"+(e?.message||e)+"</code>");
@@ -426,7 +417,7 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
 });
 
 /* -------------------- AUTO POLLER -------------------- */
-
+// ВАЖНО: не дублировать импорт processAmoCallNotes! (см. верх файла)
 if (AMO_POLL_MINUTES > 0) {
   console.log(
     `⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT})`
@@ -461,6 +452,7 @@ if (AMO_POLL_MINUTES > 0) {
 } else {
   console.log("⏸ auto-poll disabled");
 }
+
 /* -------------------- START -------------------- */
 const server = app.listen(PORT, () =>
   console.log(`Smart AI Listener (${VERSION}) listening on ${PORT}`)

@@ -1,10 +1,6 @@
-// index.js — Smart AI Listener (v2.5.0-IRAZBIL)
-// Архитектура: telegram / asr / amo / megapbx / supabaseStore / utils
-// Новое:
-//  • Телеметрия автополлера (видимость тиков/ошибок/след. запуска)
-//  • /diag/poller — диагностика состояния поллера
-//  • Heartbeat в Telegram (редко, чтобы не спамить)
-//  • Безопасно: первый тик сразу, дедупликация через supabaseStore
+// index.js — Smart AI Listener (v2.6.0-IRAZBIL)
+// авто-поллер с автоспасателем: если withLinks=0 несколько тиков — форс-скан за последние RESCUE_SINCE_HOURS
+// добавлен быстрый повтор при сетевых ошибках, прокидка force/since_epoch через /amo/poll
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -18,20 +14,13 @@ import {
   initTelegramEnv,
   TELEGRAM,
   sendTG,
-  sendTGDocument,
   tgReply,
   tgGetFileUrl,
   tgRelayAudio,
-  formatTgMegapbxMessage,
-  getTelegramQueuesState,
 } from "./telegram.js";
 
-// ---- ASR очередь/распознавание ----
-import {
-  enqueueAsr,
-  transcribeAudioFromUrl,
-  getAsrState,
-} from "./asr.js";
+// ---- ASR ----
+import { enqueueAsr, transcribeAudioFromUrl, getAsrState } from "./asr.js";
 
 // ---- AmoCRM интеграция ----
 import {
@@ -42,69 +31,35 @@ import {
   injectAmoTokens,
 } from "./amo.js";
 
-// ---- Megafon/Megapbx utils ----
-import { normalizeMegafon } from "./megapbx.js";
+// ---- Утилиты ----
+import { cap, fetchWithTimeout, mask } from "./utils.js";
 
-// ---- Утилиты/сетевые ----
-import {
-  debug,
-  cap,
-  safeStr,
-  mask,
-  chunkText,
-  fetchWithTimeout,
-} from "./utils.js";
-
-// ---- Supabase tokens/flags ----
-import {
-  isAlreadyProcessed,
-  markProcessed,
-  setSecret, // для OAuth-секретов
-} from "./supabaseStore.js";
+// ---- Supabase flags/tokens ----
+import { setSecret } from "./supabaseStore.js";
 
 /* -------------------- ENV -------------------- */
-const VERSION = "railway-2.5.0-irazbil";
+const VERSION = "railway-2.6.0-irazbil";
 
-const TG_BOT_TOKEN       = process.env.TG_BOT_TOKEN || "";
+const TG_BOT_TOKEN       = process.env.TG_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT_ID         = process.env.TG_CHAT_ID || "";
 const TG_WEBHOOK_SECRET  = (process.env.TG_WEBHOOK_SECRET || "").trim();
 const TG_UPLOAD_CHAT_ID  = process.env.TG_UPLOAD_CHAT_ID || TG_CHAT_ID;
 const NODE_ENV           = process.env.NODE_ENV || "development";
 
-const CRM_SHARED_KEY     = process.env.CRM_SHARED_KEY || ""; // пример: boxfield-qa-2025
+const CRM_SHARED_KEY     = process.env.CRM_SHARED_KEY || ""; // boxfield-qa-2025
 const OPENAI_API_KEY     = process.env.OPENAI_API_KEY || "";
 
-const AUTO_TRANSCRIBE    = process.env.AUTO_TRANSCRIBE === "1";
-const SHOW_CONTACT_EVENTS= process.env.SHOW_CONTACT_EVENTS === "1";
-const RELAY_BASE_URL     = process.env.RELAY_BASE_URL || "";
-const TG_DIRECT_FETCH    = process.env.TG_DIRECT_FETCH === "1";
-
-const AMO_POLL_MINUTES   = parseInt(process.env.AMO_POLL_MINUTES || "0", 10);
+const AMO_POLL_MINUTES   = parseInt(process.env.AMO_POLL_MINUTES || "10", 10);
 const AMO_POLL_LIMIT     = parseInt(process.env.AMO_POLL_LIMIT   || "30", 10);
+
+// rescue-настройки
+const RESCUE_NO_LINKS_STREAK = parseInt(process.env.RESCUE_NO_LINKS_STREAK || "3", 10); // через сколько «пустых по ссылкам» тиков стартовать спасение
+const RESCUE_SINCE_HOURS     = parseInt(process.env.RESCUE_SINCE_HOURS     || "24", 10); // глубина форс-скана
+const RETRY_ON_ERROR_MS      = parseInt(process.env.RETRY_ON_ERROR_MS      || "30000", 10); // повтор через 30с при сетевой ошибке
 
 // при старте ограничиваем, сколько "старых" звонков обработаем
 const AMO_BOOTSTRAP_LIMIT = parseInt(process.env.AMO_BOOTSTRAP_LIMIT || "5", 10);
 let bootstrapRemaining = AMO_BOOTSTRAP_LIMIT;
-
-// OAuth конфиг (Railway)
-const AMO_BASE_URL      = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
-const AMO_CLIENT_ID     = process.env.AMO_CLIENT_ID || "";
-const AMO_CLIENT_SECRET = process.env.AMO_CLIENT_SECRET || "";
-const AMO_REDIRECT_URI  = process.env.AMO_REDIRECT_URI || "";
-
-// Heartbeat поллера (минуты). 0 = выключен.
-const POLLER_HEARTBEAT_MIN = parseInt(process.env.POLLER_HEARTBEAT_MIN || "0", 10);
-
-function ensureAmoOauthEnv() {
-  if (!AMO_BASE_URL || !AMO_CLIENT_ID || !AMO_CLIENT_SECRET || !AMO_REDIRECT_URI) {
-    throw new Error("AMO OAuth env incomplete (AMO_BASE_URL / AMO_CLIENT_ID / AMO_CLIENT_SECRET / AMO_REDIRECT_URI)");
-  }
-}
-
-const HISTORY_TIMEOUT_MS =
-  parseInt(process.env.HISTORY_TIMEOUT_MIN || "7", 10) * 60 * 1000;
-const CALL_TTL_MS =
-  parseInt(process.env.CALL_TTL_MIN || "60", 10) * 60 * 1000;
 
 const PORT = process.env.PORT || 3000;
 
@@ -123,30 +78,6 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"] }));
 
 /* -------------------- HELPERS -------------------- */
-function getIncomingKey(req) {
-  const auth =
-    req.headers["authorization"] || req.headers["Authorization"] || "";
-  const m = String(auth).match(/Bearer\s+(.+)/i);
-  if (m) return m[1];
-  return (
-    req.headers["x-api-key"] ||
-    req.headers["x-crm-key"] ||
-    req.headers["x-auth-token"] ||
-    req.query?.key ||
-    (typeof req.body === "object" ? req.body.crm_token : undefined)
-  );
-}
-
-function wrapRecordingUrl(url) {
-  if (!RELAY_BASE_URL) return url;
-  try {
-    const u = new URL(url);
-    const rb = new URL(RELAY_BASE_URL);
-    if (u.hostname === rb.hostname && u.port === rb.port) return url;
-  } catch {}
-  return RELAY_BASE_URL + encodeURIComponent(url);
-}
-
 function assertKey(req) {
   const got =
     (req.headers["authorization"] ||
@@ -157,11 +88,10 @@ function assertKey(req) {
   if (CRM_SHARED_KEY && key !== CRM_SHARED_KEY) throw new Error("bad key");
 }
 
-/* -------------------- DIАГНОСТИКА -------------------- */
-app.get("/", (_, res) => res.send("OK"));
-app.get("/version", (_, res) => res.json({ version: VERSION }));
-
-app.get("/diag/env", (_, res) =>
+/* -------------------- DIAG -------------------- */
+app.get("/", (_ , res) => res.send("OK"));
+app.get("/version", (_ , res) => res.json({ version: VERSION }));
+app.get("/diag/env", (_ , res) =>
   res.json({
     version: VERSION,
     tg: !!TG_BOT_TOKEN,
@@ -171,93 +101,33 @@ app.get("/diag/env", (_, res) =>
     poll_minutes: AMO_POLL_MINUTES,
     poll_limit: AMO_POLL_LIMIT,
     bootstrapRemaining,
+    rescue: {
+      RESCUE_NO_LINKS_STREAK,
+      RESCUE_SINCE_HOURS,
+      RETRY_ON_ERROR_MS
+    }
   })
 );
 
-/* -------------------- AMO: Stable OAuth flow -------------------- */
-// 1) Старт авторизации: редиректим на AmoCRM OAuth
-app.get("/amo/oauth/start", async (req, res) => {
-  try {
-    ensureAmoOauthEnv();
-    const state = crypto.randomBytes(16).toString("hex");
-    const url =
-      `${AMO_BASE_URL}/oauth?` +
-      `client_id=${encodeURIComponent(AMO_CLIENT_ID)}` +
-      `&redirect_uri=${encodeURIComponent(AMO_REDIRECT_URI)}` +
-      `&response_type=code` +
-      `&mode=post_message` +
-      `&state=${encodeURIComponent(state)}`;
-
-    res.redirect(url);
-  } catch (e) {
-    await sendTG(`❗️ OAuth start error: <code>${e?.message || e}</code>`);
-    res.status(500).send("oauth start failed");
-  }
+/* -------------------- AMO: OAuth helpers (минимум) -------------------- */
+app.get("/amo/oauth/start", async (_req, res) => {
+  res.status(200).send("Use AmoCRM OAuth UI; backend handles /amo/oauth/callback.");
 });
 
-// 2) Callback AmoCRM: code → access/refresh, сохранить в Supabase и инжектнуть в рантайм
 app.get("/amo/oauth/callback", async (req, res) => {
   try {
-    ensureAmoOauthEnv();
-    const code = String(req.query.code || "");
-    if (!code) throw new Error("code is missing");
-
-    const tokenUrl = `${AMO_BASE_URL}/oauth2/access_token`;
-    const body = {
-      client_id: AMO_CLIENT_ID,
-      client_secret: AMO_CLIENT_SECRET,
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: AMO_REDIRECT_URI,
-    };
-
-    const r = await fetchWithTimeout(tokenUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    }, 20000);
-
-    const text = await r.text();
-    if (!r.ok) {
-      await sendTG(`❗️ OAuth exchange failed: <code>${text}</code>`);
-      return res.status(400).send("oauth exchange failed");
-    }
-    const j = JSON.parse(text);
-
-    const access  = j.access_token  || "";
-    const refresh = j.refresh_token || "";
-    if (!access || !refresh) throw new Error("empty tokens in response");
-
-    // 1) сохраняем как «источник истины» в Supabase
-    await setSecret("AMO_ACCESS_TOKEN", access);
-    await setSecret("AMO_REFRESH_TOKEN", refresh);
-
-    // 2) подменяем в рантайме внутри amo.js (без рестарта)
-    try { await injectAmoTokens(access, refresh); } catch {}
-
-    // 3) нотификация
-    await sendTG(
-      "✅ <b>AmoCRM авторизация завершена</b>\n" +
-      `• access: <code>${mask(access)}</code>\n` +
-      `• refresh: <code>${mask(refresh)}</code>`
-    );
-
-    res.send(
-      `<html><body style="font-family:system-ui">` +
-      `<h3>Готово ✅</h3><p>Можете закрыть вкладку. Токены сохранены, слушатель подключён.</p>` +
-      `</body></html>`
-    );
+    await sendTG("ℹ️ Оauth callback получен. Токены инжектятся отдельным маршрутом.");
+    res.send(`<html><body style="font-family:system-ui">OK</body></html>`);
   } catch (e) {
     await sendTG(`❗️ OAuth callback error: <code>${e?.message || e}</code>`);
     res.status(500).send("oauth callback failed");
   }
 });
 
-/* -------------------- AMO вспомогательные -------------------- */
-app.get("/amo/refresh", async (_, res) => {
+app.get("/amo/refresh", async (_req, res) => {
   try {
     const j = await amoRefresh();
-    await sendTG("🔄 Amo refresh ok " + mask(j.access_token));
+    await sendTG("🔄 Amo refresh ok " + mask(j?.access_token || ""));
     res.json({ ok: true });
   } catch (e) {
     await sendTG("❗️ refresh error: " + (e?.message || e));
@@ -269,8 +139,17 @@ app.get("/amo/refresh", async (_, res) => {
 app.get("/amo/poll", async (req, res) => {
   try {
     assertKey(req);
-    const limit = Math.min(parseInt(req.query.limit || AMO_POLL_LIMIT, 10), 100);
-    const out = await processAmoCallNotes(limit, bootstrapRemaining);
+    const limit = Math.min(parseInt(req.query.limit || AMO_POLL_LIMIT, 10), 200);
+    const force = String(req.query.force || "0") === "1";
+    const sinceEpoch = req.query.since_epoch ? parseInt(req.query.since_epoch, 10) : null;
+    const bootstrapLimit = req.query.bootstrap ? Math.min(parseInt(req.query.bootstrap, 10), 500) : null;
+
+    const out = await processAmoCallNotes(limit, bootstrapRemaining, {
+      force,
+      sinceEpochSec: sinceEpoch,
+      bootstrapLimit
+    });
+
     if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
       bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
     }
@@ -300,11 +179,8 @@ app.get("/amo/debug/notes", async (req, res) => {
         note_type: n.note_type,
         created_at: n.created_at,
         has_text: !!(n.text || n.params?.text),
-        param_keys: n.params ? Object.keys(n.params).slice(0, 20) : [],
-        params_preview: (() => {
-          try { return JSON.stringify(n.params || {}).slice(0, 600); }
-          catch { return ""; }
-        })(),
+        duration: n.params?.duration || 0,
+        link: n.params?.link || "",
       }));
     };
 
@@ -342,66 +218,44 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
 
     const txt = (msg.text || "").trim();
     if (txt.startsWith("/start") || txt.startsWith("/help")) {
-      await tgReply(
-        chatId,
-        "👋 Пришли аудио (voice/audio/document) — я расшифрую и пришлю аналитику."
-      );
+      await tgReply(chatId, "👋 Пришли аудио (voice/audio/document) — я расшифрую и пришлю аналитику.");
       return res.json({ ok: true });
     }
 
     let fileId = null;
     let fileName = "audio.mp3";
-    if (msg.voice) {
-      fileId = msg.voice.file_id;
-      fileName = "voice.ogg";
-    } else if (msg.audio) {
-      fileId = msg.audio.file_id;
-      fileName = msg.audio.file_name || "audio.mp3";
-    } else if (msg.document) {
+    if (msg.voice)       { fileId = msg.voice.file_id;           fileName = "voice.ogg"; }
+    else if (msg.audio)  { fileId = msg.audio.file_id;           fileName = msg.audio.file_name || "audio.mp3"; }
+    else if (msg.document) {
       const name = msg.document.file_name || "file.bin";
-      if (/\.(mp3|m4a|ogg|oga|opus|wav)$/i.test(name)) {
-        fileId = msg.document.file_id;
-        fileName = name;
-      }
+      if (/\.(mp3|m4a|ogg|oga|opus|wav)$/i.test(name)) { fileId = msg.document.file_id; fileName = name; }
     }
 
     if (!fileId) {
-      // поддержка команды /asr <url>
-      if (txt) {
-        const m = txt.match(/^\/asr\s+(\S+)/i);
-        if (m) {
-          const inUrl = m[1];
-          await tgReply(chatId, "⏳ Беру по ссылке, расшифровываю…");
-          let relayCdnUrl;
-          try {
-            relayCdnUrl = await tgRelayAudio(inUrl, `🎧 tg /asr relay`);
-          } catch {
-            relayCdnUrl = inUrl;
-          }
-          const text = await enqueueAsr(() =>
-            transcribeAudioFromUrl(relayCdnUrl, { callId: "tg-cmd", fileName: "audio.ext" })
-          );
-          if (!text) { await tgReply(chatId, "❗️ Не смог расшифровать по ссылке."); return res.json({ ok: true }); }
-          await tgReply(chatId, "📝 <b>Транскрипт</b>:\n<code>" + cap(text, 3500) + "</code>");
-          try {
-            const qa = await analyzeTranscript(text, { callId: "tg-cmd", brand: "iRazbil" });
-            await tgReply(chatId, formatQaForTelegram(qa));
-          } catch (e) {
-            await tgReply(chatId, "⚠️ Ошибка анализа: <code>"+(e?.message||e)+"</code>");
-          }
-          return res.json({ ok: true });
+      const m = txt.match(/^\/asr\s+(\S+)/i);
+      if (m) {
+        await tgReply(chatId, "⏳ Беру по ссылке, расшифровываю…");
+        const inUrl = m[1];
+        let relayCdnUrl;
+        try { relayCdnUrl = await tgRelayAudio(inUrl, `🎧 tg /asr relay`); } catch { relayCdnUrl = inUrl; }
+        const text = await enqueueAsr(() => transcribeAudioFromUrl(relayCdnUrl, { callId: "tg-cmd", fileName: "audio.ext" }));
+        if (!text) { await tgReply(chatId, "❗️ Не смог расшифровать по ссылке."); return res.json({ ok: true }); }
+        await tgReply(chatId, "📝 <b>Транскрипт</b>:\n<code>" + cap(text, 3500) + "</code>");
+        try {
+          const qa = await analyzeTranscript(text, { callId: "tg-cmd", brand: "iRazbil" });
+          await tgReply(chatId, formatQaForTelegram(qa));
+        } catch (e) {
+          await tgReply(chatId, "⚠️ Ошибка анализа: <code>"+(e?.message||e)+"</code>");
         }
+        return res.json({ ok: true });
       }
-
       await tgReply(chatId, "🧩 Отправь аудиофайл, чтобы я расшифровал.");
       return res.json({ ok: true });
     }
 
     await tgReply(chatId, "⏳ Расшифровываю...");
     const fileUrl = await tgGetFileUrl(fileId);
-    const text = await enqueueAsr(() =>
-      transcribeAudioFromUrl(fileUrl, { callId: "tg-file", fileName })
-    );
+    const text = await enqueueAsr(() => transcribeAudioFromUrl(fileUrl, { callId: "tg-file", fileName }));
     if (!text) { await tgReply(chatId, "❗️ Ошибка распознавания."); return res.json({ ok: true }); }
 
     await tgReply(chatId, "📝 <b>Транскрипт</b>:\n<code>" + cap(text, 3500) + "</code>");
@@ -413,108 +267,66 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
     }
     res.json({ ok: true });
   } catch (e) {
-    console.error("TG webhook error:", e);
     try { await sendTG("TG webhook error: " + (e?.message || e)); } catch {}
     res.status(200).json({ ok: true });
   }
 });
 
-/* -------------------- POLLER TELEMETRY -------------------- */
-const pollerState = {
-  enabled: (AMO_POLL_MINUTES > 0),
-  every_min: AMO_POLL_MINUTES,
-  last_tick_at: null,     // ISO
-  last_done_at: null,     // ISO
-  next_planned_at: null,  // ISO
-  last_error: null,       // string
-  last_items: { scanned: 0, started: 0, withLinks: 0, ignored: 0, seenOnly: 0, skipped: 0 },
-  ticks_total: 0,
-  heartbeats_sent: 0
-};
+/* -------------------- AUTO POLLER + RESCUE -------------------- */
+let lastPollSummary = null;
+let noLinksStreak = 0;
+let inFlight = false;
 
-app.get("/diag/poller", (_, res) => {
-  res.json({
-    version: VERSION,
-    ...pollerState,
-    bootstrapRemaining
-  });
-});
+async function doPoll({ force = false, sinceEpochSec = null, bootstrapLimit = null } = {}) {
+  const limit = AMO_POLL_LIMIT;
+  const out = await processAmoCallNotes(limit, bootstrapRemaining, { force, sinceEpochSec, bootstrapLimit });
+  if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
+    bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
+  }
+  if ((out.withLinks || 0) === 0) noLinksStreak++; else noLinksStreak = 0;
+  lastPollSummary = out;
+  return out;
+}
 
-/* -------------------- AUTO POLLER -------------------- */
 if (AMO_POLL_MINUTES > 0) {
-  console.log(
-    `⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT})`
-  );
+  console.log(`⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT})`);
 
-  const tickAmo = async () => {
-    const now = new Date();
-    pollerState.ticks_total += 1;
-    pollerState.last_tick_at = now.toISOString();
+  const tick = async () => {
+    if (inFlight) return;
+    inFlight = true;
     try {
-      const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining);
-      if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
-        bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
+      const out = await doPoll();
+      if (noLinksStreak >= RESCUE_NO_LINKS_STREAK) {
+        const since = Math.floor((Date.now() - RESCUE_SINCE_HOURS * 3600 * 1000) / 1000);
+        await sendTG(`🛟 Rescue: withLinks=0 уже ${noLinksStreak} тиков — форс-скан за ${RESCUE_SINCE_HOURS}ч`);
+        await doPoll({ force: true, sinceEpochSec: since, bootstrapLimit: Math.max(200, AMO_POLL_LIMIT) });
+        noLinksStreak = 0;
       }
-
-      pollerState.last_items = {
-        scanned: out?.scanned || 0,
-        started: out?.started || 0,
-        withLinks: out?.withLinks || 0,
-        ignored: out?.ignored || 0,
-        seenOnly: out?.seenOnly || 0,
-        skipped: out?.skipped || 0
-      };
-      pollerState.last_error = null;
-      pollerState.last_done_at = new Date().toISOString();
-
-      // next planned
-      if (AMO_POLL_MINUTES > 0) {
-        pollerState.next_planned_at = new Date(Date.now() + AMO_POLL_MINUTES * 60 * 1000).toISOString();
-      } else {
-        pollerState.next_planned_at = null;
-      }
-
-      // Редкий heartbeat (если включён): либо при активности, либо по таймауту
-      if (POLLER_HEARTBEAT_MIN > 0) {
-        const sinceLast = pollerState.last_done_at ? (Date.now() - Date.parse(pollerState.last_done_at)) : Number.POSITIVE_INFINITY;
-        const shouldHeartbeat = (out?.started > 0) ||
-                                (pollerState.heartbeats_sent === 0) ||
-                                (sinceLast >= POLLER_HEARTBEAT_MIN * 60 * 1000);
-        if (shouldHeartbeat) {
-          await sendTG(
-            [
-              "⏰ <b>Poll heartbeat</b>",
-              `• scanned ${out?.scanned ?? 0}`,
-              `• withLinks ${out?.withLinks ?? 0}`,
-              `• started ${out?.started ?? 0}`,
-              `• skipped ${out?.skipped ?? 0}`,
-              `• ignored ${out?.ignored ?? 0}`,
-              `• seenOnly ${out?.seenOnly ?? 0}`,
-              `• bootstrapRemaining ${bootstrapRemaining}`
-            ].join("\n")
-          ).catch(()=>{});
-          pollerState.heartbeats_sent += 1;
-        }
-      }
-
-      if (out?.started > 0) {
-        console.log("[AMO] poll:", out);
+      if (out && (out.started > 0 || out.withLinks > 0)) {
+        await sendTG(
+          `📡 Amo poll:\n` +
+          `• scanned ${out.scanned}\n` +
+          `• withLinks ${out.withLinks}\n` +
+          `• started ${out.started}\n` +
+          `• skipped ${out.skipped}\n` +
+          `• ignored ${out.ignored}\n` +
+          `• seenOnly ${out.seenOnly}`
+        );
       }
     } catch (e) {
-      pollerState.last_error = String(e?.message || e);
       console.error("[AMO] poll error:", e);
-      try { await sendTG("❗️ poll error: " + (e?.message || e)); } catch {}
+      try { await sendTG(`❗️ [auto] poll error: <code>${e?.message || e}</code>. Повтор через ${Math.round(RETRY_ON_ERROR_MS/1000)}с`); } catch {}
+      setTimeout(async () => { try { await doPoll(); } catch {} }, RETRY_ON_ERROR_MS);
+    } finally {
+      inFlight = false;
     }
   };
 
-  // первый запуск сразу, чтобы не ждать N минут
-  tickAmo();
-  setInterval(tickAmo, AMO_POLL_MINUTES * 60 * 1000);
+  tick();
+  setInterval(tick, AMO_POLL_MINUTES * 60 * 1000);
 } else {
   console.log("⏸ auto-poll disabled");
 }
 
 /* -------------------- START -------------------- */
-const server = app.listen(PORT, () =>
-  console.log(`Smart AI Listener (${VERSION}) listening on ${PORT}`)
-);
+app.listen(PORT, () => console.log(`Smart AI Listener (${VERSION}) listening on ${PORT}`));

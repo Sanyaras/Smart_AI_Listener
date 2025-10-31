@@ -109,13 +109,15 @@ app.get("/diag/env", (_ , res) =>
   })
 );
 
-/* -------------------- AMO: OAuth helpers (минимум) -------------------- */
+/* -------------------- AMO: OAuth helpers (как было) -------------------- */
 app.get("/amo/oauth/start", async (_req, res) => {
-  res.status(200).send("Use AmoCRM OAuth UI; backend handles /amo/oauth/callback.");
+  // перенаправление делает фронт — оставим минималку
+  res.status(200).send("Use your AmoCRM OAuth UI to obtain code; backend handles /amo/oauth/callback.");
 });
 
 app.get("/amo/oauth/callback", async (req, res) => {
   try {
+    const j = {}; // теперь токены храним через amo.js; тут просто заглушка
     await sendTG("ℹ️ Оauth callback получен. Токены инжектятся отдельным маршрутом.");
     res.send(`<html><body style="font-family:system-ui">OK</body></html>`);
   } catch (e) {
@@ -135,7 +137,7 @@ app.get("/amo/refresh", async (_req, res) => {
   }
 });
 
-/* ---- Ручной пул Amo ---- */
+/* ---- Ручной пул Amo (с прокидкой force/since_epoch/bootstrap) ---- */
 app.get("/amo/poll", async (req, res) => {
   try {
     assertKey(req);
@@ -208,7 +210,7 @@ app.get("/amo/debug/raw", async (req, res) => {
   }
 });
 
-/* -------------------- TELEGRAM WEBHOOK -------------------- */
+/* -------------------- TELEGRAM WEBHOOK (коротко, без изменений логики) -------------------- */
 app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
   try {
     const upd = req.body || {};
@@ -283,6 +285,7 @@ async function doPoll({ force = false, sinceEpochSec = null, bootstrapLimit = nu
   if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
     bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
   }
+  // учёт спасателя
   if ((out.withLinks || 0) === 0) noLinksStreak++; else noLinksStreak = 0;
   lastPollSummary = out;
   return out;
@@ -295,13 +298,16 @@ if (AMO_POLL_MINUTES > 0) {
     if (inFlight) return;
     inFlight = true;
     try {
+      // обычный тик
       const out = await doPoll();
+      // спасатель: если подряд нет ссылок RESCUE_NO_LINKS_STREAK раз — делаем форс-скан за последние RESCUE_SINCE_HOURS
       if (noLinksStreak >= RESCUE_NO_LINKS_STREAK) {
         const since = Math.floor((Date.now() - RESCUE_SINCE_HOURS * 3600 * 1000) / 1000);
         await sendTG(`🛟 Rescue: withLinks=0 уже ${noLinksStreak} тиков — форс-скан за ${RESCUE_SINCE_HOURS}ч`);
         await doPoll({ force: true, sinceEpochSec: since, bootstrapLimit: Math.max(200, AMO_POLL_LIMIT) });
         noLinksStreak = 0;
       }
+      // лог для наглядности
       if (out && (out.started > 0 || out.withLinks > 0)) {
         await sendTG(
           `📡 Amo poll:\n` +
@@ -316,12 +322,16 @@ if (AMO_POLL_MINUTES > 0) {
     } catch (e) {
       console.error("[AMO] poll error:", e);
       try { await sendTG(`❗️ [auto] poll error: <code>${e?.message || e}</code>. Повтор через ${Math.round(RETRY_ON_ERROR_MS/1000)}с`); } catch {}
-      setTimeout(async () => { try { await doPoll(); } catch {} }, RETRY_ON_ERROR_MS);
+      // быстрый повтор при сетевых/временных ошибках
+      setTimeout(async () => {
+        try { await doPoll(); } catch {}
+      }, RETRY_ON_ERROR_MS);
     } finally {
       inFlight = false;
     }
   };
 
+  // первый запуск сразу + интервал
   tick();
   setInterval(tick, AMO_POLL_MINUTES * 60 * 1000);
 } else {

@@ -1,7 +1,15 @@
-// qa_assistant.js (v4.0) — JSON-only QA per iRazbil rubric (roles + anchors + consistency rules)
+// qa_assistant.js (v4.1-IRAZBIL) — JSON-only QA per iRazbil rubric
+// - Строгий фиксированный JSON (roles + anchors + consistency rules)
+// - Детерминизм (temperature=0)
+// - Ретраи запроса к OpenAI с таймаутом
+// - Нормализация баллов (0..10) и корректный total (учёт intent и N/A для value)
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const CALL_QA_MODEL  = process.env.CALL_QA_MODEL  || "gpt-4.1-mini"; // можно переопределить через ENV
+
 const MAX_TXT = 16000;
+const OPENAI_TIMEOUT_MS = parseInt(process.env.CALL_QA_TIMEOUT_MS || "60000", 10);
+const OPENAI_MAX_RETRIES = parseInt(process.env.CALL_QA_RETRIES || "2", 10);
 
 /**
  * Анализ транскрипта по фиксированной JSON-схеме.
@@ -158,7 +166,7 @@ User: Пример:
     t
   ].filter(Boolean).join("\n");
 
-  // ---------------- API Call ----------------
+  // ---------------- OpenAI call (retry + timeout) ----------------
   const payload = {
     model: CALL_QA_MODEL,
     messages: [
@@ -169,18 +177,7 @@ User: Пример:
     response_format: { type: "json_object" }
   };
 
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-
-  if (!r.ok) {
-    const tt = await r.text().catch(() => "");
-    throw new Error(`assistant http ${r.status}: ${tt}`);
-  }
-
-  const data = await r.json().catch(() => null);
+  const data = await callOpenAIChatWithRetry(payload, OPENAI_MAX_RETRIES, OPENAI_TIMEOUT_MS);
   const txt = data?.choices?.[0]?.message?.content || "";
   const clean = String(txt).trim().replace(/^```json\s*|\s*```$/g, "");
 
@@ -191,8 +188,12 @@ User: Пример:
     throw new Error("assistant returned non-JSON (schema violation)");
   }
 
-  // Базовая валидация ключей (мягкая)
+  // Базовая валидация и нормализация (включая корректный total)
   ensureSchemaShape(parsed);
+  normalizeScoresAndTotal(parsed);
+
+  // Санитизация цитат, чтобы speaker ∈ {"manager","customer","ivr"}
+  sanitizeQuotes(parsed);
 
   return parsed;
 }
@@ -203,14 +204,13 @@ User: Пример:
  */
 export function formatQaForTelegram(qa) {
   const s = safe(qa);
-
   const sc = s.score || {};
   const pe = s.psycho_emotional || {};
   const tech = s.techniques || {};
   const quotes = Array.isArray(s.quotes) ? s.quotes.slice(0, 3) : [];
 
   const lines = [
-    "📊 <b>Аналитика звонка (iRazbil v4)</b>",
+    "📊 <b>Аналитика звонка (iRazbil v4.1)</b>",
     `• Intent: <b>${esc(s.intent || "-")}</b> · Total: <b>${num(sc.total)}</b>`,
     "",
     "🧠 <b>Психо-эмоциональный фон</b>",
@@ -253,10 +253,52 @@ export function makeSpoilerTranscript(roleLabeledText, maxChars = 4000) {
   return body ? `🗣️ <b>Расшифровка (сокращено)</b>\n||${esc(body)}||` : "";
 }
 
+// ---------------- Internal: OpenAI call with retry + timeout ----------------
+async function callOpenAIChatWithRetry(payload, retries, timeoutMs) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const r = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload),
+        signal: ac.signal
+      });
+      clearTimeout(to);
+      if (!r.ok) {
+        const txt = await r.text().catch(() => "");
+        throw new Error(`assistant http ${r.status}: ${txt}`);
+      }
+      return await r.json();
+    } catch (e) {
+      clearTimeout(to);
+      lastError = e;
+      // небольшой экспоненциальный бэкоф
+      if (attempt < retries) {
+        const backoff = 300 * Math.pow(2, attempt);
+        await sleep(backoff);
+      }
+    }
+  }
+  throw lastError || new Error("OpenAI call failed");
+}
+
 // ---------------- utils ----------------
+function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
 function safe(x) { return (x && typeof x === "object") ? x : {}; }
 function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 function num(n) { return (typeof n === "number" && Number.isFinite(n)) ? n : "-"; }
+
+function clamp01(n) { return Math.max(0, Math.min(1, n)); }
+function clamp10(n) {
+  const v = Number.isFinite(+n) ? +n : 0;
+  return Math.max(0, Math.min(10, v));
+}
 
 /**
  * Мягкая проверка структуры результата (не ломаем ран).
@@ -275,17 +317,7 @@ function ensureSchemaShape(obj) {
   sc.closing ??= 0;
   sc.clarity ??= 0;
   sc.compliance ??= 0;
-  sc.total ??= Math.max(
-    0,
-    Math.min(
-      100,
-      // базовый фолбэк — сумма, нормированная к 100 по максимальному 10-балльному скору на 9 метрик
-      Math.round(
-        ((sc.greeting + sc.rapport + sc.needs + sc.value + sc.objection_handling +
-          sc.next_step + sc.closing + sc.clarity + sc.compliance) / 90) * 100
-      )
-    )
-  );
+  sc.total ??= 0;
 
   obj.psycho_emotional ??= {
     customer_sentiment: "unknown",
@@ -307,4 +339,70 @@ function ensureSchemaShape(obj) {
   if (!Array.isArray(obj.quotes)) obj.quotes = [];
   obj.summary ??= "unknown";
   if (!Array.isArray(obj.action_items)) obj.action_items = [];
+}
+
+/**
+ * Нормализация числовых баллов (0..10), корректный total:
+ * - Если intent="support" ИЛИ techniques.value содержит "N/A"/"не применимо", метрика value исключается из знаменателя.
+ * - Total = (сумма применимых метрик / (10 * кол-во применимых)) * 100, округление до целого.
+ */
+function normalizeScoresAndTotal(obj) {
+  const sc = obj.score || {};
+  const tech = obj.techniques || {};
+  const intent = String(obj.intent || "").toLowerCase();
+
+  sc.greeting = clamp10(sc.greeting);
+  sc.rapport  = clamp10(sc.rapport);
+  sc.needs    = clamp10(sc.needs);
+  sc.value    = clamp10(sc.value);
+  sc.objection_handling = clamp10(sc.objection_handling);
+  sc.next_step = clamp10(sc.next_step);
+  sc.closing   = clamp10(sc.closing);
+  sc.clarity   = clamp10(sc.clarity);
+  sc.compliance = clamp10(sc.compliance);
+
+  // определяем применимость value
+  const valueText = (tech.value || "").toLowerCase();
+  const valueNA = intent === "support" || valueText.includes("n/a") || valueText.includes("не применимо");
+
+  const metrics = [
+    ["greeting", sc.greeting],
+    ["rapport", sc.rapport],
+    ["needs", sc.needs],
+    // value — условно включаем
+    ["value", sc.value, valueNA],
+    ["objection_handling", sc.objection_handling],
+    ["next_step", sc.next_step],
+    ["closing", sc.closing],
+    ["clarity", sc.clarity],
+    ["compliance", sc.compliance],
+  ];
+
+  let sum = 0;
+  let denom = 0;
+  for (const [name, val, na] of metrics) {
+    if (name === "value" && na) continue;
+    sum += clamp10(val);
+    denom += 10;
+  }
+  const total = denom > 0 ? Math.round((sum / denom) * 100) : 0;
+  sc.total = Math.max(0, Math.min(100, total));
+}
+
+/**
+ * Санитизация цитат: speaker ∈ {"manager","customer","ivr"}, quote — строка
+ */
+function sanitizeQuotes(obj) {
+  if (!Array.isArray(obj.quotes)) { obj.quotes = []; return; }
+  const mapRole = (r) => {
+    const s = String(r || "").toLowerCase();
+    if (s.includes("manager")) return "manager";
+    if (s.includes("customer") || s.includes("client")) return "customer";
+    if (s.includes("ivr") || s.includes("auto")) return "ivr";
+    return "customer"; // безопасный фолбэк
+  };
+  obj.quotes = obj.quotes
+    .map(q => ({ speaker: mapRole(q?.speaker), quote: String(q?.quote || "").trim() }))
+    .filter(q => q.quote.length > 0)
+    .slice(0, 5);
 }

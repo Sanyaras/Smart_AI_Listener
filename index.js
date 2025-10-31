@@ -1,10 +1,21 @@
-// index.js — Smart AI Listener (v2.6.3-IRAZBIL)
+// index.js — Smart AI Listener (v2.7.0-IRAZBIL)
 // Архитектура: telegram / asr / amo / supabaseStore / utils / qa_assistant
 // Фичи:
 //  • Автопуллер Amo по расписанию (AMO_POLL_MINUTES) + self-HTTP тик
 //  • Watchdog + мягкий backfill (лечит «молчание»/пропуски)
+//  • «Тупой пингер» SIMPLE_POLL_URL — жмёт ровно ту же ссылку, что ты кликаешь руками
 //  • Эндпоинты: /amo/poll, /amo/force, /amo/cursors, /amo/diag, /amo/debug/*
 //  • Стабильный OAuth-флоу + сохранение токенов в Supabase
+//
+// ENV (минимум):
+//  TG_BOT_TOKEN, TG_CHAT_ID
+//  AMO_BASE_URL, AMO_CLIENT_ID, AMO_CLIENT_SECRET, AMO_REDIRECT_URI
+//  CRM_SHARED_KEY=boxfield-qa-2025
+//  AMO_POLL_MINUTES=10  AMO_POLL_LIMIT=200
+//  SELF_HTTP_POLL=1  BACKFILL_ENABLED=1  WATCHDOG_ENABLED=1
+//  SIMPLE_POLL_URL="https://smartailistener-production.up.railway.app/amo/poll?key=boxfield-qa-2025&limit=200"
+//  SIMPLE_POLL_INTERVAL_MIN=10
+//  SIMPLE_POLL_FORCE_HOURS=72   // 0 — без since
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -52,7 +63,7 @@ import {
 } from "./supabaseStore.js";
 
 /* -------------------- ENV -------------------- */
-const VERSION             = "railway-2.6.3-irazbil";
+const VERSION             = "railway-2.7.0-irazbil";
 
 const TG_BOT_TOKEN        = process.env.TG_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT_ID          = process.env.TG_CHAT_ID || "";
@@ -76,6 +87,11 @@ const AMO_BASE_URL        = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
 const AMO_CLIENT_ID       = process.env.AMO_CLIENT_ID || "";
 const AMO_CLIENT_SECRET   = process.env.AMO_CLIENT_SECRET || "";
 const AMO_REDIRECT_URI    = process.env.AMO_REDIRECT_URI || "";
+
+/* -------------------- SIMPLE PINGER ENV -------------------- */
+const SIMPLE_POLL_URL          = (process.env.SIMPLE_POLL_URL || "").trim();
+const SIMPLE_POLL_INTERVAL_MIN = parseInt(process.env.SIMPLE_POLL_INTERVAL_MIN || "10", 10);
+const SIMPLE_POLL_FORCE_HOURS  = parseInt(process.env.SIMPLE_POLL_FORCE_HOURS || "0", 10);
 
 /* -------------------- INIT -------------------- */
 initTelegramEnv({
@@ -102,8 +118,6 @@ function ensureAmoOauthEnv() {
     throw new Error("AMO OAuth env incomplete (AMO_BASE_URL / AMO_CLIENT_ID / AMO_CLIENT_SECRET / AMO_REDIRECT_URI)");
   }
 }
-function nowIso(){ return new Date().toISOString(); }
-function minutes(ms){ return Math.floor(ms/60000); }
 
 /* -------------------- BASIC/DIAG -------------------- */
 app.get("/", (_, res) => res.send("OK"));
@@ -118,6 +132,12 @@ app.get("/diag/env", async (_, res) => {
     poll_minutes: AMO_POLL_MINUTES,
     poll_limit: AMO_POLL_LIMIT,
     bootstrapRemaining,
+    simple_pinger: {
+      enabled: !!SIMPLE_POLL_URL && SIMPLE_POLL_INTERVAL_MIN > 0,
+      url: SIMPLE_POLL_URL,
+      interval_min: SIMPLE_POLL_INTERVAL_MIN,
+      force_hours: SIMPLE_POLL_FORCE_HOURS
+    }
   });
 });
 
@@ -166,21 +186,20 @@ app.get("/amo/oauth/callback", async (req, res) => {
     }
     const j = JSON.parse(text);
     const access  = j.access_token  || "";
-    the_refresh:
-    {
-      const refresh = j.refresh_token || "";
-      if (!access || !refresh) throw new Error("empty tokens in response");
-      await setSecret("AMO_ACCESS_TOKEN", access).catch(()=>{});
-      await setSecret("AMO_REFRESH_TOKEN", refresh).catch(()=>{});
-      try { await injectAmoTokens(access, refresh); } catch {}
-      try {
-        await sendTG(
-          "✅ <b>AmoCRM авторизация завершена</b>\n" +
-          `• access: <code>${mask(access)}</code>\n` +
-          `• refresh: <code>${mask(refresh)}</code>`
-        );
-      } catch {}
-    }
+    const refresh = j.refresh_token || "";
+    if (!access || !refresh) throw new Error("empty tokens in response");
+
+    await setSecret("AMO_ACCESS_TOKEN", access).catch(()=>{});
+    await setSecret("AMO_REFRESH_TOKEN", refresh).catch(()=>{});
+    try { await injectAmoTokens(access, refresh); } catch {}
+
+    try {
+      await sendTG(
+        "✅ <b>AmoCRM авторизация завершена</b>\n" +
+        `• access: <code>${mask(access)}</code>\n` +
+        `• refresh: <code>${mask(refresh)}</code>`
+      );
+    } catch {}
     res.send(`<html><body style="font-family:system-ui"><h3>Готово ✅</h3><p>Токены сохранены, слушатель подключён.</p></body></html>`);
   } catch (e) {
     try { await sendTG(`❗️ OAuth callback error: <code>${e?.message || e}</code>`); } catch {}
@@ -216,7 +235,7 @@ app.get("/amo/poll", async (req, res) => {
     if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
       bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
     }
-    res.json({ ok: true, ...out, bootstrapRemaining });
+    res.json({ ok: true, ...out, bootstrapRemaining, since: since || undefined });
   } catch (e) {
     res.status(401).json({ ok: false, error: String(e) });
   }
@@ -230,13 +249,13 @@ app.get("/amo/force", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || "200", 10), 500);
     const since = Math.max(0, Math.floor(Date.now()/1000) - hours*3600);
     const out = await processAmoCallNotes(limit, 999999, { force: true, sinceEpochSec: since, bootstrapLimit: limit });
-    res.json({ ok: true, forced: true, hours, limit, ...out });
+    res.json({ ok: true, forced: true, hours, limit, ...out, since });
   } catch (e) {
     res.status(401).json({ ok: false, error: String(e) });
   }
 });
 
-// курсоры
+// курсоры (те самые «от номера лида/контакта/компании» — точнее по created_at заметок)
 app.get("/amo/cursors", async (req, res) => {
   try {
     assertKey(req);
@@ -246,6 +265,34 @@ app.get("/amo/cursors", async (req, res) => {
       getSecret("amo_cursor_company_notes_created_at"),
     ]);
     res.json({ ok:true, cursors: { lead, contact, company }});
+  } catch (e) {
+    res.status(401).json({ ok:false, error: String(e) });
+  }
+});
+
+// диагностика одним взглядом
+app.get("/amo/diag", async (req, res) => {
+  try {
+    assertKey(req);
+    const [lead, contact, company] = await Promise.all([
+      getSecret("amo_cursor_lead_notes_created_at"),
+      getSecret("amo_cursor_contact_notes_created_at"),
+      getSecret("amo_cursor_company_notes_created_at"),
+    ]);
+    res.json({
+      ok: true,
+      version: VERSION,
+      cursors: { lead, contact, company },
+      lastTickAt,
+      lastStartedAt,
+      lastWithLinksAt,
+      simple_pinger: {
+        enabled: !!SIMPLE_POLL_URL && SIMPLE_POLL_INTERVAL_MIN > 0,
+        url: SIMPLE_POLL_URL,
+        interval_min: SIMPLE_POLL_INTERVAL_MIN,
+        force_hours: SIMPLE_POLL_FORCE_HOURS
+      }
+    });
   } catch (e) {
     res.status(401).json({ ok:false, error: String(e) });
   }
@@ -399,6 +446,8 @@ async function runHttpSelfPoll() {
   }
 }
 
+function minutes(ms){ return Math.floor(ms/60000); }
+
 if (AMO_POLL_MINUTES > 0) {
   console.log(`⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${bootstrapRemaining})`);
 
@@ -460,28 +509,48 @@ if (AMO_POLL_MINUTES > 0) {
   console.log("⏸ auto-poll disabled");
 }
 
-/* -------------------- DIAG/HEALTH -------------------- */
-// Диагностика тиков: удобно быстро увидеть, «живо» ли всё
-app.get("/amo/diag", (_req, res) => {
-  const now = Date.now();
-  const diag = {
-    ok: true,
-    version: VERSION,
-    now: nowIso(),
-    poll_minutes: AMO_POLL_MINUTES,
-    poll_limit: AMO_POLL_LIMIT,
-    bootstrapRemaining,
-    lastTickAt,
-    lastWithLinksAt,
-    lastStartedAt,
-    since: {
-      lastTickMinAgo: lastTickAt ? minutes(now - lastTickAt) : null,
-      lastWithLinksMinAgo: lastWithLinksAt ? minutes(now - lastWithLinksAt) : null,
-      lastStartedMinAgo: lastStartedAt ? minutes(now - lastStartedAt) : null,
+/* -------------------- SIMPLE URL PINGER (жмём ту же ссылку, что руками) -------------------- */
+function buildSimplePollUrl() {
+  if (!SIMPLE_POLL_URL) return null;
+  try {
+    const u = new URL(SIMPLE_POLL_URL);
+    if (SIMPLE_POLL_FORCE_HOURS > 0) {
+      const since = Math.floor((Date.now() - SIMPLE_POLL_FORCE_HOURS * 3600 * 1000) / 1000);
+      u.searchParams.set("since", String(since));
+    } else {
+      u.searchParams.delete("since");
     }
-  };
-  res.json(diag);
-});
+    return u.toString();
+  } catch {
+    return SIMPLE_POLL_URL;
+  }
+}
+
+async function simplePingOnce(kind = "simple") {
+  const url = buildSimplePollUrl();
+  if (!url) return;
+  try {
+    const r = await fetch(url);
+    let j = null;
+    try { j = await r.json(); } catch {}
+    const msg =
+      `[PING] ${kind} -> ${r.status}` +
+      (j ? ` scanned=${j.scanned||0} withLinks=${j.withLinks||0} started=${j.started||0}` : "");
+    console.log(msg);
+    try { await sendTG(`✅ ${msg}`); } catch {}
+  } catch (e) {
+    const msg = `[PING] ${kind} error: ${e?.message || e}`;
+    console.warn(msg);
+    try { await sendTG(`❗️ ${msg}`); } catch {}
+  }
+}
+
+// Автозапуск «тупого пингера», если задан SIMPLE_POLL_URL
+if (SIMPLE_POLL_URL && SIMPLE_POLL_INTERVAL_MIN > 0) {
+  console.log(`🔁 SIMPLE_PINGER: каждые ${SIMPLE_POLL_INTERVAL_MIN} мин → ${buildSimplePollUrl()}`);
+  simplePingOnce("boot").catch(()=>{});
+  setInterval(() => { simplePingOnce("interval").catch(()=>{}); }, SIMPLE_POLL_INTERVAL_MIN * 60 * 1000);
+}
 
 /* -------------------- SERVER -------------------- */
 app.listen(PORT, () => {

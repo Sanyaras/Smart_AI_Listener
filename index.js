@@ -445,81 +445,82 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
 });
 
 /* -------------------- AUTO POLLER WITH RETRIES -------------------- */
-function backeme(hours){ return Math.floor(hours*3600); }
 
-if (AMPOk()) {
-  console.log(
-    `⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT})`
+function hoursToSec(h){ return Math.floor((parseFloat(h)||0) * 3600); }
+
+function AMOEnvOk() {
+  return Boolean(
+    process.env.AMO_BASE_URL &&
+    process.env.AMO_CLIENT_ID &&
+    process.env.AMO_CLIENT_SECRET &&
+    process.env.AMO_REDIRECT_URI
   );
+}
 
-  const tickAmo = async (opts = {}) => {
-    const { force = false, since = 0 } = opts;
+if (AMOEnvOk() && AMO_POLL_MINUTES > 0) {
+  console.log(`⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT})`);
+
+  let timer = null;
+  let backoffMs = 0;
+  let bootstrapBackfillStarted = false;
+
+  async function tickAmo({ force = false, since = 0 } = {}) {
     try {
       const options = {};
       if (force) options.force = true;
-      if (since) options.fineGrained = true, options.since = since;
+      if (since) options.since = since;
 
       const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining, options);
       if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
         bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
       }
-      if (out?.started > 0) {
+
+      if (out?.started > 0 || out?.withLinks > 0) {
         await sendTG(
-          `📡 Amo poll:\n` +
-          `• scanned ${out.scanned}\n` +
-          `• with links ${out.withLinks}\n` +
-          `• started ${out.started}\n` +
-          `• skipped ${out.skipped} · seenOnly ${out.seenOnly} · ignored ${out.ignored}\n` +
-          `• cursors: L${out.cursors.lead_next} C${out.cursors.contact_next} Co${out.cursors.company_next}\n` +
-          `• bootstrapRemaining ${bootstrapRemaining}`
+          [
+            "📡 Amo poll",
+            `• scanned: ${out.scanned}`,
+            `• withLinks: ${out.withLinks}`,
+            `• started: ${out.started}`,
+            `• skipped: ${out.skipped} · seenOnly: ${out.seenOnly} · ignored: ${out.ignored}`,
+            `• cursors: lead ${out.cursors.lead_next} · contact ${out.cursors.contact_next} · company ${out.cursors.company_next}`,
+            `• bootstrapRemaining: ${bootstrapRemaining}`
+          ].join("\n")
         );
       }
+
+      // успех — сбрасываем бэкофф
+      backoffMs = 0;
     } catch (e) {
       console.error("[AMO] poll error:", e);
       try { await sendTG("❗️ [AMO] poll error: " + (e?.message || e)); } catch {}
-      // экспоненциальный ре-трай с минимальной задержкой
-      scheduleNext(true);
-      return;
+      // неуспех — увеличиваем бэкофф
+      backoffMs = Math.min(5 * 60 * 1000, backoffMs ? backoffMs * 2 : 30 * 1000);
+    } finally {
+      scheduleNext();
     }
-    scheduleNext(false);
-  };
+  }
 
-  let timer = null;
-  let backoffMs = 0;
-  function scheduleNext(failed) {
-    if (failed) {
-      backoffMs = Math.min(5 * 60 * 1000, (backoffMs ? backoffMs * 2 : 30 * 1000));
-    } else {
-      backoffMs = 0;
-    }
+  function scheduleNext() {
     const base = AMO_POLL_MINUTES * 60 * 1000;
     const jitter = Math.floor(Math.random() * 5000);
-    const due = (failed ? backoffMs : base) + jitter;
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => {
-      // если курсоры пустые и задан бэкфилл — стартуем «от даты» один раз
-      if (AMO_BOOTSTRAY()) {
-        const since = Math.max(0, Math.floor(Date.now()/1000) - backeme(AMO_BOOTSTRAP_BACKFILL + 0));
-        tickAmo({ force: true, since });
-        AMO_BOOTSTRAP_BACKFILL_STARTED = true;
+    const due = (backoffMs || base) + jitter;
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      // Первый запуск — если задан авто-бэкфилл при старте и ещё не делали
+      if (!bootstrapBackfillStarted && AMO_BOOTSTRAP_BACKFILL_HOURS > 0) {
+        bootstrapBackfillStarted = true;
+        const since = Math.max(0, Math.floor(Date.now()/1000) - hoursToSec(AMO_BOOTSTRAP_BACKFILL_HOURS));
+        await tickAmo({ force: true, since });
       } else {
-        tickAmo();
+        await tickAmo();
       }
     }, due);
   }
 
-  let AMO_BOOTSTRAP_BACKFILL_STARTED = false;
-  function AMO_BOOTSTRAY() {
-    if (!AMO_BOOTSTRAP_BACKFILL_HOURS) return false;
-    if (AMO_BOOTSTRAP_BACKFILL_STARTED) return false;
-    return true;
-  }
-  function AMO_BOOTSTRAP_BACKFILL(){ return AMO_BOOTSTRAP_BACKFILL_HOURS; }
-  function AMPOk(){ return AMO_PTOP() && AMO_POLL_MINUTES > 0; }
-  function AMO_PTOP(){ return !!AMO_BASE_URL && !!AMO_CLIENT_ID && !!AMO_CLIENT_SECRET && !!AMO_REDIRECT_URI; }
-
   // первый запуск сразу
   tickAmo();
+
 } else {
   console.log("⏸ auto-poll disabled or AMO env incomplete");
 }

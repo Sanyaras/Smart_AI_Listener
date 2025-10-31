@@ -1,6 +1,7 @@
-// amo.js — AmoCRM интеграция + надёжный поллер (v3.3-IRAZBIL)
+// amo.js — AmoCRM интеграция + надёжный поллер (v3.4-IRAZBIL)
 // Совместимо с index.js v2.5.0-IRAZBIL (processAmoCallNotes(limit, bootstrapRemaining, options))
-// Фичи: tail-scan + overlap/healing, анти-спам, алерты, Supabase upsert, токены из Supabase
+// Фичи: tail-scan + overlap/healing, анти-спам, алерты, Supabase upsert, токены из Supabase,
+//        устойчивые сетевые ретраи (DNS/ENOTFOUND, 5xx/429, ECONNRESET и пр.)
 
 import crypto from "crypto";
 import { fetchWithTimeout, mask, cap } from "./utils.js";
@@ -44,6 +45,11 @@ const SUPABASE_TABLE = process.env.SUPABASE_CALLS_QA_TABLE || "calls_qa";
 const CURSOR_OVERLAP_MIN = parseInt(process.env.AMO_CURSOR_OVERLAP_MIN || "180", 10); // 3h overlap
 const BACKFILL_MAX_HOURS = parseInt(process.env.AMO_BACKFILL_MAX_HOURS || "72", 10);  // heal up to 72h
 
+// Сетевые ретраи
+const NET_RETRIES          = parseInt(process.env.AMO_NET_RETRIES || "3", 10);
+const NET_TIMEOUT_MS       = parseInt(process.env.AMO_NET_TIMEOUT_MS || "15000", 10);
+const NET_BASE_BACKOFF_MS  = parseInt(process.env.AMO_NET_BACKOFF_MS || "400", 10);
+
 // ==================== Tokens & Secrets ====================
 import {
   isAlreadyProcessed,
@@ -59,24 +65,34 @@ let TOKENS_LOADED_ONCE = false;
 
 async function loadTokensFromStoreIfNeeded() {
   if (TOKENS_LOADED_ONCE) return;
-  let acc = await getSecret(SECRET_KEY_ACCESS);
-  let ref = await getSecret(SECRET_KEY_REFRESH);
-  if (!acc) acc = await getSecret("AMO_ACCESS_TOKEN");
-  if (!ref) ref = await getSecret("AMO_REFRESH_TOKEN");
-  if (!AMO_ACCESS_TOKEN && acc) AMO_ACCESS_TOKEN = acc;
-  if (!AMO_REFRESH_TOKEN && ref) AMO_REFRESH_TOKEN = ref;
-  TOKENS_LOADED_ONCE = true;
+  try {
+    let acc = await getSecret(SECRET_KEY_ACCESS);
+    let ref = await getSecret(SECRET_KEY_REFRESH);
+    if (!acc) acc = await getSecret("AMO_ACCESS_TOKEN");   // обратная совместимость
+    if (!ref) ref = await getSecret("AMO_REFRESH_TOKEN");  // обратная совместимость
+    if (!AMO_ACCESS_TOKEN && acc) AMO_ACCESS_TOKEN = acc;
+    if (!AMO_REFRESH_TOKEN && ref) AMO_REFRESH_TOKEN = ref;
+  } catch (e) {
+    // не ломаем ран
+    console.warn("loadTokensFromStoreIfNeeded:", e?.message || e);
+  } finally {
+    TOKENS_LOADED_ONCE = true;
+  }
 }
 async function persistTokens(access, refresh) {
-  if (access) {
-    AMO_ACCESS_TOKEN = access;
-    await setSecret(SECRET_KEY_ACCESS, access).catch(()=>{});
-    await setSecret("AMO_ACCESS_TOKEN", access).catch(()=>{});
-  }
-  if (refresh) {
-    AMO_REFRESH_TOKEN = refresh;
-    await setSecret(SECRET_KEY_REFRESH, refresh).catch(()=>{});
-    await setSecret("AMO_REFRESH_TOKEN", refresh).catch(()=>{});
+  try {
+    if (access) {
+      AMO_ACCESS_TOKEN = access;
+      await setSecret(SECRET_KEY_ACCESS, access).catch(()=>{});
+      await setSecret("AMO_ACCESS_TOKEN", access).catch(()=>{});
+    }
+    if (refresh) {
+      AMO_REFRESH_TOKEN = refresh;
+      await setSecret(SECRET_KEY_REFRESH, refresh).catch(()=>{});
+      await setSecret("AMO_REFRESH_TOKEN", refresh).catch(()=>{});
+    }
+  } catch (e) {
+    console.warn("persistTokens:", e?.message || e);
   }
 }
 export function injectAmoTokens(access, refresh) { return persistTokens(access, refresh); }
@@ -93,10 +109,44 @@ function ensureAmoEnv() {
     throw new Error("AMO_* env incomplete");
   }
 }
+
+async function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+async function netFetch(url, opts={}, timeoutMs=NET_TIMEOUT_MS, retries=NET_RETRIES) {
+  let lastErr = null;
+  for (let attempt=0; attempt<=retries; attempt++) {
+    try {
+      const r = await fetchWithTimeout(url, opts, timeoutMs);
+      // 5xx/429 — ретраим
+      if (r.status >= 500 || r.status === 429) {
+        const body = await r.text().catch(()=> "");
+        lastErr = new Error(`HTTP ${r.status} ${r.statusText} ${body ? "- " + body : ""}`);
+        // экспоненциальный бэкофф
+        const wait = NET_BASE_BACKOFF_MS * Math.pow(2, attempt);
+        await sleep(wait);
+        continue;
+      }
+      return r;
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      // DNS/ENOTFOUND/ECONNRESET/ETIMEDOUT — ретраим
+      if (/ENOTFOUND|ECONNRESET|ETIMEDOUT|fetch failed|getaddrinfo/i.test(msg)) {
+        const wait = NET_BASE_BACKOFF_MS * Math.pow(2, attempt);
+        await sleep(wait);
+        continue;
+      }
+      // прочее — не ретраим
+      break;
+    }
+  }
+  throw lastErr || new Error("netFetch failed");
+}
+
 async function amoOAuth(body) {
   ensureAmoEnv();
   const url = `${AMO_BASE_URL}/oauth2/access_token`;
-  const resp = await fetchWithTimeout(url, {
+  const resp = await netFetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -105,7 +155,7 @@ async function amoOAuth(body) {
       redirect_uri: AMO_REDIRECT_URI,
       ...body
     })
-  }, 20000);
+  }, NET_TIMEOUT_MS, NET_RETRIES);
   if (!resp.ok) throw new Error(`amo oauth ${resp.status}: ${await resp.text().catch(()=> "")}`);
   return await resp.json();
 }
@@ -126,7 +176,6 @@ export async function amoRefresh() {
   })();
   return amoRefreshPromise;
 }
-// На случай первичного обмена кодом (не используется из index.js, но оставим)
 export async function amoExchangeCode() {
   if (!AMO_AUTH_CODE) throw new Error("AMO_AUTH_CODE missing");
   const j = await amoOAuth({ grant_type: "authorization_code", code: AMO_AUTH_CODE });
@@ -134,19 +183,20 @@ export async function amoExchangeCode() {
   return j;
 }
 
-export async function amoFetch(path, opts = {}, ms = 15000) {
+export async function amoFetch(path, opts = {}, timeoutMs = NET_TIMEOUT_MS) {
   ensureAmoEnv();
   await loadTokensFromStoreIfNeeded();
   if (!AMO_ACCESS_TOKEN) throw new Error("No AMO_ACCESS_TOKEN — авторизуйся на /amo/oauth/start");
 
   const url = `${AMO_BASE_URL}${path}`;
-  const doFetch = (token) => fetchWithTimeout(url, {
+  const doFetch = (token) => netFetch(url, {
     ...opts,
     headers: { "authorization": `Bearer ${token}`, "content-type":"application/json", ...(opts.headers||{}) }
-  }, ms);
+  }, timeoutMs, NET_RETRIES);
 
   let r = await doFetch(AMO_ACCESS_TOKEN);
   if (r.status === 401) {
+    // токен сдох, попробуем обновить
     try { await amoRefresh(); }
     catch (e) {
       const body = await r.text().catch(()=> "");
@@ -353,11 +403,11 @@ function tgSpoiler(s){ return `<span class="tg-spoiler">${s}</span>`; }
 async function sendAlert(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_ALERT_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  await fetchWithTimeout(url, {
+  await netFetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ chat_id: TELEGRAM_ALERT_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true })
-  }, 15000).catch(()=>{});
+  }, 15000, 2).catch(()=>{});
 }
 
 // ==================== Supabase upsert ====================
@@ -365,7 +415,7 @@ async function upsertCallQaToSupabase(row){
   if (!SUPABASE_URL || !SUPABASE_KEY) return;
   const url = `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}`;
   const body = Array.isArray(row) ? row : [row];
-  const resp = await fetchWithTimeout(url, {
+  const resp = await netFetch(url, {
     method: "POST",
     headers: {
       apikey: SUPABASE_KEY,
@@ -374,7 +424,7 @@ async function upsertCallQaToSupabase(row){
       Prefer: "resolution=merge-duplicates"
     },
     body: JSON.stringify(body)
-  }, 20000);
+  }, 20000, 2);
   if (!resp.ok) {
     const t = await resp.text().catch(()=> "");
     console.warn("supabase upsert failed:", resp.status, t);
@@ -463,6 +513,7 @@ export async function processAmoCallNotes(limit = 30, bootstrapRemaining = 0, op
     const source_id   = String(note.note_id);
 
     const createdMs = (note.created_at || 0) * 1000;
+
     if (IGNORE_MS > 0 && (now - createdMs) > IGNORE_MS && !force) {
       await markSeenOnly(source_type, source_id, "too_old");
       out.ignored++;
@@ -527,11 +578,10 @@ export async function processAmoCallNotes(limit = 30, bootstrapRemaining = 0, op
       ].filter(Boolean).join("\n")
     );
 
-    // Обработка ссылок (по первой валидной, остальные можно добавить по желанию)
+    // Обработка ссылок
     const origUrl = links[0];
     let relayCdnUrl = origUrl;
     try { relayCdnUrl = await tgRelayAudio(origUrl, `🎧 Аудио (${note.note_type}) • ${managerTxt}`); } catch {
-      // локальный fallback
       try {
         const u = new URL(origUrl);
         if (RELAY_BASE_URL && !String(origUrl).startsWith(RELAY_BASE_URL)) {

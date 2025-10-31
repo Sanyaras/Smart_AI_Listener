@@ -1,9 +1,13 @@
-// asr.js — Smart Role-aware ASR (v2)
+// asr.js — Smart ASR with optional role-tagging (returns STRING)
+// Node 20+: uses global fetch/FormData/Blob
 import { fetchWithTimeout, cap } from "./utils.js";
 import { sendTG } from "./telegram.js";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const ASR_CONCURRENCY = parseInt(process.env.ASR_CONCURRENCY || "2", 10);
+const OPENAI_API_KEY   = process.env.OPENAI_API_KEY || "";
+const ASR_CONCURRENCY  = parseInt(process.env.ASR_CONCURRENCY || "2", 10);
+const ASR_ROLE_MODEL   = process.env.ASR_ROLE_MODEL || "gpt-4o-mini"; // модель для ролевой разметки
+const MAX_DOWNLOAD_MB  = parseInt(process.env.ASR_MAX_MB || "60", 10); // предел размера записи в MB
+const MAX_DOWNLOAD     = MAX_DOWNLOAD_MB * 1024 * 1024;
 
 const asrQueue = [];
 let asrActive = 0;
@@ -35,6 +39,15 @@ async function processAsrQueue() {
   }
 }
 
+/**
+ * Транскрибация аудио по URL
+ * Возвращает СТРОКУ.
+ * Если ролевой теггер сработает — формат строк:
+ *   ivr: ...
+ *   customer: ...
+ *   manager: ...
+ * Иначе — сырой текст Whisper.
+ */
 export async function transcribeAudioFromUrl(fileUrl, meta = {}) {
   if (!OPENAI_API_KEY) {
     await sendTG("⚠️ <b>OPENAI_API_KEY не задан</b> — пропускаю транскрибацию.");
@@ -42,30 +55,37 @@ export async function transcribeAudioFromUrl(fileUrl, meta = {}) {
   }
 
   try {
-    // HEAD — проверяем размер файла
+    // 1) HEAD: быстрый чек размера
     try {
       const head = await fetchWithTimeout(fileUrl, { method: "HEAD", redirect: "follow" }, 8000);
       const cl = head.headers.get("content-length");
-      const MAX = 60 * 1024 * 1024;
-      if (cl && parseInt(cl, 10) > MAX) {
-        await sendTG(`⚠️ Запись слишком большая (${(parseInt(cl,10)/1024/1024).toFixed(1)}MB) — пропуск.`);
+      if (cl && parseInt(cl, 10) > MAX_DOWNLOAD) {
+        await sendTG(`⚠️ Запись слишком большая (<code>${(parseInt(cl,10)/1024/1024).toFixed(1)}MB</code>) — пропуск.`);
         return null;
       }
-    } catch {}
+    } catch (_) { /* ok, пропускаем HEAD-ошибку */ }
 
+    // 2) Скачиваем аудио
     const r = await fetchWithTimeout(fileUrl, { redirect: "follow" }, 30000);
     if (!r.ok) {
       await sendTG(`❗️ Ошибка скачивания записи: HTTP <code>${r.status}</code>`);
       return null;
     }
 
-    const buf = await r.arrayBuffer();
-    const MAX = 60 * 1024 * 1024;
-    if (buf.byteLength > MAX) {
-      await sendTG(`⚠️ Запись ${(buf.byteLength/1024/1024).toFixed(1)}MB слишком большая — пропуск.`);
+    // двукратная проверка размера (по header и по факту)
+    const contentLength = r.headers.get("content-length");
+    if (contentLength && parseInt(contentLength,10) > MAX_DOWNLOAD) {
+      await sendTG(`⚠️ Запись <code>${(parseInt(contentLength,10)/1024/1024).toFixed(1)}MB</code> слишком большая — пропуск.`);
       return null;
     }
 
+    const buf = await r.arrayBuffer();
+    if (buf.byteLength > MAX_DOWNLOAD) {
+      await sendTG(`⚠️ Запись <code>${(buf.byteLength/1024/1024).toFixed(1)}MB</code> слишком большая — пропуск.`);
+      return null;
+    }
+
+    // 3) Whisper (text)
     const form = new FormData();
     const filename = meta.fileName || (meta.callId ? `${meta.callId}.mp3` : "audio.mp3");
     form.append("file", new Blob([buf]), filename);
@@ -85,58 +105,55 @@ export async function transcribeAudioFromUrl(fileUrl, meta = {}) {
       return null;
     }
 
-    const text = (await resp.text()).trim();
-    if (!text) return null;
+    const rawText = (await resp.text()).trim();
+    if (!rawText) return null;
 
-    // ---- Ролевая разметка ----
-    const rolePrompt = `
-Раздели этот текст телефонного звонка по ролям: автоответчик, менеджер, клиент.
-Автоответчик — стандартные фразы типа "Вы позвонили в сервисный центр".
-Менеджер — представляется ("меня зовут"), предлагает помощь, говорит о ремонте.
-Клиент — задаёт вопросы, описывает проблему.
+    // 4) Мягкая ролевка (опционально). Возвращаем СТРОКУ.
+    let labeled = null;
+    try {
+      const rolePrompt =
+`Разбей текст телефонного звонка по ролям: ivr (автоответчик), manager (менеджер), customer (клиент).
+Верни ТОЛЬКО JSON-массив объектов: [{"speaker":"ivr|manager|customer","text":"..."}] без комментариев.
+Текст:
+${rawText}`;
 
-Выведи JSON вида:
-[
-  {"speaker": "autoanswer", "text": "..."},
-  {"speaker": "client", "text": "..."},
-  {"speaker": "manager", "text": "..."}
-]
+      const analyzeResp = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: ASR_ROLE_MODEL,
+          messages: [
+            { role: "system", content: "Ты помощник по разметке ролей в телефонных диалогах. Никаких объяснений, только ответ по формату." },
+            { role: "user", content: rolePrompt }
+          ],
+          temperature: 0
+        })
+      }, 60000);
 
-Текст звонка:
-${text}
-`;
+      const j = await analyzeResp.json().catch(() => null);
+      const arr = (() => {
+        try {
+          const raw = j?.choices?.[0]?.message?.content || "";
+          const clean = raw.replace(/```json|```/g, "").trim();
+          const parsed = JSON.parse(clean);
+          return Array.isArray(parsed) ? parsed : null;
+        } catch { return null; }
+      })();
 
-    const analyzeResp = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [{ role: "system", content: "Ты помощник по анализу звонков." },
-                   { role: "user", content: rolePrompt }],
-        temperature: 0.3
-      })
-    }, 60000);
+      if (arr && arr.length) {
+        labeled = arr
+          .map(x => `${(x.speaker || "unknown").toLowerCase()}: ${x.text || ""}`.trim())
+          .join("\n");
+      }
+    } catch (_) { /* молча откатываемся на сырой текст */ }
 
-    const j = await analyzeResp.json().catch(() => null);
-    const parsed = (() => {
-      try {
-        const txt = j?.choices?.[0]?.message?.content || "";
-        const clean = txt.replace(/```json|```/g, "").trim();
-        return JSON.parse(clean);
-      } catch { return null; }
-    })();
-
-    if (!parsed) {
-      return [{ speaker: "unknown", text }];
-    }
-
-    return parsed;
+    return labeled || rawText;
 
   } catch (e) {
-    await sendTG(`❗️ Ошибка транскрибации: <code>${e?.message || e}</code>`);
+    await sendTG(`❗️ Общая ошибка транскрибации: <code>${e?.message || e}</code>`);
     return null;
   }
 }

@@ -1,6 +1,10 @@
 // index.js — Smart AI Listener (v2.5.0-IRAZBIL)
-// архитектура: telegram / asr / amo / megapbx / supabaseStore / utils
-// изменения: надёжный ручной поллер с опциями force/since/bootstrap, фиксы OAuth-callback
+// Архитектура: telegram / asr / amo / megapbx / supabaseStore / utils
+// Новое:
+//  • Телеметрия автополлера (видимость тиков/ошибок/след. запуска)
+//  • /diag/poller — диагностика состояния поллера
+//  • Heartbeat в Telegram (редко, чтобы не спамить)
+//  • Безопасно: первый тик сразу, дедупликация через supabaseStore
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -14,9 +18,12 @@ import {
   initTelegramEnv,
   TELEGRAM,
   sendTG,
+  sendTGDocument,
   tgReply,
   tgGetFileUrl,
   tgRelayAudio,
+  formatTgMegapbxMessage,
+  getTelegramQueuesState,
 } from "./telegram.js";
 
 // ---- ASR очередь/распознавание ----
@@ -40,13 +47,18 @@ import { normalizeMegafon } from "./megapbx.js";
 
 // ---- Утилиты/сетевые ----
 import {
+  debug,
   cap,
+  safeStr,
   mask,
+  chunkText,
   fetchWithTimeout,
 } from "./utils.js";
 
 // ---- Supabase tokens/flags ----
 import {
+  isAlreadyProcessed,
+  markProcessed,
   setSecret, // для OAuth-секретов
 } from "./supabaseStore.js";
 
@@ -63,6 +75,7 @@ const CRM_SHARED_KEY     = process.env.CRM_SHARED_KEY || ""; // пример: bo
 const OPENAI_API_KEY     = process.env.OPENAI_API_KEY || "";
 
 const AUTO_TRANSCRIBE    = process.env.AUTO_TRANSCRIBE === "1";
+const SHOW_CONTACT_EVENTS= process.env.SHOW_CONTACT_EVENTS === "1";
 const RELAY_BASE_URL     = process.env.RELAY_BASE_URL || "";
 const TG_DIRECT_FETCH    = process.env.TG_DIRECT_FETCH === "1";
 
@@ -79,12 +92,19 @@ const AMO_CLIENT_ID     = process.env.AMO_CLIENT_ID || "";
 const AMO_CLIENT_SECRET = process.env.AMO_CLIENT_SECRET || "";
 const AMO_REDIRECT_URI  = process.env.AMO_REDIRECT_URI || "";
 
-// internal helper: валиден ли env для OAuth
+// Heartbeat поллера (минуты). 0 = выключен.
+const POLLER_HEARTBEAT_MIN = parseInt(process.env.POLLER_HEARTBEAT_MIN || "0", 10);
+
 function ensureAmoOauthEnv() {
   if (!AMO_BASE_URL || !AMO_CLIENT_ID || !AMO_CLIENT_SECRET || !AMO_REDIRECT_URI) {
     throw new Error("AMO OAuth env incomplete (AMO_BASE_URL / AMO_CLIENT_ID / AMO_CLIENT_SECRET / AMO_REDIRECT_URI)");
   }
 }
+
+const HISTORY_TIMEOUT_MS =
+  parseInt(process.env.HISTORY_TIMEOUT_MIN || "7", 10) * 60 * 1000;
+const CALL_TTL_MS =
+  parseInt(process.env.CALL_TTL_MIN || "60", 10) * 60 * 1000;
 
 const PORT = process.env.PORT || 3000;
 
@@ -103,6 +123,30 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.text({ type: ["text/*", "application/octet-stream"] }));
 
 /* -------------------- HELPERS -------------------- */
+function getIncomingKey(req) {
+  const auth =
+    req.headers["authorization"] || req.headers["Authorization"] || "";
+  const m = String(auth).match(/Bearer\s+(.+)/i);
+  if (m) return m[1];
+  return (
+    req.headers["x-api-key"] ||
+    req.headers["x-crm-key"] ||
+    req.headers["x-auth-token"] ||
+    req.query?.key ||
+    (typeof req.body === "object" ? req.body.crm_token : undefined)
+  );
+}
+
+function wrapRecordingUrl(url) {
+  if (!RELAY_BASE_URL) return url;
+  try {
+    const u = new URL(url);
+    const rb = new URL(RELAY_BASE_URL);
+    if (u.hostname === rb.hostname && u.port === rb.port) return url;
+  } catch {}
+  return RELAY_BASE_URL + encodeURIComponent(url);
+}
+
 function assertKey(req) {
   const got =
     (req.headers["authorization"] ||
@@ -189,7 +233,7 @@ app.get("/amo/oauth/callback", async (req, res) => {
     await setSecret("AMO_REFRESH_TOKEN", refresh);
 
     // 2) подменяем в рантайме внутри amo.js (без рестарта)
-    try { injectAmoTokens(access, refresh); } catch {}
+    try { await injectAmoTokens(access, refresh); } catch {}
 
     // 3) нотификация
     await sendTG(
@@ -221,28 +265,70 @@ app.get("/amo/refresh", async (_, res) => {
   }
 });
 
-/* ---- Ручной поллер Amo ---- */
-// Пример: /amo/poll?key=boxfield-qa-2025&limit=200&force=1&since=1753800000&bootstrap=300
+/* ---- Ручной пул Amo ---- */
 app.get("/amo/poll", async (req, res) => {
   try {
     assertKey(req);
-    const limit = Math.min(parseInt(req.query.limit || AMO_POLL_LIMIT, 10), 200);
-    const force = String(req.query.force || "0") === "1";
-    const since = req.query.since ? parseInt(String(req.query.since), 10) : null; // unix seconds
-    const bootstrap = req.query.bootstrap ? Math.min(parseInt(String(req.query.bootstrap), 10), 500) : null;
-
-    const out = await processAmoCallNotes(limit, bootstrapRemaining, {
-      force,
-      sinceEpochSec: Number.isFinite(since) ? since : null,
-      bootstrapLimit: bootstrap ?? null,
-    });
-
+    const limit = Math.min(parseInt(req.query.limit || AMO_POLL_LIMIT, 10), 100);
+    const out = await processAmoCallNotes(limit, bootstrapRemaining);
     if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
       bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
     }
     res.json({ ok: true, ...out, bootstrapRemaining });
   } catch (e) {
     res.status(401).json({ ok: false, error: String(e) });
+  }
+});
+
+/* ---- AMO DEBUG ---- */
+app.get("/amo/debug/notes", async (req, res) => {
+  try {
+    assertKey(req);
+    const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
+
+    const [leads, contacts, companies] = await Promise.all([
+      amoFetch(`/api/v4/leads/notes?limit=${limit}`),
+      amoFetch(`/api/v4/contacts/notes?limit=${limit}`),
+      amoFetch(`/api/v4/companies/notes?limit=${limit}`),
+    ]);
+
+    const pick = (entity, arr) => {
+      const items = Array.isArray(arr?._embedded?.notes) ? arr._embedded.notes : [];
+      return items.map(n => ({
+        entity,
+        id: n.id,
+        note_type: n.note_type,
+        created_at: n.created_at,
+        has_text: !!(n.text || n.params?.text),
+        param_keys: n.params ? Object.keys(n.params).slice(0, 20) : [],
+        params_preview: (() => {
+          try { return JSON.stringify(n.params || {}).slice(0, 600); }
+          catch { return ""; }
+        })(),
+      }));
+    };
+
+    const out = [
+      ...pick("lead", leads),
+      ...pick("contact", contacts),
+      ...pick("company", companies),
+    ].sort((a,b) => (b.created_at||0) - (a.created_at||0));
+
+    res.json({ ok: true, count: out.length, items: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.get("/amo/debug/raw", async (req, res) => {
+  try {
+    assertKey(req);
+    const path = String(req.query.path || "");
+    if (!path.startsWith("/")) return res.status(400).json({ ok:false, error:"path must start with /" });
+    const j = await amoFetch(path);
+    res.json(j);
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e) });
   }
 });
 
@@ -280,6 +366,7 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
     }
 
     if (!fileId) {
+      // поддержка команды /asr <url>
       if (txt) {
         const m = txt.match(/^\/asr\s+(\S+)/i);
         if (m) {
@@ -332,6 +419,27 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
   }
 });
 
+/* -------------------- POLLER TELEMETRY -------------------- */
+const pollerState = {
+  enabled: (AMO_POLL_MINUTES > 0),
+  every_min: AMO_POLL_MINUTES,
+  last_tick_at: null,     // ISO
+  last_done_at: null,     // ISO
+  next_planned_at: null,  // ISO
+  last_error: null,       // string
+  last_items: { scanned: 0, started: 0, withLinks: 0, ignored: 0, seenOnly: 0, skipped: 0 },
+  ticks_total: 0,
+  heartbeats_sent: 0
+};
+
+app.get("/diag/poller", (_, res) => {
+  res.json({
+    version: VERSION,
+    ...pollerState,
+    bootstrapRemaining
+  });
+});
+
 /* -------------------- AUTO POLLER -------------------- */
 if (AMO_POLL_MINUTES > 0) {
   console.log(
@@ -339,25 +447,61 @@ if (AMO_POLL_MINUTES > 0) {
   );
 
   const tickAmo = async () => {
+    const now = new Date();
+    pollerState.ticks_total += 1;
+    pollerState.last_tick_at = now.toISOString();
     try {
-      const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining, {});
+      const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining);
       if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
         bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
       }
-      console.log("[AMO] poll:", out);
+
+      pollerState.last_items = {
+        scanned: out?.scanned || 0,
+        started: out?.started || 0,
+        withLinks: out?.withLinks || 0,
+        ignored: out?.ignored || 0,
+        seenOnly: out?.seenOnly || 0,
+        skipped: out?.skipped || 0
+      };
+      pollerState.last_error = null;
+      pollerState.last_done_at = new Date().toISOString();
+
+      // next planned
+      if (AMO_POLL_MINUTES > 0) {
+        pollerState.next_planned_at = new Date(Date.now() + AMO_POLL_MINUTES * 60 * 1000).toISOString();
+      } else {
+        pollerState.next_planned_at = null;
+      }
+
+      // Редкий heartbeat (если включён): либо при активности, либо по таймауту
+      if (POLLER_HEARTBEAT_MIN > 0) {
+        const sinceLast = pollerState.last_done_at ? (Date.now() - Date.parse(pollerState.last_done_at)) : Number.POSITIVE_INFINITY;
+        const shouldHeartbeat = (out?.started > 0) ||
+                                (pollerState.heartbeats_sent === 0) ||
+                                (sinceLast >= POLLER_HEARTBEAT_MIN * 60 * 1000);
+        if (shouldHeartbeat) {
+          await sendTG(
+            [
+              "⏰ <b>Poll heartbeat</b>",
+              `• scanned ${out?.scanned ?? 0}`,
+              `• withLinks ${out?.withLinks ?? 0}`,
+              `• started ${out?.started ?? 0}`,
+              `• skipped ${out?.skipped ?? 0}`,
+              `• ignored ${out?.ignored ?? 0}`,
+              `• seenOnly ${out?.seenOnly ?? 0}`,
+              `• bootstrapRemaining ${bootstrapRemaining}`
+            ].join("\n")
+          ).catch(()=>{});
+          pollerState.heartbeats_sent += 1;
+        }
+      }
+
       if (out?.started > 0) {
-        await sendTG(
-          `📡 Amo poll:\n` +
-          `• scanned ${out.scanned}\n` +
-          `• withLinks ${out.withLinks}\n` +
-          `• started ${out.started}\n` +
-          `• skipped ${out.skipped}\n` +
-          `• ignored ${out.ignored}\n` +
-          `• seenOnly ${out.seenOnly}\n` +
-          `• bootstrapRemaining ${bootstrapRemaining}`
-        );
+        console.log("[AMO] poll:", out);
       }
     } catch (e) {
+      pollerState.last_error = String(e?.message || e);
       console.error("[AMO] poll error:", e);
       try { await sendTG("❗️ poll error: " + (e?.message || e)); } catch {}
     }
@@ -371,6 +515,6 @@ if (AMO_POLL_MINUTES > 0) {
 }
 
 /* -------------------- START -------------------- */
-app.listen(PORT, () =>
+const server = app.listen(PORT, () =>
   console.log(`Smart AI Listener (${VERSION}) listening on ${PORT}`)
 );

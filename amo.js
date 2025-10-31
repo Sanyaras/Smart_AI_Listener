@@ -1,11 +1,7 @@
-// amo.js — Smart AI Listener / AmoCRM integration (v3.2-IRAZBIL)
-// - Stable OAuth (refresh + persist to Supabase)
-// - Tail-scan надёжный поиск последних страниц заметок
-// - Фильтр call-заметок + продвинутый парсер ссылок на запись
-// - Очередь ASR + аналитика QA (brand=iRazbil)
-// - Alerts в отдельный Telegram-чат
-// - Upsert расширенной карточки в Supabase (merge-duplicates на unique_key)
+// amo.js — Smart AI Listener / AmoCRM integration (v3.2 overlap+healing)
+// tail-scan + anti-spam + sales/service routing + alerts + supabase upsert
 
+// --- deps
 import crypto from "crypto";
 import { fetchWithTimeout, mask } from "./utils.js";
 import { sendTG, tgRelayAudio } from "./telegram.js";
@@ -21,7 +17,7 @@ const AMO_AUTH_CODE      = process.env.AMO_AUTH_CODE || "";
 let   AMO_ACCESS_TOKEN   = process.env.AMO_ACCESS_TOKEN || "";
 let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";
 
-// «свежее» окно (часы); 0 = выключено
+// «свежее» окно (часы); 0 = выключено (фильтр слишком старых)
 const IGNORE_OLDER_HOURS = parseInt(process.env.AMO_IGNORE_OLDER_HOURS || "0", 10);
 const IGNORE_MS = IGNORE_OLDER_HOURS > 0 ? IGNORE_OLDER_HOURS * 60 * 60 * 1000 : 0;
 
@@ -31,14 +27,18 @@ const AMO_DEBUG_DUMP = (process.env.AMO_DEBUG_DUMP || "1") === "1";
 // Alerts — отдельный Telegram чат
 const TELEGRAM_ALERT_CHAT_ID = process.env.TELEGRAM_ALERT_CHAT_ID || "";
 const TELEGRAM_BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN || "";
-const ALERT_MIN_TOTAL        = parseInt(process.env.ALERT_MIN_TOTAL || "60", 10);   // тотал ниже — алерт
-const ALERT_MIN_SENTIMENT    = parseInt(process.env.ALERT_MIN_SENTIMENT || "-2", 10); // клиент ≤ этого — алерт
+const ALERT_MIN_TOTAL        = parseInt(process.env.ALERT_MIN_TOTAL || "60", 10);
+const ALERT_MIN_SENTIMENT    = parseInt(process.env.ALERT_MIN_SENTIMENT || "-2", 10);
 const ALERT_IF_ESCALATE      = (process.env.ALERT_IF_ESCALATE || "1") === "1";
 
 // Supabase (прямой REST upsert)
-const SUPABASE_URL  = process.env.SUPABASE_URL || "";
-const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "";
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "";
 const SUPABASE_TABLE = process.env.SUPABASE_CALLS_QA_TABLE || "calls_qa";
+
+// --- safety scan window / healing ---
+const CURSOR_OVERLAP_MIN = parseInt(process.env.AMO_CURSOR_OVERLAP_MIN || "180", 10); // 3h overlap
+const BACKFILL_MAX_HOURS = parseInt(process.env.AMO_BACKFILL_MAX_HOURS || "72", 10);  // heal back up to 72h
 
 // ==================== TOKENS store (Supabase app_secrets-like) ====================
 import {
@@ -57,7 +57,7 @@ async function loadTokensFromStoreIfNeeded() {
   if (TOKENS_LOADED_ONCE) return;
   let acc = await getSecret(SECRET_KEY_ACCESS);
   let ref = await getSecret(SECRET_KEY_REFRESH);
-  if (!acc) acc = await getSecret("AMO_ACCESS_TOKEN"); // b/c
+  if (!acc) acc = await getSecret("AMO_ACCESS_TOKEN");
   if (!ref) ref = await getSecret("AMO_REFRESH_TOKEN");
   if (!AMO_ACCESS_TOKEN && acc) AMO_ACCESS_TOKEN = acc;
   if (!AMO_REFRESH_TOKEN && ref) AMO_REFRESH_TOKEN = ref;
@@ -165,7 +165,7 @@ const CURSOR_KEYS = {
 async function getCursor(entity){ const v = parseInt(await getSecret(CURSOR_KEYS[entity]) || "0", 10); return Number.isFinite(v) ? v : 0; }
 async function setCursor(entity, sec){ if (!sec || !Number.isFinite(sec)) return; await setSecret(CURSOR_KEYS[entity], String(sec)); }
 
-// ==================== Tail probe (надёжное определение последней страницы) ====================
+// ==================== Tail probe ====================
 async function probeLastPage(pathBase, perPage, maxPageCap = 2000){
   const first = await amoFetch(`${pathBase}?limit=${perPage}&page=1`);
   let lastPage = 1;
@@ -192,9 +192,16 @@ async function probeLastPage(pathBase, perPage, maxPageCap = 2000){
   }
   return L;
 }
+
+// ==================== Safe fetch since cursor (overlap + healing) ====================
 async function fetchNotesSinceCursor(entity, pathBase, perPage, maxPagesBack, sinceCreatedAtSec){
+  const overlapSec = Math.max(0, CURSOR_OVERLAP_MIN * 60);
+  const sinceSafe = Math.max(0, (sinceCreatedAtSec || 0) - overlapSec);
+
   const lastPage = await probeLastPage(pathBase, perPage);
   const collected = [];
+  let newestSeenSec = 0;
+
   const startPage = Math.max(1, lastPage - maxPagesBack + 1);
   outer:
   for (let page = lastPage; page >= startPage; page--) {
@@ -203,10 +210,27 @@ async function fetchNotesSinceCursor(entity, pathBase, perPage, maxPagesBack, si
     if (!arr.length) continue;
     for (const n of arr) {
       const ca = parseInt(n?.created_at || 0, 10) || 0;
-      if (sinceCreatedAtSec && ca <= sinceCreatedAtSec) break outer;
+      if (ca > newestSeenSec) newestSeenSec = ca;
+      if (sinceSafe && ca <= sinceSafe) break outer;
       collected.push(n);
     }
   }
+
+  // healing: курсор «улетел» вперёд
+  if (!collected.length && newestSeenSec > 0 && sinceCreatedAtSec && sinceCreatedAtSec > newestSeenSec) {
+    const healSince = Math.max(0, newestSeenSec - overlapSec);
+    const oldestAllowed = Math.max(0, Math.floor(Date.now()/1000) - BACKFILL_MAX_HOURS*3600);
+    const healStart = Math.max(oldestAllowed, healSince);
+
+    // дёрнем хвост ещё раз и положим записи >= healStart
+    const j2 = await amoFetch(`${pathBase}?limit=${perPage}&page=${lastPage}`);
+    const arr2 = Array.isArray(j2?._embedded?.notes) ? j2._embedded.notes : [];
+    for (const n of arr2) {
+      const ca = parseInt(n?.created_at || 0, 10) || 0;
+      if (ca >= healStart) collected.push(n);
+    }
+  }
+
   collected.sort((a,b) => (b.created_at||0) - (a.created_at||0));
   return collected;
 }
@@ -248,7 +272,6 @@ async function amoGetResponsible(entity, entityId) {
 }
 
 // ==================== Link parser ====================
-// Парсим ссылки максимально щедро, но отфильтровываем медиа-не-аудио.
 function findRecordingLinksInNote(note) {
   const urls = new Set();
   const urlRe = /https?:\/\/[^\s"'<>]+/ig;
@@ -259,21 +282,15 @@ function findRecordingLinksInNote(note) {
     "voximplant.com","voximplant.net","ringcentral.com","cloudfront.net","backblazeb2.com",
     "cdn","storage","files","static"
   ];
-
-  const pushFromText = (txt) => {
-    if (!txt) return;
-    const m = String(txt).match(urlRe);
-    if (m) m.forEach(u => urls.add(u));
-  };
+  const pushFromText = (txt) => { if (!txt) return; const m = String(txt).match(urlRe); if (m) m.forEach(u => urls.add(u)); };
   const collectFromObj = (obj) => {
     if (!obj || typeof obj !== "object") return;
-    for (const [k, v] of Object.entries(obj)) {
+    for (const [, v] of Object.entries(obj)) {
       if (typeof v === "string") pushFromText(v);
       else if (Array.isArray(v)) v.forEach(collectFromObj);
       else if (typeof v === "object") collectFromObj(v);
     }
   };
-
   if (note?.text)  pushFromText(note.text);
   if (note?.params) collectFromObj(note.params);
   if (note?.params?.link && typeof note.params.link === 'string' && note.params.link.startsWith('http')) urls.add(note.params.link);
@@ -291,7 +308,6 @@ function findRecordingLinksInNote(note) {
     return false;
   });
 
-  // усиливаем, если заметка явно «call_*» и задана длительность
   const isCall = /^call_/i.test(String(note?.note_type || ""));
   const durSec = parseInt(note?.params?.duration || 0, 10) || 0;
   if (isCall && durSec > 0) {
@@ -328,7 +344,6 @@ function isLikelyCallNote(note){
 }
 function sha256(s){ return crypto.createHash("sha256").update(String(s)).digest("hex"); }
 function tgSpoiler(s){ return `<span class="tg-spoiler">${s}</span>`; }
-function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
 // Alerts прямым вызовом Telegram API
 async function sendAlert(text) {
@@ -410,7 +425,7 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
 
     const createdMs = (note.created_at || 0) * 1000;
     if (IGNORE_MS > 0 && (now - createdMs) > IGNORE_MS) {
-      await markSeenOnly(source_type, source_id, "too_old");
+      await markSeenOnly(source_type, source_id, "");
       ignored++; continue;
     }
     if (started >= maxNewToProcessThisTick) break;
@@ -457,18 +472,18 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
       [
         "🎧 <b>Новый звонок из Amo</b>",
         `📅 <b>Время:</b> <code>${createdH}</code>`,
-        `👤 <b>Менеджер:</b> ${esc(managerTxt)}`,
-        `📞 <b>Телефон:</b> <code>${esc(phone)}</code>`,
+        `👤 <b>Менеджер:</b> ${managerTxt}`,
+        `📞 <b>Телефон:</b> <code>${phone}</code>`,
         `⏱️ <b>Длительность:</b> ${fmtDuration(durSec)}`,
-        `💬 <b>Тип:</b> <code>${esc(kindTxt)}</code>`,
+        `💬 <b>Тип:</b> <code>${kindTxt}</code>`,
         dealUrl ? `🔗 <b>Карта:</b> <a href="${dealUrl}">${dealUrl}</a>` : null,
         links[0] ? `🔊 <b>Аудио:</b> <a href="${links[0]}">оригинал</a>` : null,
-        note.text ? `📝 <b>Примечание:</b> ${esc(note.text)}` : null,
+        note.text ? `📝 <b>Примечание:</b> ${note.text}` : null,
         `<i>note_id: ${note.note_id} • entity: ${note.entity} • entity_id: ${note.entity_id}</i>`
       ].filter(Boolean).join("\n")
     );
 
-    // обработка всех найденных ссылок (обычно 1)
+    // обработка всех найденных ссылок
     for (const origUrl of links) {
       let relayCdnUrl = origUrl;
       try { relayCdnUrl = await tgRelayAudio(origUrl, `🎧 Аудио (${note.note_type}) • ${managerTxt}`); } catch {}
@@ -477,11 +492,9 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
         transcribeAudioFromUrl(relayCdnUrl, { callId: `amo-${note.note_id}` })
       );
 
-      // анти-дубль по хэшу транскрипта
       const tHash = text ? sha256(text) : "";
 
       if (text) {
-        // Аналитика (внутри определяет intent и прочее)
         const qa = await analyzeTranscript(text, {
           callId: `amo-${note.note_id}`,
           brand: "iRazbil",
@@ -491,54 +504,49 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
           created_at: note.created_at || null,
           phone: phone || null,
           duration_sec: durSec || 0
-        }).catch(async (e) => {
-          await sendTG("⚠️ Ошибка QA: <code>"+(e?.message||e)+"</code>");
-          return null;
         });
 
+        // Спойлер-транскрипт (урезанный)
         const short = text.slice(0, 1600);
         const spoiler = tgSpoiler(short);
 
-        if (qa) {
-          const qaCard = formatQaForTelegram(qa);
-          await sendTG(`${qaCard}\n\n<b>Транскрипт (свернуть):</b>\n${spoiler}`);
+        // Отрисовка QA + спойлер
+        const qaCard = formatQaForTelegram(qa);
+        await sendTG(`${qaCard}\n\n<b>Транскрипт (свернуть):</b>\n${spoiler}`);
 
-          // Alerts (в отдельный чат)
-          try {
-            const total = qa?.score?.total ?? 0;
-            const sent  = (qa?.psycho_emotional?.customer_sentiment ?? "0");
-            // допускаем строковые значения типа "-2"/"раздражение"
-            const sentNum = Number.isFinite(+sent) ? +sent : 0;
-            const escFlag = !!qa?.psycho?.escalate_flag || !!qa?.psycho_emotional?.escalate_flag;
+        // Alerts (в отдельный чат)
+        try {
+          const total = qa?.score?.total ?? 0;
+          const sent  = (() => {
+            const pe = qa?.psycho_emotional;
+            if (typeof pe?.customer_sentiment === "number") return pe.customer_sentiment;
+            return 0;
+          })();
+          const esc   = !!qa?.psycho?.escalate_flag || !!qa?.psycho_emotional?.escalate_flag;
 
-            if ((total < ALERT_MIN_TOTAL) || (sentNum <= ALERT_MIN_SENTIMENT) || (ALERT_IF_ESCALATE && escFlag)) {
-              const intent = qa?.intent || qa?.meta?.intent || "-";
-              await sendAlert(
-                [
-                  "🚨 <b>Алерт по звонку</b>",
-                  `• Intent: <b>${esc(intent)}</b> · Total: <b>${total}</b> · Sentiment: <b>${sentNum}</b> ${escFlag ? "· Escalate: <b>yes</b>" : ""}`,
-                  `• Менеджер: <b>${esc(managerTxt)}</b> · Длительность: <b>${fmtDuration(durSec)}</b>`,
-                  dealUrl ? `• Карта: ${dealUrl}` : null,
-                  `• note_id: ${note.note_id}`,
-                  "",
-                  "<i>Короткий транскрипт:</i>",
-                  esc(text.slice(0, 700))
-                ].filter(Boolean).join("\n")
-              );
-            }
-          } catch {}
-        } else {
-          await sendTG(`ℹ️ Транскрипт получен, но QA не выполнен. ${spoiler}`);
-        }
+          if ((total < ALERT_MIN_TOTAL) || (sent <= ALERT_MIN_SENTIMENT) || (ALERT_IF_ESCALATE && esc)) {
+            const intent = qa?.intent || qa?.meta?.intent || "-";
+            await sendAlert(
+              [
+                "🚨 <b>Алерт по звонку</b>",
+                `• Intent: <b>${intent}</b> · Total: <b>${total}</b> · Sentiment: <b>${sent}</b> ${esc ? "· Escalate: <b>yes</b>" : ""}`,
+                `• Менеджер: <b>${managerTxt}</b> · Длительность: <b>${fmtDuration(durSec)}</b>`,
+                dealUrl ? `• Карта: ${dealUrl}` : null,
+                `• note_id: ${note.note_id}`,
+                "",
+                "<i>Короткий транскрипт:</i>",
+                text.slice(0, 700)
+              ].filter(Boolean).join("\n")
+            );
+          }
+        } catch {}
 
-        // Supabase upsert (расширенная запись)
+        // Supabase upsert
         try {
           await upsertCallQaToSupabase({
-            // ключи
             source_type: "amo_note",
             source_id: String(note.note_id),
-            unique_key: sha256(`${note.note_id}:${tHash}`), // для merge-duplicates
-            // amo
+            unique_key: sha256(`${note.note_id}:${tHash}`),
             amo_entity: note.entity,
             amo_entity_id: note.entity_id,
             note_type: note.note_type || null,
@@ -546,22 +554,18 @@ export async function processAmoCallNotes(perEntityLimit = 100, maxNewToProcessT
             duration_sec: durSec || 0,
             created_at_ts: note.created_at || null,
             created_at_iso: new Date(createdMs).toISOString(),
-            // manager / routing
             manager_name: managerTxt,
-            intent: qa?.intent || qa?.meta?.intent || null,       // sales|support
+            intent: qa?.intent || qa?.meta?.intent || null,
             stage: qa?.meta?.stage || null,
             outcome: qa?.meta?.outcome || null,
-            // psycho (унификация разных версий)
-            customer_sentiment: qa?.psycho_emotional?.customer_sentiment ?? qa?.psycho?.customer_sentiment ?? null,
-            manager_tone: qa?.psycho_emotional?.manager_tone ?? qa?.psycho?.manager_tone ?? null,
-            empathy: qa?.psycho_emotional?.manager_empathy ?? qa?.psycho?.empathy ?? null,
-            tension: qa?.psycho_emotional?.tension ?? qa?.psycho?.tension ?? null,
-            escalate_flag: qa?.psycho_emotional?.escalate_flag ?? qa?.psycho?.escalate_flag ?? null,
-            // kpi/score
+            customer_sentiment: qa?.psycho_emotional?.customer_sentiment ?? null,
+            manager_tone: qa?.psycho_emotional?.manager_tone ?? null,
+            empathy: qa?.psycho_emotional?.manager_empathy ?? null,
+            tension: qa?.psycho?.tension ?? null,
+            escalate_flag: qa?.psycho?.escalate_flag ?? qa?.psycho_emotional?.escalate_flag ?? null,
             talk_ratio_manager: qa?.kpis?.estimated_talk_ratio_manager_percent ?? null,
             score_total: qa?.score?.total ?? null,
             score_per_dimension: qa?.score?.per_dimension || null,
-            // text/json
             transcript: text,
             transcript_hash: tHash,
             qa_json: qa

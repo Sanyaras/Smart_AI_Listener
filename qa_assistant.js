@@ -1,15 +1,16 @@
-// qa_assistant.js (v4.1-IRAZBIL) — JSON-only QA per iRazbil rubric
+// qa_assistant.js (v4.1-IRAZBIL-ru) — JSON-only QA per iRazbil rubric
 // - Строгий фиксированный JSON (roles + anchors + consistency rules)
 // - Детерминизм (temperature=0)
 // - Ретраи запроса к OpenAI с таймаутом
 // - Нормализация баллов (0..10) и корректный total (учёт intent и N/A для value)
+// - Полностью русскоязычный рендер в Telegram + авто-перевод кратких англ. описаний в понятные ярлыки
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const CALL_QA_MODEL  = process.env.CALL_QA_MODEL  || "gpt-4.1-mini"; // можно переопределить через ENV
+const CALL_QA_MODEL  = process.env.CALL_QA_MODEL  || "gpt-4.1-mini";
 
 const MAX_TXT = 16000;
-const OPENAI_TIMEOUT_MS = parseInt(process.env.CALL_QA_TIMEOUT_MS || "60000", 10);
-const OPENAI_MAX_RETRIES = parseInt(process.env.CALL_QA_RETRIES || "2", 10);
+const OPENAI_TIMEOUT_MS  = parseInt(process.env.CALL_QA_TIMEOUT_MS || "60000", 10);
+const OPENAI_MAX_RETRIES = parseInt(process.env.CALL_QA_RETRIES    || "2", 10);
 
 /**
  * Анализ транскрипта по фиксированной JSON-схеме.
@@ -173,7 +174,7 @@ User: Пример:
       { role: "system", content: system },
       { role: "user", content: user }
     ],
-    temperature: 0.0, // важно: детерминированность
+    temperature: 0.0,
     response_format: { type: "json_object" }
   };
 
@@ -188,52 +189,57 @@ User: Пример:
     throw new Error("assistant returned non-JSON (schema violation)");
   }
 
-  // Базовая валидация и нормализация (включая корректный total)
   ensureSchemaShape(parsed);
   normalizeScoresAndTotal(parsed);
-
-  // Санитизация цитат, чтобы speaker ∈ {"manager","customer","ivr"}
   sanitizeQuotes(parsed);
 
   return parsed;
 }
 
 /**
- * Телеграм-рендер под новую схему.
- * Ничего лишнего, только компактная сводка для оперативного контроля.
+ * Телеграм-рендер (полностью по-русски).
+ * Сохраняем компактность + авто-перевод кратких англ. ярлыков (если вдруг в JSON попали).
  */
 export function formatQaForTelegram(qa) {
   const s = safe(qa);
+
   const sc = s.score || {};
   const pe = s.psycho_emotional || {};
   const tech = s.techniques || {};
   const quotes = Array.isArray(s.quotes) ? s.quotes.slice(0, 3) : [];
 
+  const intentRu = toRuIntent(s.intent);
+  const peCustomer = ruify(pe.customer_sentiment || "unknown");
+  const peTone     = ruify(pe.manager_tone || "unknown");
+  const peEmp      = ruify(pe.manager_empathy || "unknown");
+  const peStress   = ruify(pe.stress_level || "unknown");
+
   const lines = [
     "📊 <b>Аналитика звонка (iRazbil v4.1)</b>",
-    `• Intent: <b>${esc(s.intent || "-")}</b> · Total: <b>${num(sc.total)}</b>`,
+    `• Тип: <b>${esc(intentRu)}</b> · Итоговый балл: <b>${num(sc.total)}</b>/100`,
     "",
     "🧠 <b>Психо-эмоциональный фон</b>",
-    `• Клиент: <i>${esc(pe.customer_sentiment || "unknown")}</i>`,
-    `• Менеджер: <i>${esc(pe.manager_tone || "unknown")}</i> · Эмпатия: <i>${esc(pe.manager_empathy || "unknown")}</i> · Стресс: <i>${esc(pe.stress_level || "unknown")}</i>`,
+    `• Клиент: <i>${esc(peCustomer)}</i>`,
+    `• Менеджер: <i>${esc(peTone)}</i> · Эмпатия: <i>${esc(peEmp)}</i> · Уровень стресса: <i>${esc(peStress)}</i>`,
     "",
-    "🧩 <b>Техники (оценки)</b>",
-    `• Greeting: <code>${num(sc.greeting)}</code> · Rapport: <code>${num(sc.rapport)}</code> · Needs: <code>${num(sc.needs)}</code> · Value: <code>${num(sc.value)}</code>`,
-    `• Obj: <code>${num(sc.objection_handling)}</code> · Next: <code>${num(sc.next_step)}</code> · Closing: <code>${num(sc.closing)}</code>`,
-    `• Clarity: <code>${num(sc.clarity)}</code> · Compliance: <code>${num(sc.compliance)}</code>`,
+    "🧩 <b>Техники (оценки 0–10)</b>",
+    `• Приветствие: <code>${num(sc.greeting)}</code> · Раппорт: <code>${num(sc.rapport)}</code> · Потребности: <code>${num(sc.needs)}</code> · Ценность: <code>${num(sc.value)}</code>`,
+    `• Возражения: <code>${num(sc.objection_handling)}</code> · Следующий шаг: <code>${num(sc.next_step)}</code> · Завершение: <code>${num(sc.closing)}</code>`,
+    `• Ясность: <code>${num(sc.clarity)}</code> · Комплаенс: <code>${num(sc.compliance)}</code>`,
     "",
     "🧩 <b>Техники (статус)</b>",
-    `• greeting: ${esc(tech.greeting || "-")}`,
-    `• needs: ${esc(tech.needs || "-")}`,
-    `• value: ${esc(tech.value || "-")}`,
-    `• objections: ${esc(tech.objection_handling || "-")}`,
-    `• next_step: ${esc(tech.next_step || "-")}`,
-    `• closing: ${esc(tech.closing || "-")}`,
-    `• clarity: ${esc(tech.clarity || "-")}`,
-    `• compliance: ${esc(tech.compliance || "-")}`,
+    `• Приветствие: ${esc(ruify(tech.greeting || "-"))}`,
+    `• Раппорт: ${esc(ruify(tech.rapport || "-"))}`,
+    `• Потребности: ${esc(ruify(tech.needs || "-"))}`,
+    `• Ценность: ${esc(ruify(tech.value || "-"))}`,
+    `• Возражения: ${esc(ruify(tech.objection_handling || "-"))}`,
+    `• Следующий шаг: ${esc(ruify(tech.next_step || "-"))}`,
+    `• Завершение: ${esc(ruify(tech.closing || "-"))}`,
+    `• Ясность: ${esc(ruify(tech.clarity || "-"))}`,
+    `• Комплаенс: ${esc(ruify(tech.compliance || "-"))}`,
     "",
     quotes.length ? "💬 <b>Цитаты</b>" : null,
-    ...quotes.map(q => `• <b>${esc(q.speaker || "?")}:</b> “${esc(q.quote || "")}”`),
+    ...quotes.map(q => `• <b>${roleRu(q.speaker || "?")}:</b> “${esc(q.quote || "")}”`),
     "",
     s.summary ? `📝 <b>Итог</b>: ${esc(s.summary)}` : null,
     Array.isArray(s.action_items) && s.action_items.length
@@ -278,7 +284,6 @@ async function callOpenAIChatWithRetry(payload, retries, timeoutMs) {
     } catch (e) {
       clearTimeout(to);
       lastError = e;
-      // небольшой экспоненциальный бэкоф
       if (attempt < retries) {
         const backoff = 300 * Math.pow(2, attempt);
         await sleep(backoff);
@@ -294,16 +299,11 @@ function safe(x) { return (x && typeof x === "object") ? x : {}; }
 function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 function num(n) { return (typeof n === "number" && Number.isFinite(n)) ? n : "-"; }
 
-function clamp01(n) { return Math.max(0, Math.min(1, n)); }
 function clamp10(n) {
   const v = Number.isFinite(+n) ? +n : 0;
   return Math.max(0, Math.min(10, v));
 }
 
-/**
- * Мягкая проверка структуры результата (не ломаем ран).
- * Если чего-то не хватает — добиваем дефолтами, чтобы Telegram-рендер не падал.
- */
 function ensureSchemaShape(obj) {
   obj.intent ??= "unknown";
   obj.score ??= {};
@@ -342,9 +342,8 @@ function ensureSchemaShape(obj) {
 }
 
 /**
- * Нормализация числовых баллов (0..10), корректный total:
- * - Если intent="support" ИЛИ techniques.value содержит "N/A"/"не применимо", метрика value исключается из знаменателя.
- * - Total = (сумма применимых метрик / (10 * кол-во применимых)) * 100, округление до целого.
+ * Нормализация баллов и корректный total.
+ * Если intent="support" ИЛИ techniques.value содержит "N/A"/"не применимо", value исключается из знаменателя.
  */
 function normalizeScoresAndTotal(obj) {
   const sc = obj.score || {};
@@ -361,7 +360,6 @@ function normalizeScoresAndTotal(obj) {
   sc.clarity   = clamp10(sc.clarity);
   sc.compliance = clamp10(sc.compliance);
 
-  // определяем применимость value
   const valueText = (tech.value || "").toLowerCase();
   const valueNA = intent === "support" || valueText.includes("n/a") || valueText.includes("не применимо");
 
@@ -369,8 +367,7 @@ function normalizeScoresAndTotal(obj) {
     ["greeting", sc.greeting],
     ["rapport", sc.rapport],
     ["needs", sc.needs],
-    // value — условно включаем
-    ["value", sc.value, valueNA],
+    ["value", sc.value, valueNA], // условно
     ["objection_handling", sc.objection_handling],
     ["next_step", sc.next_step],
     ["closing", sc.closing],
@@ -390,19 +387,81 @@ function normalizeScoresAndTotal(obj) {
 }
 
 /**
- * Санитизация цитат: speaker ∈ {"manager","customer","ivr"}, quote — строка
+ * Санитизация цитат: speaker ∈ {"manager","customer","ivr"}, quote — строка.
  */
 function sanitizeQuotes(obj) {
   if (!Array.isArray(obj.quotes)) { obj.quotes = []; return; }
   const mapRole = (r) => {
     const s = String(r || "").toLowerCase();
-    if (s.includes("manager")) return "manager";
-    if (s.includes("customer") || s.includes("client")) return "customer";
-    if (s.includes("ivr") || s.includes("auto")) return "ivr";
-    return "customer"; // безопасный фолбэк
+    if (s.includes("manager") || s.includes("менедж")) return "manager";
+    if (s.includes("customer") || s.includes("client") || s.includes("клиент")) return "customer";
+    if (s.includes("ivr") || s.includes("auto") || s.includes("авто")) return "ivr";
+    return "customer";
   };
   obj.quotes = obj.quotes
     .map(q => ({ speaker: mapRole(q?.speaker), quote: String(q?.quote || "").trim() }))
     .filter(q => q.quote.length > 0)
     .slice(0, 5);
+}
+
+// -------------- локализация для рендера --------------
+function toRuIntent(intent) {
+  const s = String(intent || "").toLowerCase();
+  if (s === "sales") return "продажа";
+  if (s === "support") return "поддержка/ремонт";
+  if (s === "ivr") return "IVR/меню";
+  if (s === "noise") return "шум/неразборчиво";
+  return s || "unknown";
+}
+
+function roleRu(speaker) {
+  const s = String(speaker || "").toLowerCase();
+  if (s.includes("manager")) return "менеджер";
+  if (s.includes("customer")) return "клиент";
+  if (s.includes("ivr")) return "автоинформатор";
+  return "говорящий";
+}
+
+/**
+ * Простой «русификатор» коротких англ. ярлыков и типичных формулировок.
+ * Не переводим длинные фразы целиком — только частые теги/короткие статусы.
+ */
+function ruify(text) {
+  const s = String(text || "").trim();
+
+  // Нормализация статусов техник
+  const map = [
+    [/^done\s*well$/i, "хорошо выполнено"],
+    [/^partially$/i, "частично выполнено"],
+    [/^missed$/i, "пропущено"],
+    [/^n\/?a$/i, "не применимо"],
+
+    // Частые тона/настроения
+    [/^polite$/i, "вежливый"],
+    [/^calm$/i, "спокойный"],
+    [/^professional$/i, "профессиональный"],
+    [/^impatient/i, "нетерпеливый"],
+    [/^frustrat/i, "раздражение/фрустрация"],
+    [/^neutral$/i, "нейтральный"],
+    [/^negative$/i, "негативный"],
+    [/^positive$/i, "позитивный"],
+    [/^low$/i, "низкий"],
+    [/^moderate$/i, "умеренный"],
+    [/^high$/i, "высокий"],
+  ];
+
+  for (const [re, rep] of map) {
+    if (re.test(s)) return rep;
+  }
+
+  // Частые короткие фразы (heurstics)
+  const lower = s.toLowerCase();
+  if (lower.includes("impatient") && lower.includes("polite")) {
+    return "нетерпеливый, но вежливый";
+  }
+  if (lower.includes("calm") && lower.includes("professional")) {
+    return "спокойный, профессиональный";
+  }
+
+  return s; // если ничего не сопоставили — оставим как есть (может быть русское описание)
 }

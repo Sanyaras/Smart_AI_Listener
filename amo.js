@@ -1,13 +1,11 @@
-// amo.js — AmoCRM интеграция + надёжный поллер (v3.6.0-IRAZBIL)
-// • Хвостовой скан с бинарным поиском последней страницы
-// • Перекрытие по времени (AMO_CURSOR_OVERLAP_MIN минут) + healing, если курсор «убежал» вперёд
-// • Курсоры по created_at (unix sec), upsert в Supabase
-// • Поиск ссылок на запись (params.link, params.link.href и любые http в текстах/параметрах) + эвристики
-// • Ретраи при сетевых ошибках (ENOTFOUND/ETIMEDOUT/5xx/429)
-// • Возможность принудительного бэкфилла от произвольной даты: options = { force:true, since: <unix_sec> }
+// amo.js — AmoCRM интеграция + надёжный поллер
+// v3.4-IRAZBIL (passport upsert + suppress_alert + tokens-from-store)
+//
+// Совместимо с index.js v2.6.x-IRAZBIL
+// Экспортирует: processAmoCallNotes, amoFetch, amoRefresh, getAmoTokensMask, injectAmoTokens
 
 import crypto from "crypto";
-import { fetchWithTimeout, mask } from "./utils.js";
+import { fetchWithTimeout, mask, cap } from "./utils.js";
 import { sendTG, tgRelayAudio } from "./telegram.js";
 import { enqueueAsr, transcribeAudioFromUrl } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
@@ -34,7 +32,7 @@ const AMO_DEBUG_DUMP     = (process.env.AMO_DEBUG_DUMP || "1") === "1";
 
 // Alerts — отдельный Telegram чат
 const TELEGRAM_ALERT_CHAT_ID = process.env.TELEGRAM_ALERT_CHAT_ID || "";
-const TELEGRAM_BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN || "";
+const TELEGRAM_BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN || "";
 const ALERT_MIN_TOTAL        = parseInt(process.env.ALERT_MIN_TOTAL || "60", 10);
 const ALERT_MIN_SENTIMENT    = parseInt(process.env.ALERT_MIN_SENTIMENT || "-2", 10);
 const ALERT_IF_ESCALATE      = (process.env.ALERT_IF_ESCALATE || "1") === "1";
@@ -45,8 +43,8 @@ const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPA
 const SUPABASE_TABLE = process.env.SUPABASE_CALLS_QA_TABLE || "calls_qa";
 
 // --- safety scan window / healing ---
-const CURSOR_OVERLAP_MIN = parseInt(process.env.AMO_CURSOR_OVERLAP_MIN || "180", 10); // мин.
-const BACKFILL_MAX_HOURS = parseInt(process.env.AMO_BACKFILL_MAX_HOURS || "72", 10);  // часов назад
+const CURSOR_OVERLAP_MIN = parseInt(process.env.AMO_CURSOR_OVERLAP_MIN || "180", 10); // 3h overlap
+const BACKFILL_MAX_HOURS = parseInt(process.env.AMO_BACKFILL_MAX_HOURS || "72", 10);  // heal up to 72h
 
 // ==================== Tokens & Secrets ====================
 import {
@@ -64,10 +62,11 @@ let TOKENS_LOADED_ONCE = false;
 async function loadTokensFromStoreIfNeeded() {
   if (TOKENS_LOADED_ONCE) return;
   try {
-    let acc = (await getSecret(SECRET_KEY_ACCESS)) || (await getSecret("AMO_ACCESS_TOKEN")) || AMO_ACCESS_TOKEN;
-    let ref = (await getSecret(SECRET_KEY_REFRESH)) || (await getSecret("AMO_REFRESH_TOKEN")) || AMO_REFRESH_TOKEN;
-    if (acc) AMO_ACCESS_TOKEN = acc;
-    if (ref) AMO_REFRESH_TOKEN = ref;
+    // приоритет: явные ключи → бэкапные имена
+    const acc = (await getSecret(SECRET_KEY_ACCESS)) || (await getSecret("AMO_ACCESS_TOKEN")) || "";
+    const ref = (await getSecret(SECRET_KEY_REFRESH)) || (await getSecret("AMO_REFRESH_TOKEN")) || "";
+    if (!AMO_ACCESS_TOKEN && acc)  AMO_ACCESS_TOKEN  = acc;
+    if (!AMO_REFRESH_TOKEN && ref) AMO_REFRESH_TOKEN = ref;
   } catch {}
   TOKENS_LOADED_ONCE = true;
 }
@@ -137,29 +136,13 @@ export async function amoExchangeCode() {
   return j;
 }
 
-// --- low-level fetch with retry/backoff ---
-async function doFetchWithRetry(url, opts, ms, attempt = 0) {
-  try {
-    return await fetchWithTimeout(url, opts, ms);
-  } catch (e) {
-    const retriable =
-      e?.code === "ENOTFOUND" || e?.code === "ETIMEDOUT" || e?.name === "AbortError" || /network/i.test(String(e));
-    if (retriable && attempt < 3) {
-      const backoff = Math.min(8000, 1000 * Math.pow(2, attempt));
-      await new Promise(r => setTimeout(r, backoff));
-      return doFetchWithRetry(url, opts, ms, attempt + 1);
-    }
-    throw e;
-  }
-}
-
 export async function amoFetch(path, opts = {}, ms = 15000) {
   ensureAmoEnv();
   await loadTokensFromStoreIfNeeded();
-  if (!AMO_ACCESS_TOKEN) throw new Error("No AMO_ACCESS_TOKEN — авторизуйтесь на /amo/oauth/start");
+  if (!AMO_ACCESS_TOKEN) throw new Error("No AMO_ACCESS_TOKEN — авторизуйся на /amo/oauth/start");
 
   const url = `${AMO_BASE_URL}${path}`;
-  const doFetch = (token) => doFetchWithRetry(url, {
+  const doFetch = (token) => fetchWithTimeout(url, {
     ...opts,
     headers: { "authorization": `Bearer ${token}`, "content-type":"application/json", ...(opts.headers||{}) }
   }, ms);
@@ -174,11 +157,6 @@ export async function amoFetch(path, opts = {}, ms = 15000) {
     r = await doFetch(AMO_ACCESS_TOKEN);
   }
   if (r.status === 204) return { _embedded: { notes: [] } };
-  if (r.status === 429 || (r.status >= 500 && r.status < 600)) {
-    // soft retry handled above by doFetchWithRetry, but here we can throw with message
-    const t = await r.text().catch(()=> "");
-    throw new Error(`amo ${path} ${r.status}: ${t}`);
-  }
   if (!r.ok) {
     const t = await r.text().catch(()=> "");
     throw new Error(`amo ${path} ${r.status}: ${t}`);
@@ -309,9 +287,9 @@ function findRecordingLinksInNote(note) {
     "mango-office.ru","mangotele.com","uiscom.ru","uiscom.net",
     "sipuni.com","binotel.ua","zadarma.com","zaddarma.com",
     "yandexcloud.net","storage.yandexcloud.net","s3.amazonaws.com","amazonaws.com",
-    "voximplant.com","voximplant.net","ringcentral.com","cloudfront.net","backblazeb2.com","digitaloceanspaces.com"
+    "voximplant.com","voximplant.net","ringcentral.com","cloudfront.net","backblazeb2.com"
   ];
-  const pushFromText = (txt) => { if (!txt) return; const m = String(txt).matchAll(urlRe); for (const mm of m) urls.add(mm[0]); };
+  const pushFromText = (txt) => { if (!txt) return; const m = String(txt).match(urlRe); if (m) m.forEach(u => urls.add(u)); };
   const collectFromObj = (obj) => {
     if (!obj || typeof obj !== "object") return;
     for (const [, v] of Object.entries(obj)) {
@@ -322,25 +300,25 @@ function findRecordingLinksInNote(note) {
   };
   if (note?.text)  pushFromText(note.text);
   if (note?.params) collectFromObj(note.params);
-  if (note?.params?.link && typeof note.params.link === 'string' && /^https?:\/\//i.test(note.params.link)) urls.add(note.params.link);
-  if (note?.params?.link?.href && typeof note.params.link.href === 'string' && /^https?:\/\//i.test(note.params.link.href)) urls.add(note.params.link.href);
+  if (note?.params?.link && typeof note.params.link === 'string' && note.params.link.startsWith('http')) urls.add(note.params.link);
+  if (note?.params?.link?.href && typeof note.params.link.href === 'string' && note.params.link.href.startsWith('http')) urls.add(note.params.link.href);
 
   const candidates = Array.from(urls);
-  const filtered = [];
-  for (const u of candidates) {
-    if (/\.(mp3|wav|ogg|m4a|opus|webm|aac)(\?|$)/i.test(u)) { filtered.push(u); continue; }
-    if (/\.(svg|png|jpg|jpeg|gif|webp|mp4|mov|mkv|avi)(\?|$)/i.test(u)) continue;
-    if (/(record|recording|audio|call|voice|download|file|storage|rec|voip)/i.test(u)) { filtered.push(u); continue; }
+  const filtered = candidates.filter(u => {
+    if (/\.(mp3|wav|ogg|m4a|opus|webm|aac)(\?|$)/i.test(u)) return true;
+    if (/\.(svg|png|jpg|jpeg|gif|webp|mp4|mov|mkv|avi)(\?|$)/i.test(u)) return false;
+    if (/(record|recording|audio|call|voice|download|file|storage|rec|voip)/i.test(u)) return true;
     try {
       const host = new URL(u).hostname.toLowerCase().replace(/^www\./,'');
-      if (TELEPHONY_HOSTS.some(h => host.endsWith(h)) || /pbx|sip|voip|call|tele/i.test(host)) { filtered.push(u); continue; }
+      if (TELEPHONY_HOSTS.some(h => host.endsWith(h)) || /pbx|sip|voip|call|tele/i.test(host)) return true;
     } catch {}
-  }
+    return false;
+  });
 
   const durSec = parseInt(note?.params?.duration || 0, 10) || 0;
   if (durSec > 0) {
-    const more = candidates.filter(u => !/\.(svg|png|jpg|jpeg|gif|webp)(\?|$)/i.test(u));
-    for (const u of more) filtered.push(u);
+    const more = candidates.filter(u => !/\.(svg|png|jpg|jpeg|gif|webp)/i.test(u));
+    more.forEach(u => filtered.push(u));
   }
   return Array.from(new Set(filtered));
 }
@@ -405,25 +383,26 @@ async function upsertCallQaToSupabase(row){
   }
 }
 
-// ==================== Main ====================
-export async function processAmoCallNotes(limit = 100, bootstrapRemaining = 0, options = {}) {
-  // Backward-compat: if options passed as number (maxNewToProcessThisTick), normalize
-  if (typeof options === "number") options = { maxNew: options };
-  const perEntityLimit = Math.min(parseInt(limit,10)||100, 300);
-  const maxPagesBack   = 8;
+// ==================== Main Poller (совместим с index.js) ====================
+// signature: processAmoCallNotes(limit, bootstrapRemaining, options)
+// options: { force?: boolean, sinceEpochSec?: number|null, bootstrapLimit?: number|null }
+let _zeroScansStreak = 0;
 
+export async function processAmoCallNotes(limit = 30, bootstrapRemaining = 0, options = {}) {
+  const { force = false, sinceEpochSec = null, bootstrapLimit = null } = options || {};
+
+  const perEntityLimit = Math.min(limit, 200);
+  const maxPagesBack = 8; // сколько страниц назад смотреть «хвост»
   const [leadCursor, contactCursor, companyCursor] = await Promise.all([ getCursor("lead"), getCursor("contact"), getCursor("company") ]);
 
-  // if force+since provided, override cursors virtually
-  const since = Number.isFinite(options.since) ? parseInt(options.since,10) : 0;
-  const sinceLead    = options.force && since ? since : leadCursor;
-  const sinceContact = options.force && since ? since : contactCursor;
-  const sinceCompany = options.force && since ? since : companyCursor;
+  const scanSinceLead    = force && sinceEpochSec ? sinceEpochSec : leadCursor;
+  const scanSinceContact = force && sinceEpochSec ? sinceEpochSec : contactCursor;
+  const scanSinceCompany = force && sinceEpochSec ? sinceEpochSec : companyCursor;
 
   const [leadNotesRaw, contactNotesRaw, companyNotesRaw] = await Promise.all([
-    fetchNotesSinceCursor("lead",    "/api/v4/leads/notes",     perEntityLimit, maxPagesBack, sinceLead),
-    fetchNotesSinceCursor("contact", "/api/v4/contacts/notes",  perEntityLimit, maxPagesBack, sinceContact),
-    fetchNotesSinceCursor("company", "/api/v4/companies/notes", perEntityLimit, maxPagesBack, sinceCompany),
+    fetchNotesSinceCursor("lead",    "/api/v4/leads/notes",     perEntityLimit, maxPagesBack, scanSinceLead),
+    fetchNotesSinceCursor("contact", "/api/v4/contacts/notes",  perEntityLimit, maxPagesBack, scanSinceContact),
+    fetchNotesSinceCursor("company", "/api/v4/companies/notes", perEntityLimit, maxPagesBack, scanSinceCompany),
   ]);
 
   const filterSpam = (arr) => arr.filter(isLikelyCallNote);
@@ -431,6 +410,7 @@ export async function processAmoCallNotes(limit = 100, bootstrapRemaining = 0, o
   const contactNotes = filterSpam(contactNotesRaw);
   const companyNotes = filterSpam(companyNotesRaw);
 
+  // Сводим в один массив
   const picked = [];
   const pack = (entity, items) => {
     for (const n of items) {
@@ -445,54 +425,82 @@ export async function processAmoCallNotes(limit = 100, bootstrapRemaining = 0, o
       });
     }
   };
-  pack("lead",    leadNotes);
+  pack("lead", leadNotes);
   pack("contact", contactNotes);
   pack("company", companyNotes);
   picked.sort((a,b) => (b.created_at||0) - (a.created_at||0));
 
-  const now = Date.now();
-  let started = 0, skipped = 0, withLinks = 0, ignored = 0, seenOnly = 0;
+  const out = {
+    scanned: picked.length,
+    withLinks: 0,
+    started: 0,
+    skipped: 0,
+    ignored: 0,
+    seenOnly: 0,
+    cursors: {
+      lead_prev: leadCursor, contact_prev: contactCursor, company_prev: companyCursor,
+      lead_next: leadCursor, contact_next: contactCursor, company_next: companyCursor
+    }
+  };
 
+  if (out.scanned === 0) _zeroScansStreak++; else _zeroScansStreak = 0;
+
+  // авто-перепроверка, если несколько пустых сканов подряд
+  if (out.scanned === 0 && _zeroScansStreak >= 3 && !force) {
+    const yesterday = Math.floor((Date.now() - 24*3600*1000) / 1000);
+    await sendTG("🛠 Автоперепроверка Amo: скан пуст 3 раза подряд — делаю форс-скан со вчерашней даты.");
+    return await processAmoCallNotes(limit, bootstrapRemaining, {
+      force: true,
+      sinceEpochSec: yesterday,
+      bootstrapLimit: Math.max(200, limit),
+    });
+  }
+
+  const now = Date.now();
   let maxLeadCA = leadCursor, maxContactCA = contactCursor, maxCompanyCA = companyCursor;
 
-  for (const note of picked) {
+  const takeMax = Math.min(bootstrapLimit || picked.length, 500);
+  for (const note of picked.slice(0, takeMax)) {
     const source_type = "amo_note";
-    const source_id = String(note.note_id);
-
-    const already = await isAlreadyProcessed(source_type, source_id);
-    if (already && !options.force) { skipped++; continue; }
+    const source_id   = String(note.note_id);
 
     const createdMs = (note.created_at || 0) * 1000;
-    if (IGNORE_MS > 0 && (now - createdMs) > IGNORE_MS) {
-      await markSeenOnly(source_type, source_id, "");
-      ignored++; continue;
+    if (IGNORE_MS > 0 && (now - createdMs) > IGNORE_MS && !force) {
+      await markSeenOnly(source_type, source_id, "too_old");
+      out.ignored++;
+      continue;
     }
-    if (options.maxNew && started >= options.maxNew) break;
 
+    const already = await isAlreadyProcessed(source_type, source_id).catch(()=>false);
+    if (already && !force) { out.skipped++; continue; }
+
+    // Ссылки на запись звонка
     const links = findRecordingLinksInNote(note);
     if (!links.length) {
-      if (AMO_DEBUG_CHECK()) {
+      if (AMO_DEBUG_DUMP) {
         const paramsKeys = Object.keys(note.params||{});
-        const preview = (note.text || "").slice(0, 300);
+        const previewText = note.text ? mask(String(note.text)).slice(0, 700) : "—";
         await sendTG(
           [
             "🧪 <b>AMO DEBUG</b> — запись не найдена, дамп полей",
             `🔹 note_id: <code>${note.note_id}</code> • entity: <code>${note.entity}</code> • entity_id: <code>${note.entity_id}</code>`,
             `🔹 note_type: <code>${note.note_type || "—"}</code> • created_at: <code>${note.created_at || 0}</code>`,
             `🔹 params.keys: <code>${paramsKeys.join(", ") || "—"}</code>`,
-            preview ? `📝 text: <code>${preview}</code>` : null
-          ].filter(Boolean).join("\n")
+            `📝 text: <code>${previewText}</code>`
+          ].join("\n")
         );
       }
       await markSeenOnly(source_type, source_id, "no_links");
-      seenOnly++;
+      out.seenOnly++;
       const ca = note.created_at || 0;
       if (note.entity === "lead")    { if (ca > maxLeadCA)    maxLeadCA = ca; }
       if (note.entity === "contact") { if (ca > maxContactCA) maxContactCA = ca; }
       if (note.entity === "company") { if (ca > maxCompanyCA) maxCompanyCA = ca; }
-      skipped++; continue;
+      out.skipped++;
+      continue;
     }
-    withLinks++;
+
+    out.withLinks++;
 
     // Ответственный / карточка
     const respInfo   = await amoGetResponsible(note.entity, note.entity_id);
@@ -505,7 +513,7 @@ export async function processAmoCallNotes(limit = 100, bootstrapRemaining = 0, o
     const dealUrl  = entityCardUrl(note.entity, note.entity_id);
     const createdH = humanDate(createdMs);
 
-    // пред-репорт
+    // Пред-репорт
     await sendTG(
       [
         "🎧 <b>Новый звонок из Amo</b>",
@@ -521,20 +529,28 @@ export async function processAmoCallNotes(limit = 100, bootstrapRemaining = 0, o
       ].filter(Boolean).join("\n")
     );
 
-    for (const origUrl of links) {
-      let relayCdnUrl = origUrl;
-      try { relayCdnUrl = await tgRelayAudio(origUrl, `🎧 Аудио (${note.note_type}) • ${managerTxt}`); } catch {
-        if (RELAY_BASE_URL && /^https?:\/\//i.test(origUrl)) {
-          try { relayCdnUrl = `${RELAY_BASE_URL}${encodeURIComponent(origUrl)}`; } catch {}
+    // Обработка одной (первой) валидной ссылки
+    const origUrl = links[0];
+    let relayCdnUrl = origUrl;
+    try { relayCdnUrl = await tgRelayAudio(origUrl, `🎧 Аудио (${note.note_type}) • ${managerTxt}`); } catch {
+      // локальный fallback — если Telegram-релей недоступен
+      try {
+        const u = new URL(origUrl);
+        if (RELAY_BASE_URL && !String(origUrl).startsWith(RELAY_BASE_URL)) {
+          relayCdnUrl = RELAY_BASE_URL + encodeURIComponent(origUrl);
         }
-      }
+      } catch {}
+    }
 
-      const text = await enqueueAsr(() =>
-        transcribeAudioFromUrl(relayCdnUrl, { callId: `amo-${note.note_id}` })
-      );
-      const tHash = text ? sha256(text) : "";
+    // Дедуп до тяжёлых операций
+    await markProcessed(source_type, source_id, origUrl).catch(()=>{});
 
-      if (text) {
+    await enqueueAsr(async () => {
+      try {
+        const text = await transcribeAudioFromUrl(relayCdnUrl, { callId: `amo-${note.note_id}`, fileName: "call.mp3" });
+        if (!text) { await sendTG(`❗️ ASR пусто по note ${note.note_id} (<code>${cap(relayCdnUrl, 120)}</code>)`); return; }
+
+        const tHash = sha256(text);
         const qa = await analyzeTranscript(text, {
           callId: `amo-${note.note_id}`,
           brand: "iRazbil",
@@ -543,26 +559,31 @@ export async function processAmoCallNotes(limit = 100, bootstrapRemaining = 0, o
           amo_entity_id: note.entity_id,
           created_at: note.created_at || null,
           phone: phone || null,
-          duration_sec: durSec || 0
+          duration_sec: durSec || 0,
+          note_type: note.note_type || ""
         });
 
-        const short = text.slice(0, 1600);
-        const spoiler = tgSpoiler(short);
         const qaCard = formatQaForTelegram(qa);
+        const spoiler = tgSpoiler(text.slice(0, 1600));
         await sendTG(`${qaCard}\n\n<b>Транскрипт (свернуть):</b>\n${spoiler}`);
 
-        // Alerts
+        // Alerts — с учётом suppress_alert
         try {
-          const total = qa?.score?.total ?? 0;
-          const sent  = (() => {
-            const pe = qa?.psycho_emotional;
-            if (typeof pe?.customer_sentiment === "number") return pe.customer_sentiment;
-            return 0;
-          })();
-          const esc   = !!(qa?.psycho?.escalate_flag || qa?.psycho_emotional?.escalate_flag);
+          const suppress = !!qa?.passport?.suppress_alert;
+          const total = qa?.score?.total ?? null;
+          const pe    = qa?.psycho_emotional || {};
+          const sent  = typeof pe.customer_sentiment === "number" ? pe.customer_sentiment : 0;
+          const esc   = !!pe.escalate_flag;
 
-          if ((total < ALERT_MIN_TOTAL) || (sent <= ALERT_MIN_SENTIMENT) || (ALERT_IF_ESCALATE && esc)) {
-            const intent = qa?.intent || qa?.meta?.intent || "-";
+          const shouldAlert =
+            !suppress && (
+              (typeof total === "number" && total < ALERT_MIN_TOTAL) ||
+              (sent <= ALERT_MIN_SENTIMENT) ||
+              (ALERT_IF_ESCALATE && esc)
+            );
+
+          if (shouldAlert) {
+            const intent = qa?.intent || "-";
             await sendAlert(
               [
                 "🚨 <b>Алерт по звонку</b>",
@@ -572,17 +593,19 @@ export async function processAmoCallNotes(limit = 100, bootstrapRemaining = 0, o
                 `• note_id: ${note.note_id}`,
                 "",
                 "<i>Короткий транскрипт:</i>",
-                short
+                text.slice(0, 700)
               ].filter(Boolean).join("\n")
             );
           }
         } catch {}
 
+        // Supabase upsert (+ паспорт пайплайна)
         try {
           await upsertCallQaToSupabase({
             source_type: "amo_note",
             source_id: String(note.note_id),
             unique_key: sha256(`${note.note_id}:${tHash}`),
+
             amo_entity: note.entity,
             amo_entity_id: note.entity_id,
             note_type: note.note_type || null,
@@ -591,58 +614,54 @@ export async function processAmoCallNotes(limit = 100, bootstrapRemaining = 0, o
             created_at_ts: note.created_at || null,
             created_at_iso: new Date(createdMs).toISOString(),
             manager_name: managerTxt,
-            intent: qa?.intent || qa?.meta?.intent || null,
+
+            intent: qa?.intent || null,
             customer_sentiment: qa?.psycho_emotional?.customer_sentiment ?? null,
             manager_tone: qa?.psycho_emotional?.manager_tone ?? null,
             empathy: qa?.psycho_emotional?.manager_empathy ?? null,
-            escalate_flag: qa?.psycho?.escalate_flag ?? qa?.psycho_emotional?.escalate_flag ?? null,
+            escalate_flag: qa?.psycho_emotional?.escalate_flag ?? null,
+
             score_total: qa?.score?.total ?? null,
+            score_per_dimension: qa?.score?.per_dimension || null,
+
             transcript: text,
             transcript_hash: tHash,
-            qa_json: qa
+            qa_json: qa,
+
+            // паспорт пайплайна для трассировки версий
+            qa_model: qa?.passport?.qa_model || null,
+            qa_rubric_version: qa?.passport?.qa_rubric_version || null,
+            alert_rules_version: qa?.passport?.alert_rules_version || null,
+            config_hash: qa?.passport?.config_hash || null,
+            suppress_alert: qa?.passport?.suppress_alert ?? null
           });
         } catch (e) {
           console.warn("upsertCallQaToSupabase error:", e?.message || e);
         }
 
-        started++;
-        await markProcessed(source_type, source_id, origUrl);
-
-        const ca = note.created_at || 0;
-        if (note.entity === "lead")    { if (ca > maxLeadCA)    maxLeadCA = ca; }
-        if (note.entity === "contact") { if (ca > maxContactCA) maxContactCA = ca; }
-        if (note.entity === "company") { if (ca > maxCompanyCA) maxCompanyCA = ca; }
-      } else {
-        await sendTG("⚠️ ASD: не удалось распознать аудио из Amo");
-        await markSeenOnly(source_type, source_id, "asr_fail");
-        skipped++;
+      } catch (e) {
+        await sendTG(`⚠️ Ошибка пайплайна note ${note.note_id}: <code>${(e?.message || e)}</code>`);
       }
-      // обрабатываем только первую валидную ссылку на запись
-      break;
-    }
+    });
+
+    out.started++;
+    const ca = note.created_at || 0;
+    if (note.entity === "lead")    { if (ca > maxLeadCA)    maxLeadCA = ca; }
+    if (note.entity === "contact") { if (ca > maxContactCA) maxContactCA = ca; }
+    if (note.entity === "company") { if (ca > maxCompanyCA) maxCompanyCA = ca; }
   }
 
-  if (started > 0 || seenOnly > 0 || ignored > 0) {
+  // Обновим курсоры, если были изменения
+  if (out.started > 0 || out.seenOnly > 0 || out.ignored > 0) {
     const upd = [];
     if (maxLeadCA    > leadCursor)    upd.push(setCursor("lead",    maxLeadCA));
     if (maxContactCA > contactCursor) upd.push(setCursor("contact", maxContactCA));
     if (maxCompanyCA > companyCursor) upd.push(setCursor("company", maxCompanyCA));
     if (upd.length) await Promise.all(upd);
+    out.cursors.lead_next    = maxLeadCA;
+    out.cursors.contact_next = maxContactCA;
+    out.cursors.company_next = maxCompanyCA;
   }
 
-  return {
-    scanned: picked.length,
-    withLinks,
-    started,
-    skipped,
-    ignored,
-    seenOnly,
-    cursors: {
-      lead_prev: leadCursor,    lead_next: (started>0 || seenOnly>0 || ignored>0) ? maxLeadCA    : leadCursor,
-      contact_prev: contactCursor, contact_next: (started>0 || seenOnly>0 || ignored>0) ? maxContactCA : contactCursor,
-      company_prev: companyCursor, company_next: (started>0 || seenOnly>0 || ignored>0) ? maxCompanyCA : companyCursor
-    }
-  };
+  return out;
 }
-
-function AMO_DEBUG_CHECK(){ return AMO_DEBUG_DUMP; }

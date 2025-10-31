@@ -444,88 +444,164 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
   }
 });
 
-/* -------------------- AUTO POLLER WITH RETRIES -------------------- */
+/* -------------------- AUTO / WATCHDOG / HTTP-SELF -------------------- */
 
-function hoursToSec(h){ return Math.floor((parseFloat(h)||0) * 3600); }
+// ENV
+const AMO_POLL_MINUTES   = parseInt(process.env.AMO_POLL_MINUTES || "10", 10);
+const AMO_POLL_LIMIT     = parseInt(process.env.AMO_POLL_LIMIT   || "200", 10);
+const CRM_SHARED_KEY     = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
 
-function AMOEnvOk() {
-  return Boolean(
-    process.env.AMO_BASE_URL &&
-    process.env.AMO_CLIENT_ID &&
-    process.env.AMO_CLIENT_SECRET &&
-    process.env.AMO_REDIRECT_URI
-  );
-}
+// опционально можно выключить/включить фичи через ENV
+const SELF_HTTP_POLL     = (process.env.SELF_HTTP_POLL || "1") === "1";   // локальный GET на /amo/poll
+const BACKFILL_ENABLED   = (process.env.BACKFILL_ENABLED || "1") === "1"; // периодический soft backfill
+const WATCHDOG_ENABLED   = (process.env.WATCHDOG_ENABLED || "1") === "1"; // форс, если давно тишина
 
-if (AMOEnvOk() && AMO_POLL_MINUTES > 0) {
-  console.log(`⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${AMO_BOOTSTRAP_LIMIT})`);
+let lastTickAt = 0;        // ms
+let lastStartedAt = 0;     // ms (когда реально что-то обработали)
+let lastWithLinksAt = 0;   // ms (когда были withLinks>0)
+let bootstrapRemaining = parseInt(process.env.AMO_BOOTSTRAP_LIMIT || "5", 10); // как и раньше
 
-  let timer = null;
-  let backoffMs = 0;
-  let bootstrapBackfillStarted = false;
+// ручной «мягкий» форс-скан, старт от hours назад
+app.get("/amo/force", async (req, res) => {
+  try {
+    assertKey(req);
+    const hours = Math.max(1, Math.min(parseInt(req.query.hours || "24", 10), 72));
+    const limit = Math.min(parseInt(req.query.limit || "200", 10), 500);
+    const since = Math.floor((Date.now() - hours*3600*1000) / 1000);
 
-  async function tickAmo({ force = false, since = 0 } = {}) {
-    try {
-      const options = {};
-      if (force) options.force = true;
-      if (since) options.since = since;
+    const out = await processAmoCallNotes(limit, bootstrapRemaining, {
+      force: true,
+      sinceEpochSec: since,
+      bootstrapLimit: limit
+    });
 
-      const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining, options);
-      if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
-        bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
-      }
+    // маркеры активности
+    lastTickAt = Date.now();
+    if (out.started > 0) lastStartedAt = Date.now();
+    if (out.withLinks > 0) lastWithLinksAt = Date.now();
 
-      if (out?.started > 0 || out?.withLinks > 0) {
-        await sendTG(
-          [
-            "📡 Amo poll",
-            `• scanned: ${out.scanned}`,
-            `• withLinks: ${out.withLinks}`,
-            `• started: ${out.started}`,
-            `• skipped: ${out.skipped} · seenOnly: ${out.seenOnly} · ignored: ${out.ignored}`,
-            `• cursors: lead ${out.cursors.lead_next} · contact ${out.cursors.contact_next} · company ${out.cursors.company_next}`,
-            `• bootstrapRemaining: ${bootstrapRemaining}`
-          ].join("\n")
-        );
-      }
+    res.json({ ok: true, forced: true, hours, limit, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
 
-      // успех — сбрасываем бэкофф
-      backoffMs = 0;
-    } catch (e) {
-      console.error("[AMO] poll error:", e);
-      try { await sendTG("❗️ [AMO] poll error: " + (e?.message || e)); } catch {}
-      // неуспех — увеличиваем бэкофф
-      backoffMs = Math.min(5 * 60 * 1000, backoffMs ? backoffMs * 2 : 30 * 1000);
-    } finally {
-      scheduleNext();
+// диагностика: покажет последние отметки
+app.get("/amo/diag", (req, res) => {
+  res.json({
+    ok: true,
+    now: new Date().toISOString(),
+    lastTickAt,
+    lastStartedAt,
+    lastWithLinksAt,
+    poll_minutes: AMO_POLL_MINUTES,
+    poll_limit: AMO_POLL_LIMIT,
+    self_http_poll: SELF_HTTP_POLL,
+    backfill_enabled: BACKFILL_ENABLED,
+    watchdog_enabled: WATCHDOG_ENABLED
+  });
+});
+
+async function runTick(kind = "regular") {
+  try {
+    const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining);
+    lastTickAt = Date.now();
+    if (out.started > 0) lastStartedAt = Date.now();
+    if (out.withLinks > 0) lastWithLinksAt = Date.now();
+
+    // немного логов
+    console.log(`[AMO] ${kind} tick -> scanned=${out.scanned} withLinks=${out.withLinks} started=${out.started}`);
+    if (out.started > 0) {
+      try {
+        await sendTG(`📡 AMO ${kind} tick: scanned ${out.scanned}, withLinks ${out.withLinks}, started ${out.started}`);
+      } catch {}
     }
+    return out;
+  } catch (e) {
+    console.error(`[AMO] ${kind} tick error:`, e);
+    try { await sendTG(`❗️ AMO ${kind} tick error: <code>${e?.message || e}</code>`); } catch {}
+    throw e;
   }
-
-  function scheduleNext() {
-    const base = AMO_POLL_MINUTES * 60 * 1000;
-    const jitter = Math.floor(Math.random() * 5000);
-    const due = (backoffMs || base) + jitter;
-    clearTimeout(timer);
-    timer = setTimeout(async () => {
-      // Первый запуск — если задан авто-бэкфилл при старте и ещё не делали
-      if (!bootstrapBackfillStarted && AMO_BOOTSTRAP_BACKFILL_HOURS > 0) {
-        bootstrapBackfillStarted = true;
-        const since = Math.max(0, Math.floor(Date.now()/1000) - hoursToSec(AMO_BOOTSTRAP_BACKFILL_HOURS));
-        await tickAmo({ force: true, since });
-      } else {
-        await tickAmo();
-      }
-    }, due);
-  }
-
-  // первый запуск сразу
-  tickAmo();
-
-} else {
-  console.log("⏸ auto-poll disabled or AMO env incomplete");
 }
 
-/* -------------------- START -------------------- */
-const server = app.listen(PORT, () =>
-  console.log(`Smart AI Listener (${VERSION}) listening on ${PORT}`)
-);
+// self-HTTP тик — имитируем твой ручной клик
+async function runHttpSelfPoll() {
+  const url = `http://127.0.0.1:${PORT}/amo/poll?key=${encodeURIComponent(CRM_SHARED_KEY)}&limit=${AMO_POLL_LIMIT}`;
+  try {
+    const r = await fetch(url);
+    const j = await r.json().catch(()=> ({}));
+    lastTickAt = Date.now();
+    if (j.started > 0) lastStartedAt = Date.now();
+    if (j.withLinks > 0) lastWithLinksAt = Date.now();
+    console.log(`[AMO] self-http tick -> scanned=${j.scanned} withLinks=${j.withLinks} started=${j.started}`);
+    return j;
+  } catch (e) {
+    console.error(`[AMO] self-http tick error:`, e?.message || e);
+  }
+}
+
+function minutes(ms) { return Math.floor(ms/60000); }
+
+// расписание
+if (AMO_POLL_MINUTES > 0) {
+  console.log(`⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT}, bootstrap=${bootstrapRemaining})`);
+
+  // 1) Немедленный запуск обычного тика
+  runTick("boot").catch(()=>{});
+
+  // 2) Регулярный in-process тик
+  setInterval(() => { runTick("regular").catch(()=>{}); }, AMO_POLL_MINUTES * 60 * 1000);
+
+  // 3) Параллельно self-HTTP тик (иногда помогает на платформах с нюансами event-loop)
+  if (SELF_HTTP_POLL) {
+    setInterval(() => { runHttpSelfPoll(); }, AMO_POLL_MINUTES * 60 * 1000);
+  }
+
+  // 4) Периодический мягкий бэкофилл (раз в 15 минут) — добираем «поздние» ссылки
+  if (BACKFILL_ENABLED) {
+    setInterval(async () => {
+      try {
+        const since = Math.floor((Date.now() - 6*3600*1000) / 1000); // 6 часов назад
+        const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining, {
+          force: true,
+          sinceEpochSec: since,
+          bootstrapLimit: AMO_POLL_LIMIT
+        });
+        console.log(`[AMO] soft-backfill -> scanned=${out.scanned} withLinks=${out.withLinks} started=${out.started}`);
+        if (out.started > 0) lastStartedAt = Date.now();
+        if (out.withLinks > 0) lastWithLinksAt = Date.now();
+      } catch (e) {
+        console.warn(`[AMO] soft-backfill error:`, e?.message || e);
+      }
+    }, 15 * 60 * 1000);
+  }
+
+  // 5) Watchdog: если 20 минут нет withLinks/started — делаем форс скан
+  if (WATCHDOG_ENABLED) {
+    setInterval(async () => {
+      const now = Date.now();
+      const noLinksMin = lastWithLinksAt ? minutes(now - lastWithLinksAt) : Infinity;
+      const noStartedMin = lastStartedAt ? minutes(now - lastStartedAt) : Infinity;
+      if (noLinksMin >= 20 && noStartedMin >= 20) {
+        try {
+          await sendTG(`🛠 Watchdog: не было активности ${Math.min(noLinksMin, noStartedMin)} мин — форс-скан за 6ч.`);
+        } catch {}
+        const since = Math.floor((Date.now() - 6*3600*1000) / 1000);
+        try {
+          const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining, {
+            force: true,
+            sinceEpochSec: since,
+            bootstrapLimit: AMO_POLL_LIMIT
+          });
+          console.log(`[AMO] watchdog-force -> scanned=${out.scanned} withLinks=${out.withLinks} started=${out.started}`);
+          if (out.started > 0) lastStartedAt = Date.now();
+          if (out.withLinks > 0) lastWithLinksAt = Date.now();
+        } catch (e) {
+          console.warn(`[AMO] watchdog-force error:`, e?.message || e);
+        }
+      }
+    }, 5 * 60 * 1000);
+  }
+} else {
+  console.log("⏸ auto-poll disabled");
+}

@@ -1,247 +1,473 @@
-// qa_assistant.js — QA-анализ звонков + форматтер для Telegram
-// v4.2-IRAZBIL (non-evaluable calls policy + pipeline passport)
-// Задача:
-//  • Анализ транскрипта с помощью OpenAI (или offline fallback)
-//  • Нормализация итоговой структуры под amo.js / index.js
-//  • "Короткие/инфо/не по адресу" — не штрафуем (score_total = null, suppress_alert = true)
-//  • Паспорт пайплайна: модель/версии/хэш конфига (для трассировки)
+// qa_assistant.js (v4.3-IRAZBIL) — JSON-only QA + duration-aware scoring & robust render
+// Совместимо со схемой v4.1 (тот же JSON на выходе), улучшена логика total:
+// - non-scoring: IVR-only и очень короткие (<15s) → "неоценочный"
+// - "service_short" (15–60s) → мягкая шкала, без алертов
+// - "sales" (≥60s) → взвешенная шкала (нормировка на 100), value/objections вносят вклад
+// - "support" (≥60s) → value/objections не штрафуют (N/A), нормировка без них
+// Рендер в TG показывает "неоценочный" вместо балла для соответствующих случаев.
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Конфиг рубрики/алертов (меняешь здесь — хэш конфига изменится)
-const CALL_QA_MODEL         = process.env.CALL_QA_MODEL || "gpt-4o-mini";
-const QA_RUBRIC_VERSION     = process.env.QA_RUBRIC_VERSION || "irazbil-rubric@4.2";
-const ALERT_RULES_VERSION   = process.env.ALERT_RULES_VERSION || "alerts@1.1.0";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const CALL_QA_MODEL  = process.env.CALL_QA_MODEL  || "gpt-4.1-mini";
 
-// Пороги/категоризация
-const SHORT_CALL_SEC        = parseInt(process.env.QA_SHORT_CALL_SEC || "25", 10);
-const NON_EVALUABLE_INTENTS = new Set(["short", "info", "misroute", "ivr_only"]);
+const MAX_TXT = 16000;
+const OPENAI_TIMEOUT_MS  = parseInt(process.env.CALL_QA_TIMEOUT_MS || "60000", 10);
+const OPENAI_MAX_RETRIES = parseInt(process.env.CALL_QA_RETRIES    || "2", 10);
 
-// Базовые пороги алертов (для справки/хэша — сами алерты дергаются из index/amo env)
-const ALERT_MIN_TOTAL       = parseInt(process.env.ALERT_MIN_TOTAL || "60", 10);
-const ALERT_MIN_SENTIMENT   = parseInt(process.env.ALERT_MIN_SENTIMENT || "-2", 10);
-const ALERT_IF_ESCALATE     = (process.env.ALERT_IF_ESCALATE || "1") === "1";
+// --------- Public API ---------
+export async function analyzeTranscript(transcript, meta = {}) {
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is missing");
+  if (!transcript || !transcript.trim()) throw new Error("Empty transcript");
 
-// ──────────────────────────────────────────────────────────────────────────────
-import crypto from "crypto";
+  const t = transcript.length > MAX_TXT ? (transcript.slice(0, MAX_TXT) + "\n[...cut...]") : transcript;
 
-// Хэш конфига — для трассировки в БД
-function configHash() {
-  const cfg = {
-    CALL_QA_MODEL,
-    QA_RUBRIC_VERSION,
-    ALERT_RULES_VERSION,
-    SHORT_CALL_SEC,
-    NON_EVALUABLE_INTENTS: Array.from(NON_EVALUABLE_INTENTS).sort(),
-    ALERT_MIN_TOTAL, ALERT_MIN_SENTIMENT, ALERT_IF_ESCALATE,
-  };
-  const s = JSON.stringify(cfg);
-  return crypto.createHash("sha256").update(s).digest("hex");
+  // ----- System -----
+  const system = `
+Вы – AI-ассистент по оценке качества звонков компании iRazbil (продажа и ремонт устройств Apple).
+Входные данные – транскрипт телефонного разговора (без указания говорящих).
+Ваша задача – провести оценку звонка и выдать РОВНО один JSON по схеме.
+
+Инструкции:
+• Определите роли: manager (менеджер), customer (клиент), ivr (автоинформатор). Разбейте реплики и используйте их в «quotes».
+• Определите intent: "sales" (продажа/консультация) или "support" (ремонт/поддержка). Не штрафуйте за неприменимые критерии.
+• Оцените техники: greeting, rapport, needs, value, objection_handling, next_step, closing, clarity, compliance — в 0..10.
+• Дайте психо-эмоциональный анализ, краткое summary и action_items (рекомендации).
+• Строгий JSON: НИЧЕГО, кроме полей схемы. Температура 0.0.
+
+Схема JSON:
+{
+  "intent": "sales|support",
+  "score": {
+    "greeting": 0..10,
+    "rapport": 0..10,
+    "needs": 0..10,
+    "value": 0..10,
+    "objection_handling": 0..10,
+    "next_step": 0..10,
+    "closing": 0..10,
+    "clarity": 0..10,
+    "compliance": 0..10,
+    "total": 0..100
+  },
+  "psycho_emotional": {
+    "customer_sentiment": "string",
+    "manager_tone": "string",
+    "manager_empathy": "string",
+    "stress_level": "string"
+  },
+  "techniques": {
+    "greeting": "done well|partially|missed|N/A|short text",
+    "rapport":   "...",
+    "needs":     "...",
+    "value":     "...",
+    "objection_handling": "...",
+    "next_step": "...",
+    "closing":   "...",
+    "clarity":   "...",
+    "compliance":"..."
+  },
+  "quotes": [
+    { "speaker": "manager|customer|ivr", "quote": "..." },
+    { "speaker": "customer", "quote": "..." }
+  ],
+  "summary": "string (3–5 предложений)",
+  "action_items": ["...", "..."]
 }
 
-// Простейшая эвристика: определить "intent" по тексту
-function naiveIntentDetect(text = "", meta = {}) {
-  const t = (text || "").toLowerCase();
-  const dur = meta?.duration_sec || 0;
+Edge-cases:
+• Если разговора почти нет (почти один IVR или 1-2 короткие реплики) — выставляйте минимальные подоценки, но формат JSON сохраняйте.
+• Если критерий неприменим — «N/A» в techniques и не снижайте total за него.
+  `.trim();
 
-  if (!t.trim()) return "unknown";
-  if (dur > 0 && dur <= SHORT_CALL_SEC) return "short";
-  if (/нажал(и)?\s*не туда|перепутал(а)?|ошиблись номером|это не туда|не ваш сервис/.test(t)) return "misroute";
-  if (/статус|когда будет готов|сколько по времени|позвоните|перезвоните|диагностик|готов/i.test(t)) return "support";
-  if (/сколько стоит|цена|стоимость|купить|есть в наличии|оформить заказ|заказ/i.test(t)) return "sales";
-  if (/подскажите|узнать|вопрос|интересует/i.test(t)) return "info";
-  return "support"; // по умолчанию считаем поддержкой
-}
-
-// Простейшая эвристика для тональности клиента (-3..+3)
-function naiveSentiment(text = "") {
-  const t = (text || "").toLowerCase();
-  if (!t.trim()) return 0;
-  if (/(ор(у|ете)|вы.*(должн|почему)|сколько можно|ужас.*сервис|ненавижу|отврат|хрен|пизд|бляд)/.test(t)) return -3;
-  if (/(разочаров|недоволен|не доволен|плохо|не устраивает|вынужден)/.test(t)) return -2;
-  if (/(непонятно|неясно|что с моим|где мой|сколько ждать)/.test(t)) return -1;
-  if (/(спасибо|благодарю|хорошего дня|отлично|супер)/.test(t)) return +2;
-  return 0;
-}
-
-// Простейшая оценка техник менеджера (0..10) + итог
-function scoreManagerHeuristics(text = "", meta = {}) {
-  // Очень простая шкала по ключевым словам — временный fallback.
-  // В проде основную детализацию даёт модель.
-  const t = (text || "").toLowerCase();
-
-  const greeting = /здравств|добрый|меня зовут|компания/.test(t) ? 6 : 3;
-  const rapport  = /как.*могу помочь|скажите пожалуйста|давайте|хорошо/i.test(t) ? 5 : 2;
-  const needs    = /уточн|какая модель|что случилось|по какому вопросу|детал/i.test(t) ? 6 : 3;
-  const value    = /для вас.*можем|выгодно|предлож/i.test(t) ? 4 : 0;
-  const obj      = /но|однако|к сожалению/i.test(t) ? 3 : 0;
-  const next     = /перезвон|свяжем|передам|приходите|оформ/i.test(t) ? 6 : 2;
-  const close    = /всего добр|хорошего дня|до свидан/i.test(t) ? 6 : 0;
-  const clarity  = /итог|значит|получается|тогда/i.test(t) ? 6 : 3;
-  const comp     = /согласн|по правилам|оформ|согласие/i.test(t) ? 6 : 5;
-
-  const per = {
-    greeting, rapport, needs, value, objections: obj, next_step: next, closing: close, clarity, compliance: comp
-  };
-
-  // Итоговая метрика (простая средняя по задействованным)
-  const vals = Object.values(per);
-  const total = Math.round(vals.reduce((a,b) => a+b, 0) / vals.length);
-
-  return { per, total };
-}
-
-// Обёртка обращения к модели (если ключ есть)
-async function callOpenAIForQA(text, meta) {
-  const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-  if (!OPENAI_API_KEY) return null;
-
-  // Формируем системную инструкцию — короткую и детерминированную
-  const sys = [
-    "Ты — QA-инспектор звонков сервисного центра. Отвечай JSON строго по схеме:",
-    "{ intent: 'sales|support|info|misroute|short|unknown',",
-    "  psycho_emotional: { customer_sentiment: -3..3, manager_tone: 'string', manager_empathy: 'низкий|умеренный|высокий', escalate_flag: boolean },",
-    "  score: { total: 0..100, per_dimension: { greeting, rapport, needs, value, objections, next_step, closing, clarity, compliance } },",
-    "  kpis: { estimated_talk_ratio_manager_percent?: number },",
-    "  summary: 'краткий вывод' }",
-    "Если звонок «short|info|misroute|ivr_only» — выставь intent и аккуратные оценки (или 0), но помни: такие звонки НЕ для штрафов.",
-  ].join(" ");
-
+  // ----- User -----
   const user = [
-    `Текст транскрипта (может быть коротким):\n${text}\n`,
-    `Метаданные: ${JSON.stringify({ duration_sec: meta?.duration_sec || 0, note_type: meta?.note_type || "" })}`
-  ].join("\n");
+    meta.callId ? `CallID: ${meta.callId}` : null,
+    meta.direction ? `direction: ${meta.direction}` : null,
+    meta.from && meta.to ? `from: ${meta.from} -> to: ${meta.to}` : null,
+    `brand: ${meta.brand || "iRazbil"}`,
+    "",
+    "Транскрипт (без указаных говорящих; требуется ролевая сегментация):",
+    t
+  ].filter(Boolean).join("\n");
 
-  // Используем fetch к OpenAI REST (без внешних зависимостей)
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { "authorization": `Bearer ${OPENAI_API_KEY}`, "content-type":"application/json" },
-    body: JSON.stringify({
-      model: CALL_QA_MODEL,
-      temperature: 0,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: user }
-      ]
-    })
-  });
-  if (!r.ok) {
-    const tx = await r.text().catch(()=> "");
-    throw new Error(`OpenAI QA HTTP ${r.status}: ${tx}`);
-  }
-  const j = await r.json();
-  const raw = j?.choices?.[0]?.message?.content || "{}";
+  const payload = {
+    model: CALL_QA_MODEL,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user }
+    ],
+    temperature: 0.0,
+    response_format: { type: "json_object" }
+  };
+
+  const data = await callOpenAIChatWithRetry(payload, OPENAI_MAX_RETRIES, OPENAI_TIMEOUT_MS);
+  const txt = data?.choices?.[0]?.message?.content || "";
+  const clean = String(txt).trim().replace(/^```json\s*|\s*```$/g, "");
+
+  let parsed;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(clean);
   } catch {
-    return null;
+    throw new Error("assistant returned non-JSON (schema violation)");
   }
+
+  ensureSchemaShape(parsed);
+
+  // ----- Duration-aware gating & weighted total -----
+  const durSec = Number.isFinite(+meta.duration_sec) ? +meta.duration_sec : null;
+  const gating = classifyCallType(transcript, durSec, parsed.intent, parsed.techniques);
+
+  // нормализуем сабскор и считаем total по весам, учитывая gating
+  normalizeSubscores(parsed);
+  parsed.score.total = computeWeightedTotal(parsed, gating);
+
+  sanitizeQuotes(parsed);
+  return parsed;
 }
 
-// Главная функция — анализ транскрипта
-export async function analyzeTranscript(text, meta = {}) {
-  const duration = meta?.duration_sec || 0;
-
-  // 1) Попробуем модель
-  let modelQa = null;
-  try {
-    modelQa = await callOpenAIForQA(text || "", meta);
-  } catch (e) {
-    // молча упадем в эвристику
-  }
-
-  // 2) Эвристики как fallback / для нормализации
-  let intent = modelQa?.intent || naiveIntentDetect(text, meta);
-  let sent   = Number.isFinite(+modelQa?.psycho_emotional?.customer_sentiment)
-               ? +modelQa.psycho_emotional.customer_sentiment
-               : naiveSentiment(text);
-
-  // Если очень короткий звонок — принудительно short
-  if (duration > 0 && duration <= SHORT_CALL_SEC) intent = "short";
-
-  // Эвристические пер-оценки, если модели нет
-  const h = scoreManagerHeuristics(text, meta);
-  const modelTotal = Number.isFinite(+modelQa?.score?.total) ? +modelQa.score.total : null;
-  const perDimension = modelQa?.score?.per_dimension || h.per;
-  let total = modelTotal ?? h.total;
-
-  // Психо-эмоциональный блок
-  const psycho_emotional = {
-    customer_sentiment: sent,
-    manager_tone: modelQa?.psycho_emotional?.manager_tone || (sent <= -2 ? "напряжённый" : sent >= 2 ? "дружелюбный" : "спокойный"),
-    manager_empathy: modelQa?.psycho_emotional?.manager_empathy || (sent <= -2 ? "низкий" : "умеренный"),
-    escalate_flag: Boolean(modelQa?.psycho_emotional?.escalate_flag) || (sent <= -3)
-  };
-
-  // Если intent неоценочный — убираем итоговую оценку из «штрафного поля»
-  let suppress_alert = false;
-  if (NON_EVALUABLE_INTENTS.has(intent)) {
-    suppress_alert = true;
-    total = null; // в БД score_total = null, чтобы не попадал под пороги
-  }
-
-  // Соберём итог
-  const qa = {
-    intent,
-    meta: { intent }, // совместимость с более старыми вызовами
-    psycho_emotional,
-    score: { total, per_dimension: perDimension },
-    kpis: { estimated_talk_ratio_manager_percent: modelQa?.kpis?.estimated_talk_ratio_manager_percent ?? null },
-    summary: modelQa?.summary || "",
-    // паспорт пайплайна
-    passport: {
-      qa_model: CALL_QA_MODEL,
-      qa_rubric_version: QA_RUBRIC_VERSION,
-      alert_rules_version: ALERT_RULES_VERSION,
-      config_hash: configHash(),
-      suppress_alert
-    }
-  };
-
-  return qa;
-}
-
-// Форматтер карточки в Telegram (HTML)
 export function formatQaForTelegram(qa) {
-  const i = qa?.intent || "unknown";
-  const pe = qa?.psycho_emotional || {};
-  const sc = qa?.score || {};
-  const per = sc.per_dimension || {};
-  const total = sc.total;
+  const s = safe(qa);
+  const sc = s.score || {};
+  const pe = s.psycho_emotional || {};
+  const tech = s.techniques || {};
+  const quotes = Array.isArray(s.quotes) ? s.quotes.slice(0, 3) : [];
 
-  const nonEval = NON_EVALUABLE_INTENTS.has(i);
-  const badge = nonEval ? "· неоценочный звонок" : `· Итоговый балл: ${total ?? "—"}/100`;
+  const intentRu = toRuIntent(s.intent);
+  const peCustomer = ruify(pe.customer_sentiment || "unknown");
+  const peTone     = ruify(pe.manager_tone || "unknown");
+  const peEmp      = ruify(pe.manager_empathy || "unknown");
+  const peStress   = ruify(pe.stress_level || "unknown");
 
-  const lines = [];
+  // эвристика для "неоценочного" отображения (total могли оставить 0, но мы явно подписываемся)
+  const nonScoringDisplay =
+    isIvrDominated(quotes, s.summary) ||
+    isNonScoringByHeuristics(sc, tech);
 
-  // Заголовок
-  const typeRu = (
-    i === "sales"   ? "продажи" :
-    i === "support" ? "поддержка/ремонт" :
-    i === "info"    ? "информационный" :
-    i === "misroute"? "не по адресу" :
-    i === "short"   ? "короткий" : "не распознан"
-  );
+  const head = nonScoringDisplay
+    ? `• Тип: <b>${esc(intentRu)}</b> · <i>неоценочный звонок</i>`
+    : `• Тип: <b>${esc(intentRu)}</b> · Итоговый балл: <b>${num(sc.total)}</b>/100`;
 
-  lines.push("📊 <b>Аналитика звонка (iRazbil v4.2)</b>");
-  lines.push(`• Тип: <b>${typeRu}</b> ${badge}`);
-
-  // Психо-эмоциональный блок
-  const tone = pe.manager_tone ? ` · Менеджер: ${pe.manager_tone}` : "";
-  const emp  = pe.manager_empathy ? ` · Эмпатия: ${pe.manager_empathy}` : "";
-  lines.push("🧠 <b>Психо-эмоциональный фон</b>");
-  lines.push(`• Клиент: ${typeof pe.customer_sentiment === "number" ? pe.customer_sentiment : "—"}${tone}${emp}`);
-
-  // Техники — коротко
-  const pick = k => (typeof per[k] === "number" ? per[k] : "—");
-  lines.push("🧩 <b>Техники (оценки 0–10)</b>");
-  lines.push(`• Приветствие: ${pick("greeting")} · Раппорт: ${pick("rapport")} · Потребности: ${pick("needs")} · Ценность: ${pick("value")}`);
-  lines.push(`• Возражения: ${pick("objections")} · Следующий шаг: ${pick("next_step")} · Завершение: ${pick("closing")}`);
-  lines.push(`• Ясность: ${pick("clarity")} · Комплаенс: ${pick("compliance")}`);
-
-  if (nonEval) {
-    lines.push("⚖️ <i>Звонок помечен как «неоценочный» — формальный балл не выставляется и в алерты не пойдёт.</i>");
-  }
+  const lines = [
+    "📊 <b>Аналитика звонка (iRazbil v4.3)</b>",
+    head,
+    "",
+    "🧠 <b>Психо-эмоциональный фон</b>",
+    `• Клиент: <i>${esc(peCustomer)}</i>`,
+    `• Менеджер: <i>${esc(peTone)}</i> · Эмпатия: <i>${esc(peEmp)}</i> · Уровень стресса: <i>${esc(peStress)}</i>`,
+    "",
+    "🧩 <b>Техники (оценки 0–10)</b>",
+    `• Приветствие: <code>${num(sc.greeting)}</code> · Раппорт: <code>${num(sc.rapport)}</code> · Потребности: <code>${num(sc.needs)}</code> · Ценность: <code>${num(sc.value)}</code>`,
+    `• Возражения: <code>${num(sc.objection_handling)}</code> · Следующий шаг: <code>${num(sc.next_step)}</code> · Завершение: <code>${num(sc.closing)}</code>`,
+    `• Ясность: <code>${num(sc.clarity)}</code> · Комплаенс: <code>${num(sc.compliance)}</code>`,
+    "",
+    "🧩 <b>Техники (статус)</b>",
+    `• Приветствие: ${esc(ruify(tech.greeting || "-"))}`,
+    `• Раппорт: ${esc(ruify(tech.rapport || "-"))}`,
+    `• Потребности: ${esc(ruify(tech.needs || "-"))}`,
+    `• Ценность: ${esc(ruify(tech.value || "-"))}`,
+    `• Возражения: ${esc(ruify(tech.objection_handling || "-"))}`,
+    `• Следующий шаг: ${esc(ruify(tech.next_step || "-"))}`,
+    `• Завершение: ${esc(ruify(tech.closing || "-"))}`,
+    `• Ясность: ${esc(ruify(tech.clarity || "-"))}`,
+    `• Комплаенс: ${esc(ruify(tech.compliance || "-"))}`,
+    "",
+    quotes.length ? "💬 <b>Цитаты</b>" : null,
+    ...quotes.map(q => `• <b>${roleRu(q.speaker || "?")}:</b> “${esc(q.quote || "")}”`),
+    "",
+    s.summary ? `📝 <b>Итог</b>: ${esc(s.summary)}` : null,
+    Array.isArray(s.action_items) && s.action_items.length
+      ? ["📌 <b>Действия</b>:", ...s.action_items.slice(0, 5).map(i => `• ${esc(i)}`)].join("\n")
+      : null
+  ].filter(Boolean);
 
   return lines.join("\n");
+}
+
+export function makeSpoilerTranscript(roleLabeledText, maxChars = 4000) {
+  const body = String(roleLabeledText || "").slice(0, maxChars);
+  return body ? `🗣️ <b>Расшифровка (сокращено)</b>\n||${esc(body)}||` : "";
+}
+
+// --------- Internal: OpenAI call with retry + timeout ---------
+async function callOpenAIChatWithRetry(payload, retries, timeoutMs) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const r = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload),
+        signal: ac.signal
+      });
+      clearTimeout(to);
+      if (!r.ok) {
+        const txt = await r.text().catch(() => "");
+        throw new Error(`assistant http ${r.status}: ${txt}`);
+      }
+      return await r.json();
+    } catch (e) {
+      clearTimeout(to);
+      lastError = e;
+      if (attempt < retries) {
+        const backoff = 300 * Math.pow(2, attempt);
+        await sleep(backoff);
+      }
+    }
+  }
+  throw lastError || new Error("OpenAI call failed");
+}
+
+// ---------------- utils & scoring core ----------------
+function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
+function safe(x) { return (x && typeof x === "object") ? x : {}; }
+function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function num(n) { return (typeof n === "number" && Number.isFinite(n)) ? n : "-"; }
+
+function clamp10(n) {
+  const v = Number.isFinite(+n) ? +n : 0;
+  return Math.max(0, Math.min(10, v));
+}
+
+function ensureSchemaShape(obj) {
+  obj.intent ??= "unknown";
+  obj.score ??= {};
+  const sc = obj.score;
+  sc.greeting ??= 0;
+  sc.rapport ??= 0;
+  sc.needs ??= 0;
+  sc.value ??= 0;
+  sc.objection_handling ??= 0;
+  sc.next_step ??= 0;
+  sc.closing ??= 0;
+  sc.clarity ??= 0;
+  sc.compliance ??= 0;
+  sc.total ??= 0;
+
+  obj.psycho_emotional ??= {
+    customer_sentiment: "unknown",
+    manager_tone: "unknown",
+    manager_empathy: "unknown",
+    stress_level: "unknown"
+  };
+  obj.techniques ??= {
+    greeting: "unknown",
+    rapport: "unknown",
+    needs: "unknown",
+    value: "unknown",
+    objection_handling: "unknown",
+    next_step: "unknown",
+    closing: "unknown",
+    clarity: "unknown",
+    compliance: "unknown"
+  };
+  if (!Array.isArray(obj.quotes)) obj.quotes = [];
+  obj.summary ??= "unknown";
+  if (!Array.isArray(obj.action_items)) obj.action_items = [];
+}
+
+function normalizeSubscores(obj) {
+  const sc = obj.score || {};
+  sc.greeting = clamp10(sc.greeting);
+  sc.rapport  = clamp10(sc.rapport);
+  sc.needs    = clamp10(sc.needs);
+  sc.value    = clamp10(sc.value);
+  sc.objection_handling = clamp10(sc.objection_handling);
+  sc.next_step = clamp10(sc.next_step);
+  sc.closing   = clamp10(sc.closing);
+  sc.clarity   = clamp10(sc.clarity);
+  sc.compliance= clamp10(sc.compliance);
+}
+
+function classifyCallType(transcript, durSec, intentRaw, tech) {
+  const intent = String(intentRaw || "").toLowerCase();
+  const dur = Number.isFinite(+durSec) ? +durSec : null;
+
+  const ivrOnly = isIvrDominatedText(transcript);
+  if (ivrOnly || (dur !== null && dur < 15)) return { kind: "na" }; // неоценочный
+
+  if (dur !== null && dur < 60) {
+    // короткий сервисный «инфозвонок»
+    return { kind: "service_short" };
+  }
+
+  // полноценные
+  if (intent === "sales")   return { kind: "sales" };
+  if (intent === "support") return { kind: "support" };
+
+  return { kind: "support" };
+}
+
+function computeWeightedTotal(obj, gating) {
+  const sc = obj.score || {};
+  const tech = obj.techniques || {};
+  const kind = gating?.kind || "support";
+
+  // non-scoring: показывать «неоценочный»; для совместимости вернём 0
+  if (kind === "na") return 0;
+
+  // Мягкая шкала для service_short: нормируем на «ожидаемое»
+  if (kind === "service_short") {
+    // учитываем главное: greeting, needs, clarity, compliance, next_step, closing слегка
+    const weights = {
+      greeting:  5,
+      rapport:   5,
+      needs:     25,
+      value:     0,  // N/A
+      objection_handling: 0, // N/A
+      next_step: 25,
+      closing:   10,
+      clarity:   20,
+      compliance:10,
+    };
+    const { total, max } = weightedSum(sc, weights);
+    // мягкая шкала — верхний кап ~60
+    const score = Math.round((total / max) * 60);
+    return clamp100(score);
+  }
+
+  // Полные звонки
+  if (kind === "sales") {
+    // Веса для продаж (сумма 100)
+    const weights = {
+      greeting:  3,
+      rapport:   10,
+      needs:     25,
+      value:     20,
+      objection_handling: 15,
+      next_step: 20,
+      closing:   5,
+      clarity:   2,
+      compliance:0
+    };
+    const { total, max } = weightedSum(sc, weights);
+    return clamp100(Math.round((total / max) * 100));
+  }
+
+  // support (полный): value/objections не штрафуют (если реально N/A)
+  const valueNA = isNA(tech.value);
+  const objNA   = isNA(tech.objection_handling);
+
+  const weightsSupportBase = {
+    greeting:  4,
+    rapport:   10,
+    needs:     30,
+    value:     valueNA ? 0 : 10,
+    objection_handling: objNA ? 0 : 10,
+    next_step: 20,
+    closing:   8,
+    clarity:   6,
+    compliance:12
+  };
+  const { total, max } = weightedSum(sc, weightsSupportBase);
+  return clamp100(Math.round((total / max) * 100));
+}
+
+function weightedSum(sc, weights) {
+  let total = 0, max = 0;
+  for (const [k, w] of Object.entries(weights)) {
+    const ww = Number.isFinite(+w) ? +w : 0;
+    if (ww <= 0) continue;
+    total += (clamp10(sc[k]) / 10) * ww;
+    max   += ww;
+  }
+  return { total, max: Math.max(1, max) };
+}
+
+function clamp100(n) { return Math.max(0, Math.min(100, Number.isFinite(+n) ? +n : 0)); }
+
+function isNA(text) {
+  const s = String(text || "").toLowerCase();
+  return s.includes("n/a") || s.includes("не применимо") || s.includes("na");
+}
+
+function sanitizeQuotes(obj) {
+  if (!Array.isArray(obj.quotes)) { obj.quotes = []; return; }
+  const mapRole = (r) => {
+    const s = String(r || "").toLowerCase();
+    if (s.includes("manager") || s.includes("менедж")) return "manager";
+    if (s.includes("customer") || s.includes("client") || s.includes("клиент")) return "customer";
+    if (s.includes("ivr") || s.includes("auto") || s.includes("авто")) return "ivr";
+    return "customer";
+  };
+  obj.quotes = obj.quotes
+    .map(q => ({ speaker: mapRole(q?.speaker), quote: String(q?.quote || "").trim() }))
+    .filter(q => q.quote.length > 0)
+    .slice(0, 5);
+}
+
+// --------- IVR / non-scoring helpers ----------
+function isIvrDominatedText(transcript) {
+  const s = String(transcript || "").toLowerCase();
+  // частые фрагменты IVR/звонка
+  const ivrHints = [
+    "нажмите 1", "нажмите один", "нажмите 2", "нажмите два",
+    "оставайтесь на линии", "вам ответит первый освободившийся сотрудник",
+    "звонит телефон", "ivr:", "автоинформатор"
+  ];
+  let hits = 0;
+  for (const h of ivrHints) if (s.includes(h)) hits++;
+  // если почти весь текст — это IVR/«звонит телефон», считаем non-scoring
+  return hits >= 2 && s.replace(/ivr:|звонит телефон|[^\w]+/g, "").length < 800;
+}
+
+function isIvrDominated(quotes, summary) {
+  const qs = (quotes || []).map(q => (q.speaker||"") + ":" + (q.quote||"")).join("\n").toLowerCase();
+  const sum = String(summary||"").toLowerCase();
+  return /ivr|автоинформатор/.test(qs) && /ivr|автоинформатор/.test(sum);
+}
+
+function isNonScoringByHeuristics(sc, tech) {
+  // крайне низкие все показатели + value/objections N/A → вероятно, короткий/формальный звонок
+  const vals = [
+    sc.greeting, sc.rapport, sc.needs, sc.next_step,
+    sc.closing, sc.clarity, sc.compliance
+  ].map(v => Number.isFinite(+v) ? +v : 0);
+  const veryLow = vals.filter(v => v <= 3).length >= 6;
+  return veryLow;
+}
+
+// -------------- локализация/русификатор --------------
+function toRuIntent(intent) {
+  const s = String(intent || "").toLowerCase();
+  if (s === "sales") return "продажа";
+  if (s === "support") return "поддержка/ремонт";
+  if (s === "ivr") return "IVR/меню";
+  if (s === "noise") return "шум/неразборчиво";
+  return s || "unknown";
+}
+function roleRu(speaker) {
+  const s = String(speaker || "").toLowerCase();
+  if (s.includes("manager")) return "менеджер";
+  if (s.includes("customer")) return "клиент";
+  if (s.includes("ivr")) return "автоинформатор";
+  return "говорящий";
+}
+function ruify(text) {
+  const s = String(text || "").trim();
+  const map = [
+    [/^done\s*well$/i, "хорошо выполнено"],
+    [/^partially$/i, "частично выполнено"],
+    [/^missed$/i, "пропущено"],
+    [/^n\/?a$/i, "не применимо"],
+    [/^polite$/i, "вежливый"],
+    [/^calm$/i, "спокойный"],
+    [/^professional$/i, "профессиональный"],
+    [/^impatient/i, "нетерпеливый"],
+    [/^frustrat/i, "раздражение/фрустрация"],
+    [/^neutral$/i, "нейтральный"],
+    [/^negative$/i, "негативный"],
+    [/^positive$/i, "позитивный"],
+    [/^low$/i, "низкий"],
+    [/^moderate$/i, "умеренный"],
+    [/^high$/i, "высокий"],
+  ];
+  for (const [re, rep] of map) if (re.test(s)) return rep;
+  const lower = s.toLowerCase();
+  if (lower.includes("impatient") && lower.includes("polite")) return "нетерпеливый, но вежливый";
+  if (lower.includes("calm") && lower.includes("professional")) return "спокойный, профессиональный";
+  return s;
 }

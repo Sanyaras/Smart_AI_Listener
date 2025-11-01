@@ -2,6 +2,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { debug, safeStr } from "./utils.js";
 
+// ====================== INIT SUPABASE ======================
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
 if (!supabaseUrl || !supabaseKey) throw new Error("❌ Missing Supabase credentials");
@@ -10,17 +11,20 @@ export const supabase = createClient(supabaseUrl, supabaseKey, {
   auth: { persistSession: false },
 });
 
-// ===== CALL RECORDS TABLE =====
+// ====================== CALL RECORDS ======================
 
 export async function insertCallRecord({ note_id, contact_id, link, created_at }) {
   try {
     const { data, error } = await supabase
       .from("call_records")
-      .insert([{ note_id, contact_id, link, created_at, status: "new" }])
+      .upsert(
+        { note_id, contact_id, link, created_at, status: "new" },
+        { onConflict: "note_id" } // предотвращаем дублирование
+      )
       .select();
 
     if (error) throw error;
-    debug("✅ Added call record:", note_id);
+    debug("✅ Added/Updated call record:", note_id);
     return data?.[0] || null;
   } catch (e) {
     console.error("❌ insertCallRecord:", safeStr(e));
@@ -29,18 +33,20 @@ export async function insertCallRecord({ note_id, contact_id, link, created_at }
 }
 
 export async function getUnprocessedCalls(limit = 10) {
-  const { data, error } = await supabase
-    .from("call_records")
-    .select("*")
-    .eq("status", "new")
-    .limit(limit)
-    .order("created_at", { ascending: true });
+  try {
+    const { data, error } = await supabase
+      .from("call_records")
+      .select("*")
+      .eq("status", "new")
+      .order("created_at", { ascending: true })
+      .limit(limit);
 
-  if (error) {
-    console.error("❌ getUnprocessedCalls:", safeStr(error));
+    if (error) throw error;
+    return data || [];
+  } catch (e) {
+    console.error("❌ getUnprocessedCalls:", safeStr(e));
     return [];
   }
-  return data || [];
 }
 
 export async function markCallProcessed(note_id, transcript, qa_report) {
@@ -64,12 +70,11 @@ export async function markCallProcessed(note_id, transcript, qa_report) {
   }
 }
 
+// ====================== AMO TOKENS ======================
+
 export async function getAmoTokens() {
   try {
-    const { data, error } = await supabase
-      .from("app_secrets")
-      .select("key, val");
-
+    const { data, error } = await supabase.from("app_secrets").select("key, val");
     if (error) throw error;
 
     const map = {};
@@ -77,8 +82,14 @@ export async function getAmoTokens() {
       map[row.key.toLowerCase()] = row.val;
     }
 
-    const access_token = map.amo_access_token || map.amo_access_token?.toUpperCase() || map.amo_access_token;
-    const refresh_token = map.amo_refresh_token || map.amo_refresh_token?.toUpperCase() || map.amo_refresh_token;
+    const access_token =
+      map.amo_access_token ||
+      map.amo_access_token?.toUpperCase() ||
+      map.amo_access_token;
+    const refresh_token =
+      map.amo_refresh_token ||
+      map.amo_refresh_token?.toUpperCase() ||
+      map.amo_refresh_token;
     const expires_at = map.amo_expires_at || null;
 
     if (!access_token || !refresh_token) {
@@ -88,7 +99,7 @@ export async function getAmoTokens() {
 
     return { access_token, refresh_token, expires_at };
   } catch (e) {
-    console.error("❌ getAmoTokens:", e.message);
+    console.error("❌ getAmoTokens:", safeStr(e));
     return null;
   }
 }
@@ -100,7 +111,10 @@ export async function saveAmoTokens({ access_token, refresh_token, expires_at })
       { key: "AMO_ACCESS_TOKEN", val: access_token },
       { key: "amo_refresh_token", val: refresh_token },
       { key: "AMO_REFRESH_TOKEN", val: refresh_token },
-      { key: "amo_expires_at", val: expires_at || new Date(Date.now() + 3600 * 1000).toISOString() },
+      {
+        key: "amo_expires_at",
+        val: expires_at || new Date(Date.now() + 3600 * 1000).toISOString(),
+      },
     ];
 
     for (const row of entries) {
@@ -109,11 +123,11 @@ export async function saveAmoTokens({ access_token, refresh_token, expires_at })
 
     debug("💾 Amo tokens updated in app_secrets");
   } catch (e) {
-    console.error("❌ saveAmoTokens:", e.message);
+    console.error("❌ saveAmoTokens:", safeStr(e));
   }
 }
 
-// ====================== GET RECENT CALLS ======================
+// ====================== RECENT CALLS ======================
 
 /**
  * Возвращает последние N звонков из таблицы call_records
@@ -130,7 +144,7 @@ export async function getRecentCalls(limit = 15) {
     if (error) throw error;
     return data || [];
   } catch (e) {
-    console.error("❌ getRecentCalls:", e.message);
+    console.error("❌ getRecentCalls:", safeStr(e));
     return [];
   }
 }

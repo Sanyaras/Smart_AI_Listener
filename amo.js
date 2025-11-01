@@ -1,7 +1,8 @@
-// amo.js — AmoCRM интеграция (v3.5-IRAZBIL-simple)
-// Режим: БЕЗ КУРСОРОВ. Каждый тик сканирует "окно" за последние AMO_BACKFILL_MAX_HOURS (по умолчанию 72ч).
-// Дедупликация через Supabase (isAlreadyProcessed/markProcessed/markSeenOnly).
-// Совместимо с index.js v2.6.x-IRAZBIL: processAmoCallNotes(limit, bootstrapRemaining, options)
+// amo.js — AmoCRM интеграция (manual-since, без курсоров) v3.6-IRAZBIL
+// • manual-since хранится в Supabase ("amo_manual_since")
+// • processAmoCallNotes(limit, _, { sinceEpochSec }) — скан хвоста по since
+// • getPenultimateCreatedAt() — timestamp предпоследнего звонка (по всем сущностям)
+// • get/set/bump/reset manual since — экспортированы
 
 import crypto from "crypto";
 import { fetchWithTimeout, mask, cap } from "./utils.js";
@@ -13,18 +14,13 @@ const AMO_BASE_URL       = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
 const AMO_CLIENT_ID      = process.env.AMO_CLIENT_ID || "";
 const AMO_CLIENT_SECRET  = process.env.AMO_CLIENT_SECRET || "";
 const AMO_REDIRECT_URI   = process.env.AMO_REDIRECT_URI || "";
-const AMO_AUTH_CODE      = process.env.AMO_AUTH_CODE || "";
-
 let   AMO_ACCESS_TOKEN   = process.env.AMO_ACCESS_TOKEN || "";
 let   AMO_REFRESH_TOKEN  = process.env.AMO_REFRESH_TOKEN || "";
 
 const AMO_TIMEZONE       = process.env.AMO_TIMEZONE || "Europe/Moscow";
 const RELAY_BASE_URL     = process.env.RELAY_BASE_URL || "";
-
-// Сканируемое "окно" в прошлое (часы). Ровно то, что ты хочешь (например, 72).
 const BACKFILL_MAX_HOURS = parseInt(process.env.AMO_BACKFILL_MAX_HOURS || "72", 10);
 
-// Мини-диагностика, если не нашли ссылок
 const AMO_DEBUG_DUMP     = (process.env.AMO_DEBUG_DUMP || "1") === "1";
 
 // Alerts (опционально)
@@ -38,9 +34,7 @@ const ALERT_IF_ESCALATE      = (process.env.ALERT_IF_ESCALATE || "1") === "1";
 const SUPABASE_URL   = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "";
 const SUPABASE_TABLE = process.env.SUPABASE_CALLS_QA_TABLE || "calls_qa";
-
-// Версия пайплайна QA
-const QA_VERSION = "v4.3-IRAZBIL";
+const QA_VERSION     = "v4.3-IRAZBIL";
 
 // ===== Supabase processed helpers =====
 import {
@@ -51,7 +45,39 @@ import {
   setSecret
 } from "./supabaseStore.js";
 
-// ===== OAuth & Fetch =====
+/* -------------------- Manual-since store -------------------- */
+const SECRET_KEY_ACCESS   = "amo_access_token";
+const SECRET_KEY_REFRESH  = "amo_refresh_token";
+const SECRET_MANUAL_SINCE = "amo_manual_since";
+
+export async function getManualSince() {
+  const v = parseInt(await getSecret(SECRET_MANUAL_SINCE) || "0", 10);
+  if (Number.isFinite(v) && v > 0) return v;
+  // по умолчанию — окно BACKFILL_MAX_HOURS
+  return Math.floor((Date.now() - BACKFILL_MAX_HOURS * 3600 * 1000) / 1000);
+}
+
+export async function setManualSinceForwardOnly(unixSec) {
+  const current = parseInt(await getSecret(SECRET_MANUAL_SINCE) || "0", 10);
+  const next = Number.isFinite(current) && current > 0 ? Math.max(current, unixSec) : unixSec;
+  await setSecret(SECRET_MANUAL_SINCE, String(next));
+  return next;
+}
+
+export async function bumpManualSince(seconds) {
+  const cur = await getManualSince();
+  const next = Math.max(0, cur + (parseInt(seconds,10) || 0));
+  await setSecret(SECRET_MANUAL_SINCE, String(next));
+  return next;
+}
+
+export async function resetManualSinceFromHours(hours) {
+  const base = Math.floor((Date.now() - Math.max(1, parseInt(hours,10)||72) * 3600 * 1000) / 1000);
+  await setSecret(SECRET_MANUAL_SINCE, String(base));
+  return base;
+}
+
+/* -------------------- OAuth & Fetch -------------------- */
 function ensureAmoEnv() {
   if (!AMO_BASE_URL || !AMO_CLIENT_ID || !AMO_CLIENT_SECRET || !AMO_REDIRECT_URI) {
     throw new Error("AMO_* env incomplete");
@@ -75,8 +101,6 @@ async function amoOAuth(body) {
 }
 
 let _tokensLoaded = false;
-const SECRET_KEY_ACCESS  = "amo_access_token";
-const SECRET_KEY_REFRESH = "amo_refresh_token";
 async function loadTokensFromStoreIfNeeded() {
   if (_tokensLoaded) return;
   try {
@@ -152,7 +176,7 @@ export async function amoFetch(path, opts = {}, ms = 15000) {
   return await r.json();
 }
 
-// ===== Helpers =====
+/* -------------------- Helpers -------------------- */
 function sha256(s){ return crypto.createHash("sha256").update(String(s)).digest("hex"); }
 function pad2(n){ return String(n).padStart(2,"0"); }
 function fmtDuration(sec=0){ const s = Math.max(0, parseInt(sec,10) || 0); const m = Math.floor(s/60), r = s%60; return `${m}:${pad2(r)}`; }
@@ -254,9 +278,7 @@ async function upsertCallQaToSupabase(row){
   }
 }
 
-// ===== Простая выборка последних N страниц до границы sinceSec =====
-// Amo Notes не фильтруются по created_at в query, поэтому просто идём с "хвоста" назад,
-// пока не встретим записи старше sinceSec или не исчерпаем maxPagesBack.
+/* -------------------- Tail helpers -------------------- */
 async function probeLastPage(pathBase, perPage, maxPageCap = 2000){
   const first = await amoFetch(`${pathBase}?limit=${perPage}&page=1`);
   let lastPage = 1;
@@ -265,7 +287,7 @@ async function probeLastPage(pathBase, perPage, maxPageCap = 2000){
     const m = String(lastHref).match(/(?:\?|&)page=(\d+)/i);
     if (m) { lastPage = parseInt(m[1], 10) || 1; if (lastPage > 1) return lastPage; }
   }
-  // бинарный поиск "последней" страницы
+  // бинарный поиск «последней» страницы
   let lo = 1, hi = 1;
   const loHas = Array.isArray(first?._embedded?.notes) && first._embedded.notes.length>0;
   if (!loHas) return 1;
@@ -303,6 +325,20 @@ async function fetchRecentNotes(pathBase, perPage, maxPagesBack, sinceSec){
   return out;
 }
 
+async function fetchRecentAcrossEntities(perEntityLimit, maxPagesBack, sinceSec) {
+  const [leadRaw, contactRaw, companyRaw] = await Promise.all([
+    fetchRecentNotes("/api/v4/leads/notes",     perEntityLimit, maxPagesBack, sinceSec),
+    fetchRecentNotes("/api/v4/contacts/notes",  perEntityLimit, maxPagesBack, sinceSec),
+    fetchRecentNotes("/api/v4/companies/notes", perEntityLimit, maxPagesBack, sinceSec),
+  ]);
+  return [
+    ...leadRaw.map(n => ({...n, __entity:"lead"})),
+    ...contactRaw.map(n => ({...n, __entity:"contact"})),
+    ...companyRaw.map(n => ({...n, __entity:"company"})),
+  ].sort((a,b)=> (b.created_at||0) - (a.created_at||0));
+}
+
+/* -------------------- Users -------------------- */
 async function amoGetUsersMap() {
   const data = await amoFetch("/api/v4/users?limit=250");
   const arr = data?._embedded?.users || [];
@@ -314,25 +350,17 @@ async function amoGetUsersMap() {
   }
   return map;
 }
-async function amoGetResponsible(entity, entityId) {
-  try {
-    let path = "";
-    if (entity === "lead") path = `/api/v4/leads/${entityId}`;
-    else if (entity === "contact") path = `/api/v4/contacts/${entityId}`;
-    else if (entity === "company") path = `/api/v4/companies/${entityId}`;
-    else return { userId: null, userName: null };
-    const card = await amoFetch(path);
-    const respId = card.responsible_user_id || card.responsible_user || null;
-    if (!respId) return { userId: null, userName: null };
-    const usersMap = await amoGetUsersMap();
-    const u = usersMap.get(respId);
-    return { userId: respId, userName: u ? u.name : `user#${respId}` };
-  } catch {
-    return { userId: null, userName: null };
-  }
+
+/* -------------------- Penultimate call timestamp -------------------- */
+export async function getPenultimateCreatedAt() {
+  const sinceSec = Math.floor((Date.now() - 30*24*3600*1000)/1000); // подстраховка: месяц назад
+  const tail = await fetchRecentAcrossEntities(200, 12, sinceSec);
+  const callish = tail.filter(isLikelyCallNote);
+  if (callish.length < 2) throw new Error("недостаточно звонков для 'предпоследнего'");
+  return callish[1].created_at;
 }
 
-// ===== Non-scoring классификация =====
+/* -------------------- Non-scoring классификация -------------------- */
 function deriveCallTypeAndScored(qa, durSec) {
   const d = Number.isFinite(+durSec) ? +durSec : null;
   const summary = (qa?.summary || "").toLowerCase();
@@ -347,69 +375,48 @@ function deriveCallTypeAndScored(qa, durSec) {
   return { call_type_norm: "support", scored: true };
 }
 
-// ===== Главный поллер (упрощённый) =====
-// signature: processAmoCallNotes(limit, bootstrapRemaining, options)
-// options: { force?: boolean, sinceEpochSec?: number|null }
+/* -------------------- Main poller -------------------- */
+// signature: processAmoCallNotes(limit, _bootstrapRemaining, { sinceEpochSec })
 export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, options = {}) {
-  const { sinceEpochSec = null } = options || {};
   const perEntityLimit = Math.min(limit, 200);
-  const maxPagesBack = 12; // сколько страниц пролистывать хвост
-  const sinceSec = sinceEpochSec
-    ? Math.max(0, parseInt(sinceEpochSec, 10) || 0)
-    : Math.floor((Date.now() - BACKFILL_MAX_HOURS * 3600 * 1000) / 1000);
+  const maxPagesBack = 12;
+  const since = Math.max(0,
+    options?.sinceEpochSec
+      ? (parseInt(options.sinceEpochSec,10) || 0)
+      : await getManualSince()
+  );
 
-  // 1) Забираем ноты из трёх сущностей в "скользящем окне"
-  const [leadRaw, contactRaw, companyRaw] = await Promise.all([
-    fetchRecentNotes("/api/v4/leads/notes",     perEntityLimit, maxPagesBack, sinceSec),
-    fetchRecentNotes("/api/v4/contacts/notes",  perEntityLimit, maxPagesBack, sinceSec),
-    fetchRecentNotes("/api/v4/companies/notes", perEntityLimit, maxPagesBack, sinceSec),
-  ]);
+  // 1) хвост по всем сущностям
+  const tail = await fetchRecentAcrossEntities(perEntityLimit, maxPagesBack, since);
 
-  const filterCallish = (arr) => arr.filter(isLikelyCallNote);
-  const leadNotes    = filterCallish(leadRaw);
-  const contactNotes = filterCallish(contactRaw);
-  const companyNotes = filterCallish(companyRaw);
-
-  const picked = [];
-  const pack = (entity, items) => {
-    for (const n of items) {
-      picked.push({
-        entity,
-        note_id: n.id,
-        note_type: n.note_type,
-        created_at: n.created_at, // unix sec
-        entity_id: n.entity_id,
-        text: n.text || n.params?.text || "",
-        params: n.params || n.payload || n.data || {}
-      });
-    }
-  };
-  pack("lead", leadNotes);
-  pack("contact", contactNotes);
-  pack("company", companyNotes);
-  picked.sort((a,b) => (b.created_at||0) - (a.created_at||0));
+  // 2) фильтруем на звонки
+  const notes = tail.filter(isLikelyCallNote);
 
   const out = {
-    scanned: picked.length,
+    scanned: tail.length,
     withLinks: 0,
     started: 0,
     skipped: 0,
     ignored: 0,
     seenOnly: 0,
-    since: sinceSec
+    since,
+    maxCreatedAt: since
   };
 
   const usersMap = await amoGetUsersMap().catch(()=> new Map());
 
-  for (const note of picked) {
-    const source_type = "amo_note";
-    const source_id   = String(note.note_id);
+  for (const note of notes) {
+    const createdAt = note.created_at || 0;
+    if (createdAt > out.maxCreatedAt) out.maxCreatedAt = createdAt;
 
-    // Проверка на "уже делали"
+    const source_type = "amo_note";
+    const source_id   = String(note.id);
+
+    // Дедуп: уже обрабатывали эту заметку?
     const already = await isAlreadyProcessed(source_type, source_id).catch(()=>false);
     if (already) { out.skipped++; continue; }
 
-    // Пытаемся найти ссылку на запись
+    // Ищем ссылку на запись
     const links = findRecordingLinksInNote(note);
     if (!links.length) {
       if (AMO_DEBUG_DUMP) {
@@ -418,7 +425,7 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
         await sendTG(
           [
             "🧪 <b>AMO DEBUG</b> — запись не найдена, дамп полей",
-            `🔹 note_id: <code>${note.note_id}</code> • entity: <code>${note.entity}</code> • entity_id: <code>${note.entity_id}</code>`,
+            `🔹 note_id: <code>${note.id}</code> • entity: <code>${note.__entity}</code> • entity_id: <code>${note.entity_id}</code>`,
             `🔹 note_type: <code>${note.note_type || "—"}</code> • created_at: <code>${note.created_at || 0}</code>`,
             `🔹 params.keys: <code>${paramsKeys.join(", ") || "—"}</code>`,
             `📝 text: <code>${previewText}</code>`
@@ -434,7 +441,7 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
 
     const durSec   = parseInt(note?.params?.duration || 0, 10) || 0;
     const phone    = note?.params?.phone || "—";
-    const dealUrl  = entityCardUrl(note.entity, note.entity_id);
+    const dealUrl  = entityCardUrl(note.__entity, note.entity_id);
     const createdH = humanDate((note.created_at || 0) * 1000);
     const kindTxt  = note.note_type === "call_in" ? "📥 Входящий"
                    : note.note_type === "call_out" ? "📤 Исходящий"
@@ -443,9 +450,9 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
     // Ответственный
     let managerTxt = "неизвестно";
     try {
-      const cardPath = note.entity === "lead"
+      const cardPath = note.__entity === "lead"
         ? `/api/v4/leads/${note.entity_id}`
-        : note.entity === "contact"
+        : note.__entity === "contact"
         ? `/api/v4/contacts/${note.entity_id}`
         : `/api/v4/companies/${note.entity_id}`;
       const card = await amoFetch(cardPath);
@@ -465,11 +472,11 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
         dealUrl ? `🔗 <b>Карта:</b> <a href="${dealUrl}">${dealUrl}</a>` : null,
         links[0] ? `🔊 <b>Аудио:</b> <a href="${links[0]}">оригинал</a>` : null,
         note.text ? `📝 <b>Примечание:</b> ${note.text}` : null,
-        `<i>note_id: ${note.note_id} • entity: ${note.entity} • entity_id: ${note.entity_id}</i>`
+        `<i>note_id: ${note.id} • entity: ${note.__entity} • entity_id: ${note.entity_id}</i>`
       ].filter(Boolean).join("\n")
     );
 
-    // Релей + маркировка как processed (дедуп до тяжёлых шагов)
+    // Релей + маркировка как processed (до тяжёлых шагов)
     const origUrl = links[0];
     let relayCdnUrl = origUrl;
     try { relayCdnUrl = await tgRelayAudio(origUrl, `🎧 Аудио (${note.note_type}) • ${managerTxt}`); } catch {
@@ -485,15 +492,15 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
     // ASR → QA → Telegram → Supabase
     await enqueueAsr(async () => {
       try {
-        const text = await transcribeAudioFromUrl(relayCdnUrl, { callId: `amo-${note.note_id}`, fileName: "call.mp3" });
-        if (!text) { await sendTG(`❗️ ASR пусто по note ${note.note_id} (<code>${cap(relayCdnUrl, 120)}</code>)`); return; }
+        const text = await transcribeAudioFromUrl(relayCdnUrl, { callId: `amo-${note.id}`, fileName: "call.mp3" });
+        if (!text) { await sendTG(`❗️ ASR пусто по note ${note.id} (<code>${cap(relayCdnUrl, 120)}</code>)`); return; }
 
         const tHash = sha256(text);
         const qa = await analyzeTranscript(text, {
-          callId: `amo-${note.note_id}`,
+          callId: `amo-${note.id}`,
           brand: "iRazbil",
           manager: managerTxt,
-          amo_entity: note.entity,
+          amo_entity: note.__entity,
           amo_entity_id: note.entity_id,
           created_at: note.created_at || null,
           phone: phone || null,
@@ -522,7 +529,7 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
                 `• Менеджер: <b>${managerTxt}</b> · Длительность: <b>${fmtDuration(durSec)}</b>`,
                 dealUrl ? `• Карта: ${dealUrl}` : null,
                 `• call_type: <b>${call_type_norm}</b> · scored: <b>${scored ? "yes" : "no"}</b>`,
-                `• note_id: ${note.note_id}`,
+                `• note_id: ${note.id}`,
                 "",
                 "<i>Короткий транскрипт:</i>",
                 text.slice(0, 700)
@@ -536,10 +543,10 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
           const createdMs = (note.created_at || 0) * 1000;
           await upsertCallQaToSupabase({
             source_type: "amo_note",
-            source_id: String(note.note_id),
-            unique_key: sha256(`${note.note_id}:${tHash}`),
+            source_id: String(note.id),
+            unique_key: sha256(`${note.id}:${tHash}`),
 
-            amo_entity: note.entity,
+            amo_entity: note.__entity,
             amo_entity_id: note.entity_id,
             note_type: note.note_type || null,
             phone: phone || null,
@@ -572,7 +579,7 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
         }
 
       } catch (e) {
-        await sendTG(`⚠️ Ошибка пайплайна note ${note.note_id}: <code>${(e?.message || e)}</code>`);
+        await sendTG(`⚠️ Ошибка пайплайна note ${note.id}: <code>${(e?.message || e)}</code>`);
       }
     });
 

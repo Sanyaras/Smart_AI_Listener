@@ -13,9 +13,6 @@ let TELEGRAM_CHAT_ID = null;
 let TG_UPLOAD_CHAT_ID = null;
 let bot = null;
 
-/**
- * Инициализация Telegram-бота (Webhook + relay + автообработка)
- */
 export async function initTelegram(env = process.env, app = null) {
   TELEGRAM_BOT_TOKEN = env.TELEGRAM_BOT_TOKEN || env.TG_BOT_TOKEN;
   TELEGRAM_CHAT_ID = env.TELEGRAM_CHAT_ID || env.TG_CHAT_ID;
@@ -28,21 +25,18 @@ export async function initTelegram(env = process.env, app = null) {
 
   bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-  // === Команды ===
   bot.start((ctx) => ctx.reply("✅ Бот активен и готов к работе!"));
   bot.command("scan", async (ctx) => {
-    await ctx.reply("🔍 Начинаю ручное сканирование звонков...");
+    await ctx.reply("🔍 Запускаю скан звонков...");
     await processCallsAndReport(ctx);
   });
 
-  // === Обработка голосовых ===
   bot.on("message", async (ctx) => {
     const msg = ctx.message;
 
     if (msg.voice || msg.audio) {
       const fileId = msg.voice?.file_id || msg.audio?.file_id;
       console.log(`🎤 Получен голос/аудио file_id=${fileId}`);
-
       try {
         const fileRes = await fetch(
           `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
@@ -56,51 +50,52 @@ export async function initTelegram(env = process.env, app = null) {
 
         if (transcript) {
           await ctx.reply(`🗣️ Расшифровка:\n\n${transcript.slice(0, 4000)}`);
-
           const qa = await analyzeTranscript(transcript, { callId: "TG-VOICE" });
           const qaText = formatQaForTelegram(qa);
           await ctx.reply(`📊 Анализ звонка:\n${qaText}`);
         } else {
-          await ctx.reply("⚠️ Не удалось транскрибировать голос.");
+          await ctx.reply("⚠️ Не удалось распознать голос.");
         }
       } catch (err) {
         console.error("❌ Ошибка при обработке голосового:", err);
-        await ctx.reply("❌ Ошибка при обработке голосового сообщения.");
+        await ctx.reply("❌ Ошибка при обработке голосового.");
       }
     } else if (msg.text) {
-      await ctx.reply(
-        "📨 Команды:\n/start — проверить связь\n/scan — обработать звонки из AmoCRM"
-      );
+      await ctx.reply("📨 Команды:\n/start — проверить связь\n/scan — анализ новых звонков");
     }
   });
 
-  // === Запуск через Webhook ===
-  const webhookDomain = env.TG_WEBHOOK_URL || process.env.TG_WEBHOOK_URL;
+  // === Webhook или fallback на polling ===
+  const webhookDomain = (env.TG_WEBHOOK_URL || process.env.TG_WEBHOOK_URL || "")
+    .trim()
+    .replace(/^=+/, "");
   const webhookPath = `/tg/webhook/${env.TG_WEBHOOK_SECRET || "secret"}`;
 
-  if (app) {
-    app.use(await bot.createWebhook({ domain: webhookDomain, path: webhookPath }));
-    console.log(`🤖 Telegram бот запущен через webhook: ${webhookDomain}${webhookPath}`);
-  } else {
-    console.warn("⚠️ app не передан — бот запущен в offline режиме (без webhook)");
+  if (!webhookDomain || !webhookDomain.startsWith("https://")) {
+    console.warn(`⚠️ TG_WEBHOOK_URL некорректен (${webhookDomain || "пусто"}) — Telegram в polling`);
     await bot.launch();
+  } else if (app) {
+    try {
+      app.use(await bot.createWebhook({ domain: webhookDomain, path: webhookPath }));
+      console.log(`🤖 Telegram бот запущен через webhook: ${webhookDomain}${webhookPath}`);
+    } catch (err) {
+      console.error("❌ Ошибка webhook, fallback polling:", err.message);
+      await bot.launch();
+    }
+  } else {
+    await bot.launch();
+    console.log("⚙️ Telegram работает в polling режиме (app не передан)");
   }
 
-  // === Автообработка звонков ===
   const AUTO_SCAN_MINUTES = parseInt(env.AUTO_SCAN_MINUTES || "5", 10);
   if (AUTO_SCAN_MINUTES > 0) {
     setInterval(async () => {
       console.log(`🕒 Авто-скан звонков (${AUTO_SCAN_MINUTES} мин)...`);
       await processCallsAndReport();
     }, AUTO_SCAN_MINUTES * 60 * 1000);
-
-    console.log(`🔁 Автоматическая обработка звонков включена (${AUTO_SCAN_MINUTES} мин)`);
   }
 }
 
-/**
- * Отправка текста в Telegram
- */
 export async function sendTGMessage(text, chatOverride = null) {
   try {
     if (!bot) return;
@@ -111,9 +106,6 @@ export async function sendTGMessage(text, chatOverride = null) {
   }
 }
 
-/**
- * Relay: заливает mp3 в Telegram, возвращает прямую ссылку
- */
 export async function uploadToTelegramAndGetUrl(mp3Url) {
   try {
     console.log("🎧 Uploading audio to Telegram via relay...");
@@ -163,16 +155,13 @@ export async function uploadToTelegramAndGetUrl(mp3Url) {
   }
 }
 
-/**
- * Основной процесс обработки звонков
- */
 export async function processCallsAndReport(ctx = null) {
   try {
     const unprocessed = await getUnprocessedCalls(5);
     if (!unprocessed.length) {
-      const msg = "📭 Нет новых звонков для обработки";
-      console.log(msg);
+      const msg = "📭 Нет новых звонков";
       if (ctx) await ctx.reply(msg);
+      console.log(msg);
       return;
     }
 
@@ -185,10 +174,7 @@ export async function processCallsAndReport(ctx = null) {
         relayUrl = await uploadToTelegramAndGetUrl(link);
       }
 
-      if (!relayUrl) {
-        console.warn("⚠️ Не удалось получить рабочую ссылку для:", link);
-        continue;
-      }
+      if (!relayUrl) continue;
 
       const transcript = await transcribeAudio(relayUrl);
       if (!transcript) continue;
@@ -196,14 +182,13 @@ export async function processCallsAndReport(ctx = null) {
       const qa = await analyzeTranscript(transcript, { callId: note_id });
       const qaText = formatQaForTelegram(qa);
 
-      const msg = `📞 <b>Звонок #${note_id}</b>\n${qaText}`;
-      await sendTGMessage(msg);
+      await sendTGMessage(`📞 <b>Звонок #${note_id}</b>\n${qaText}`);
       await markCallProcessed(note_id, transcript, qa);
 
       console.log(`✅ Звонок #${note_id} обработан`);
     }
 
-    if (ctx) await ctx.reply("✅ Все новые звонки обработаны!");
+    if (ctx) await ctx.reply("✅ Все звонки обработаны!");
   } catch (e) {
     console.error("❌ processCallsAndReport:", safeStr(e));
     if (ctx) await ctx.reply("❌ Ошибка при обработке звонков");

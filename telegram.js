@@ -1,4 +1,6 @@
-// telegram.js — финальная версия (возвращаем проверенный relay)
+// ====================== telegram.js — industrial+human readable v3.6 ======================
+// Telegram-интеграция, relay, транскрипция, QA-анализ и Telegram-отчёт (с текстом звонка)
+
 import crypto from "crypto";
 import { fetchWithTimeout, cap, safeStr } from "./utils.js";
 import { getUnprocessedCalls, markCallProcessed } from "./supabaseStore.js";
@@ -11,7 +13,7 @@ export const TELEGRAM = {
   TG_WEBHOOK_SECRET: "",
   TG_SECRET: "",
   TG_UPLOAD_CHAT_ID: "",
-  NODE_ENV: ""
+  NODE_ENV: "",
 };
 
 /* -------------------- INIT -------------------- */
@@ -28,138 +30,189 @@ export function initTelegramEnv(env = process.env) {
       throw new Error("TG_WEBHOOK_SECRET is required in production");
     } else {
       TELEGRAM.TG_SECRET = crypto.randomBytes(18).toString("hex");
-      console.warn("⚠️ TG_WEBHOOK_SECRET not set — using ephemeral:", TELEGRAM.TG_SECRET);
+      console.warn(
+        "⚠️ TG_WEBHOOK_SECRET not set — using ephemeral:",
+        TELEGRAM.TG_SECRET
+      );
     }
+  }
+
+  if (!TELEGRAM.TG_BOT_TOKEN) {
+    console.warn("⚠️ TG_BOT_TOKEN не установлен, Telegram неактивен");
+  } else {
+    console.log("🤖 Telegram API инициализирован");
   }
 }
 
-/* -------------------- TG CORE -------------------- */
-async function tgRequest(apiPath, bodyObj, ms = 15000) {
-  if (!TELEGRAM.TG_BOT_TOKEN) throw new Error("TG_BOT_TOKEN not set");
+/* -------------------- CORE TG REQUEST -------------------- */
+async function tgRequest(apiPath, bodyObj, ms = 20000, retries = 2) {
+  if (!TELEGRAM.TG_BOT_TOKEN)
+    throw new Error("TG_BOT_TOKEN отсутствует (initTelegramEnv не выполнен)");
   const url = `https://api.telegram.org/bot${TELEGRAM.TG_BOT_TOKEN}/${apiPath}`;
   const payload = JSON.stringify(bodyObj);
 
-  const r = await fetchWithTimeout(
-    url,
-    { method: "POST", headers: { "content-type": "application/json" }, body: payload },
-    ms
-  );
-
-  const text = await r.text();
-  if (!r.ok) throw new Error(`Telegram ${apiPath} ${r.status}: ${text}`);
-  const json = JSON.parse(text);
-  if (!json.ok) throw new Error(`Telegram ${apiPath} error: ${text}`);
-  return json;
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await fetchWithTimeout(
+        url,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: payload,
+        },
+        ms
+      );
+      const text = await r.text();
+      const json = JSON.parse(text || "{}");
+      if (!r.ok || !json.ok)
+        throw new Error(`Telegram ${apiPath} ${r.status}: ${text}`);
+      return json;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`⚠️ Telegram retry #${attempt + 1}: ${safeStr(e)}`);
+      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
 }
 
-/* -------------------- SEND -------------------- */
+/* -------------------- SEND MESSAGE -------------------- */
 export async function sendTG(text) {
+  if (!TELEGRAM.TG_CHAT_ID) {
+    console.warn("⚠️ sendTG skipped: TG_CHAT_ID отсутствует");
+    return false;
+  }
   try {
-    if (!TELEGRAM.TG_BOT_TOKEN || !TELEGRAM.TG_CHAT_ID) {
-      console.warn("⚠️ sendTG skipped: no TG env");
-      return false;
-    }
     const body = {
       chat_id: TELEGRAM.TG_CHAT_ID,
-      text,
+      text: cap(text || "(пустое сообщение)", 4000),
       parse_mode: "HTML",
-      disable_web_page_preview: true
+      disable_web_page_preview: true,
     };
     await tgRequest("sendMessage", body);
     return true;
   } catch (e) {
-    console.error("❌ sendTG:", e.message || e);
+    console.error("❌ sendTG ошибка:", safeStr(e));
     return false;
   }
 }
 
-export async function tgReply(chatId, text, extra = {}) {
-  try {
-    const body = {
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      ...extra
-    };
-    await tgRequest("sendMessage", body);
-  } catch (e) {
-    console.error("tgReply error:", e.message || e);
-  }
-}
-
-export async function tgGetFileUrl(fileId) {
-  const resp = await tgRequest("getFile", { file_id: fileId });
-  if (!resp?.result?.file_path)
-    throw new Error(`tgGetFileUrl: file_path missing`);
-  return `https://api.telegram.org/file/bot${TELEGRAM.TG_BOT_TOKEN}/${resp.result.file_path}`;
-}
-
 /* -------------------- RELAY -------------------- */
 export async function tgRelayAudio(origUrl, captionForTg = "🎧 Relay upload") {
-  if (!TELEGRAM.TG_UPLOAD_CHAT_ID) throw new Error("TG_UPLOAD_CHAT_ID not set");
+  if (!TELEGRAM.TG_UPLOAD_CHAT_ID)
+    throw new Error("TG_UPLOAD_CHAT_ID не установлен");
 
-  // 📤 Telegram сам скачивает файл по URL — без ручного стрима
-  const sendResp = await tgRequest(
-    "sendDocument",
-    {
-      chat_id: TELEGRAM.TG_UPLOAD_CHAT_ID,
-      document: origUrl,
-      caption: captionForTg,
-      parse_mode: "HTML",
-      disable_content_type_detection: false
-    },
-    25000
-  );
+  console.log(`📡 Relay upload → ${origUrl}`);
+  let sendResp;
+  try {
+    sendResp = await tgRequest(
+      "sendDocument",
+      {
+        chat_id: TELEGRAM.TG_UPLOAD_CHAT_ID,
+        document: origUrl,
+        caption: captionForTg,
+        parse_mode: "HTML",
+      },
+      30000
+    );
+  } catch (e) {
+    console.warn("⚠️ sendDocument не сработал, fallback → sendAudio");
+    sendResp = await tgRequest(
+      "sendAudio",
+      {
+        chat_id: TELEGRAM.TG_UPLOAD_CHAT_ID,
+        audio: origUrl,
+        caption: captionForTg,
+      },
+      30000
+    );
+  }
 
   const fileId =
     sendResp?.result?.document?.file_id ||
     sendResp?.result?.audio?.file_id ||
     sendResp?.result?.voice?.file_id;
-
-  if (!fileId) throw new Error("tgRelayAudio: no file_id from Telegram");
+  if (!fileId) throw new Error("tgRelayAudio: Telegram не вернул file_id");
 
   const fileInfo = await tgRequest("getFile", { file_id: fileId }, 15000);
-  if (!fileInfo?.result?.file_path)
-    throw new Error("tgRelayAudio: missing file_path");
+  const finalPath = fileInfo?.result?.file_path;
+  if (!finalPath)
+    throw new Error("tgRelayAudio: Telegram не вернул file_path");
 
-  const finalUrl = `https://api.telegram.org/file/bot${TELEGRAM.TG_BOT_TOKEN}/${fileInfo.result.file_path}`;
+  const finalUrl = `https://api.telegram.org/file/bot${TELEGRAM.TG_BOT_TOKEN}/${finalPath}`;
   console.log("✅ Relay готов:", finalUrl);
   return finalUrl;
 }
 
-/* -------------------- PROCESS CALLS -------------------- */
+/* -------------------- MAIN PROCESS -------------------- */
 export async function processCallsAndReport() {
   try {
     const unprocessed = await getUnprocessedCalls(5);
-    if (!unprocessed.length) {
+    if (!unprocessed?.length) {
       console.log("📭 Нет новых звонков для обработки");
       return;
     }
 
     for (const call of unprocessed) {
       const { note_id, link } = call;
-      console.log(`📞 Обрабатываю звонок #${note_id}`);
+      console.log(`\n➡️ Обрабатываю звонок #${note_id}`);
 
-      // relay если megapbx
       let relayUrl = link;
       if (link && link.includes("megapbx.ru")) {
-        relayUrl = await tgRelayAudio(link, "📎 Relay из AmoCRM");
+        try {
+          relayUrl = await tgRelayAudio(link, `📎 Relay из AmoCRM #${note_id}`);
+        } catch (e) {
+          console.error(`❌ Relay ошибка для #${note_id}:`, safeStr(e));
+          continue;
+        }
       }
 
       if (!relayUrl) continue;
 
-      const transcript = await transcribeAudio(relayUrl);
-      if (!transcript) continue;
+      // Whisper транскрипция
+      console.log(`🎤 Транскрибирую звонок #${note_id}...`);
+      const transcript = await transcribeAudio(relayUrl).catch((e) => {
+        console.error(`❌ Ошибка транскрипции #${note_id}:`, safeStr(e));
+        return null;
+      });
 
-      const qa = await analyzeTranscript(transcript, { callId: note_id });
+      if (!transcript || !transcript.trim()) {
+        console.warn(`⚠️ Пропуск звонка #${note_id}: нет текста`);
+        continue;
+      }
+
+      console.log(`✅ Транскрипция готова (${transcript.length} символов)`);
+
+      // 💬 Отправляем саму транскрипцию в Telegram (в спойлере)
+      const shortTranscript = cap(transcript, 3900);
+      const spoiler = `🎙️ <b>Транскрипция звонка #${note_id}</b>\n||${shortTranscript.replace(
+        /([|<>])/g,
+        ""
+      )}||`;
+      await sendTG(spoiler);
+
+      // Анализ
+      console.log("🧠 Анализ звонка...");
+      let qa;
+      try {
+        qa = await analyzeTranscript(transcript, { callId: note_id });
+        console.log("✅ QA-анализ завершён");
+      } catch (e) {
+        console.error(`❌ Ошибка QA #${note_id}:`, safeStr(e));
+        await sendTG(`❗️ Ошибка QA для звонка #${note_id}: ${safeStr(e)}`);
+        continue;
+      }
+
+      // Отчёт в Telegram
       const qaText = formatQaForTelegram(qa);
-
       await sendTG(`📞 <b>Звонок #${note_id}</b>\n${qaText}`);
+
+      // Сохраняем в Supabase
       await markCallProcessed(note_id, transcript, qa);
-      console.log(`✅ Звонок #${note_id} обработан`);
+      console.log(`💾 Звонок #${note_id} сохранён`);
     }
   } catch (e) {
-    console.error("❌ processCallsAndReport:", safeStr(e));
+    console.error("💥 processCallsAndReport ошибка:", safeStr(e));
   }
 }

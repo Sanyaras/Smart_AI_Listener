@@ -4,13 +4,13 @@ import bodyParser from "body-parser";
 import { processAmoCalls } from "./amo.js";
 import { transcribeAudio } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
-import { 
-  getUnprocessedCalls, 
-  markCallProcessed, 
-  getAmoTokens, 
-  getRecentCalls 
+import {
+  getUnprocessedCalls,
+  markCallProcessed,
+  getAmoTokens,
+  getRecentCalls
 } from "./supabaseStore.js";
-import { initTelegram, sendTGMessage, uploadToTelegramAndGetUrl } from "./telegram.js";
+import { initTelegramEnv, sendTG as sendTGMessage, tgRelayAudio as uploadToTelegramAndGetUrl } from "./telegram.js";
 import { fetchWithTimeout, debug, safeStr } from "./utils.js";
 
 const app = express();
@@ -20,14 +20,12 @@ const PORT = process.env.PORT || 3000;
 const POLL_INTERVAL_MIN = parseInt(process.env.AMO_POLL_MINUTES || "5", 10) * 60 * 1000;
 
 // ====================== INIT TELEGRAM ======================
-(async () => {
-  try {
-    await initTelegram(process.env, app);
-    console.log("🤖 Telegram инициализирован (Webhook or polling mode)");
-  } catch (err) {
-    console.error("❌ Ошибка инициализации Telegram:", err);
-  }
-})();
+try {
+  initTelegramEnv(process.env);
+  console.log("🤖 Telegram окружение инициализировано (relay mode)");
+} catch (err) {
+  console.error("❌ Ошибка инициализации Telegram:", err);
+}
 
 // ====================== CORE PROCESS ======================
 async function mainCycle() {
@@ -50,8 +48,8 @@ async function mainCycle() {
 
       // 0️⃣ MegaPBX: relay через Telegram, если ссылка не скачивается напрямую
       if (link && link.includes("megapbx.ru")) {
-        debug("📡 MegaPBX detected — uploading to Telegram...");
-        const newLink = await uploadToTelegramAndGetUrl(link);
+        debug("📡 MegaPBX detected — relay через Telegram...");
+        const newLink = await uploadToTelegramAndGetUrl(link, "📎 Relay из AmoCRM");
         if (newLink) {
           link = newLink;
           debug("✅ Relay ссылка:", link);
@@ -106,8 +104,8 @@ app.get("/status", (req, res) => {
     uptime: process.uptime(),
     env: {
       AMO_BASE_URL: process.env.AMO_BASE_URL,
-      TG_CHAT_ID: process.env.TG_CHAT_ID,
-    },
+      TG_CHAT_ID: process.env.TG_CHAT_ID
+    }
   });
 });
 
@@ -124,7 +122,7 @@ app.get("/amo/debug", async (req, res) => {
 
     const url = `${process.env.AMO_BASE_URL}/api/v4/leads/notes?filter[type]=call_in&limit=10`;
     const amoRes = await fetchWithTimeout(url, {
-      headers: { Authorization: `Bearer ${tokens.access_token}` },
+      headers: { Authorization: `Bearer ${tokens.access_token}` }
     });
     const json = await amoRes.json();
 
@@ -136,7 +134,7 @@ app.get("/amo/debug", async (req, res) => {
       entity_id: n.entity_id,
       created_at: n.created_at,
       link: n.params?.link || n.params?.LINK || null,
-      type: n.note_type,
+      type: n.note_type
     }));
 
     res.json({ ok: true, count: result.length, notes: result });

@@ -145,8 +145,8 @@ export async function uploadToTelegramAndGetUrl(fileUrl) {
 }
 
 // =============================
-// Автоматический запуск
+// Автоматический запуск (только при DEBUG)
 // =============================
-if (process.env.TG_BOT_TOKEN && process.env.TG_CHAT_ID) {
-  initTelegram();
+if (process.env.TG_BOT_TOKEN && process.env.TG_CHAT_ID && process.env.TG_DEBUG === "true") {
+  initTelegram().catch((e) => console.error("⚠️ Telegram init error:", e.message));
 }

@@ -1,4 +1,6 @@
-// index.js
+// ====================== index.js — Smart AI Listener (ultimate v3.2) ======================
+// Надёжная версия: устойчива к падениям, логирует каждый шаг, обрабатывает все звонки последовательно.
+
 import express from "express";
 import bodyParser from "body-parser";
 import { processAmoCalls } from "./amo.js";
@@ -7,17 +9,21 @@ import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 import {
   getUnprocessedCalls,
   markCallProcessed,
-  getAmoTokens,
-  getRecentCalls
+  getAmoTokens
 } from "./supabaseStore.js";
-import { initTelegramEnv, sendTG as sendTGMessage, tgRelayAudio as uploadToTelegramAndGetUrl } from "./telegram.js";
+import {
+  initTelegramEnv,
+  sendTG as sendTGMessage,
+  tgRelayAudio as uploadToTelegramAndGetUrl
+} from "./telegram.js";
 import { fetchWithTimeout, debug, safeStr } from "./utils.js";
 
 const app = express();
-app.use(bodyParser.json({ limit: "10mb" }));
+app.use(bodyParser.json({ limit: "15mb" }));
 
 const PORT = process.env.PORT || 3000;
-const POLL_INTERVAL_MIN = parseInt(process.env.AMO_POLL_MINUTES || "5", 10) * 60 * 1000;
+const POLL_INTERVAL_MIN =
+  parseInt(process.env.AMO_POLL_MINUTES || "5", 10) * 60 * 1000;
 
 // ====================== INIT TELEGRAM ======================
 try {
@@ -27,68 +33,104 @@ try {
   console.error("❌ Ошибка инициализации Telegram:", err);
 }
 
-// ====================== CORE PROCESS ======================
+// ====================== CORE MAIN CYCLE ======================
 async function mainCycle() {
-  console.log("🌀 mainCycle() стартовал...");
+  console.log("\n==============================");
+  console.log(`🌀 mainCycle() стартовал @ ${new Date().toLocaleString()}`);
+  console.log("==============================");
+
   try {
-    debug("🔄 Запуск цикла AmoCRM...");
-    const found = await processAmoCalls();
-    debug(`📥 Новых звонков из AmoCRM: ${found}`);
+    debug("🔄 Получаем свежие звонки из AmoCRM...");
+    const found = await processAmoCalls().catch((e) => {
+      console.error("⚠️ processAmoCalls ошибка:", safeStr(e));
+      return 0;
+    });
+    debug(`📥 Найдено новых звонков: ${found}`);
 
     const unprocessed = await getUnprocessedCalls(10);
-    if (!unprocessed.length) {
-      debug("📭 Нет необработанных звонков");
+    if (!unprocessed?.length) {
+      debug("📭 Нет необработанных звонков в Supabase");
       return;
     }
 
-    debug(`🎧 Обрабатываем ${unprocessed.length} звонков...`);
+    debug(`🎧 К обработке: ${unprocessed.length} звонков...`);
     for (const call of unprocessed) {
-      let { note_id, link } = call;
-      debug(`➡️ Note ${note_id}: ${link}`);
+      const { note_id, link } = call;
+      console.log(`\n➡️ Начинаю обработку звонка #${note_id}`);
+      let relayUrl = link;
 
-      // 0️⃣ MegaPBX: relay через Telegram, если ссылка не скачивается напрямую
+      // 0️⃣ Проверка источника (MegaPBX)
       if (link && link.includes("megapbx.ru")) {
-        debug("📡 MegaPBX detected — relay через Telegram...");
-        const newLink = await uploadToTelegramAndGetUrl(link, "📎 Relay из AmoCRM");
-        if (newLink) {
-          link = newLink;
-          debug("✅ Relay ссылка:", link);
-        } else {
-          console.warn("⚠️ Не удалось получить relay-ссылку, пропуск...");
+        console.log("📡 MegaPBX ссылка обнаружена, relay через Telegram...");
+        relayUrl = await uploadToTelegramAndGetUrl(link, `🎧 Relay для #${note_id}`).catch((e) => {
+          console.error("❌ Relay ошибка:", safeStr(e));
+          return null;
+        });
+        if (!relayUrl) {
+          console.warn(`⚠️ Пропуск звонка #${note_id}: relay не удалось`);
           continue;
         }
       }
 
-      // 1️⃣ Транскрипция
-      const transcript = await transcribeAudio(link);
-      if (!transcript) {
-        debug(`⚠️ Пропущен звонок ${note_id}: не удалось транскрибировать`);
+      // 1️⃣ Whisper-транскрипция
+      console.log(`🎤 Транскрибирую звонок #${note_id}...`);
+      const transcript = await transcribeAudio(relayUrl).catch((e) => {
+        console.error("❌ Ошибка транскрипции:", safeStr(e));
+        return null;
+      });
+
+      if (!transcript || !transcript.trim()) {
+        console.warn(`⚠️ Пропуск звонка #${note_id}: нет текста`);
         continue;
       }
 
-      // 2️⃣ Анализ звонка
-      const qa = await analyzeTranscript(transcript, { callId: note_id });
-      const qaText = formatQaForTelegram(qa);
+      console.log(`✅ Транскрипция готова (${transcript.length} символов)`);
 
-      // 3️⃣ Отчёт в Telegram
-      await sendTGMessage(`📞 <b>Звонок #${note_id}</b>\n${qaText}`);
+      // 2️⃣ Анализ через QA Assistant
+      console.log("🧠 Запускаю анализ звонка...");
+      let qa;
+      try {
+        qa = await analyzeTranscript(transcript, { callId: note_id });
+        console.log("✅ QA анализ завершён успешно");
+        console.log("🧩 Фрагмент JSON:", JSON.stringify(qa).slice(0, 200));
+      } catch (e) {
+        console.error("❌ Ошибка при анализе звонка:", safeStr(e));
+        await sendTGMessage(`❗️ Ошибка анализа звонка #${note_id}: ${safeStr(e)}`);
+        continue;
+      }
 
-      // 4️⃣ Пометка в Supabase
-      await markCallProcessed(note_id, transcript, qa);
-      debug(`✅ Звонок ${note_id} обработан`);
+      // 3️⃣ Форматирование и отчёт в Telegram
+      let qaText = "";
+      try {
+        qaText = formatQaForTelegram(qa);
+        await sendTGMessage(`📞 <b>Звонок #${note_id}</b>\n${qaText}`);
+        console.log("📨 Отчёт успешно отправлен в Telegram");
+      } catch (e) {
+        console.error("❌ Ошибка при отправке отчёта в Telegram:", safeStr(e));
+      }
+
+      // 4️⃣ Сохранение результатов в Supabase
+      try {
+        await markCallProcessed(note_id, transcript, qa);
+        console.log(`✅ Звонок #${note_id} успешно записан как обработанный`);
+      } catch (e) {
+        console.error("⚠️ Ошибка при сохранении звонка:", safeStr(e));
+      }
     }
 
-    console.log("✅ mainCycle успешно завершён");
+    console.log("✅ mainCycle завершён успешно");
   } catch (e) {
-    console.error("❌ Ошибка mainCycle:", safeStr(e));
+    console.error("💥 Ошибка уровня mainCycle:", safeStr(e));
   }
 }
 
 // ====================== EXPRESS ROUTES ======================
-app.get("/", (req, res) => res.send("✅ Smart AI Listener v3 работает"));
+app.get("/", (req, res) =>
+  res.send("✅ Smart AI Listener v3.2 работает стабильно 🚀")
+);
 
 app.post("/amo/force-scan", async (req, res) => {
-  console.log("⚙️ POST /amo/force-scan запущен вручную");
+  console.log("⚙️ /amo/force-scan — ручной запуск обработки звонков");
   try {
     await mainCycle();
     res.json({ ok: true });
@@ -101,15 +143,17 @@ app.post("/amo/force-scan", async (req, res) => {
 app.get("/status", (req, res) => {
   res.json({
     ok: true,
-    uptime: process.uptime(),
+    uptime: `${Math.round(process.uptime())}s`,
+    next_poll_min: POLL_INTERVAL_MIN / 60000,
     env: {
       AMO_BASE_URL: process.env.AMO_BASE_URL,
-      TG_CHAT_ID: process.env.TG_CHAT_ID
-    }
+      TG_CHAT_ID: process.env.TG_CHAT_ID,
+      NODE_ENV: process.env.NODE_ENV,
+    },
   });
 });
 
-// ====================== DEBUG ROUTES ======================
+// ====================== DEBUG ROUTE ======================
 app.get("/amo/debug", async (req, res) => {
   try {
     const key = req.query.key;
@@ -122,33 +166,38 @@ app.get("/amo/debug", async (req, res) => {
 
     const url = `${process.env.AMO_BASE_URL}/api/v4/leads/notes?filter[type]=call_in&limit=10`;
     const amoRes = await fetchWithTimeout(url, {
-      headers: { Authorization: `Bearer ${tokens.access_token}` }
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
     });
     const json = await amoRes.json();
 
-    if (!json?._embedded?.notes)
-      return res.status(500).json({ error: "No notes returned", raw: json });
-
-    const result = json._embedded.notes.map((n) => ({
-      id: n.id,
-      entity_id: n.entity_id,
-      created_at: n.created_at,
-      link: n.params?.link || n.params?.LINK || null,
-      type: n.note_type
-    }));
-
-    res.json({ ok: true, count: result.length, notes: result });
+    const notes = json?._embedded?.notes || [];
+    res.json({
+      ok: true,
+      count: notes.length,
+      notes: notes.map((n) => ({
+        id: n.id,
+        entity_id: n.entity_id,
+        created_at: n.created_at,
+        link: n.params?.link || n.params?.LINK || null,
+        type: n.note_type,
+      })),
+    });
   } catch (e) {
-    console.error("❌ /amo/debug:", e);
+    console.error("❌ /amo/debug ошибка:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 // ====================== SCHEDULER ======================
-setInterval(mainCycle, POLL_INTERVAL_MIN);
+setInterval(() => {
+  console.log("⏰ Плановый запуск mainCycle()");
+  mainCycle().catch(console.error);
+}, POLL_INTERVAL_MIN);
+
+// Первый запуск сразу при старте
 mainCycle().catch(console.error);
 
 // ====================== START SERVER ======================
 app.listen(PORT, () => {
-  console.log(`🚀 Smart-AI-Listener v3 запущен на порту ${PORT}`);
+  console.log(`🚀 Smart-AI-Listener v3.2 запущен на порту ${PORT}`);
 });

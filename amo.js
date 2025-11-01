@@ -56,12 +56,9 @@ async function getAccessToken() {
 // ================= FETCH RECENT CALL NOTES =================
 
 function isLikelyCall(note) {
-  return (
-    note &&
-    note.note_type === "call_in" &&
-    note.params &&
-    (note.params.LINK || note.params.link)
-  );
+  if (!note || note.note_type !== "call_in") return false;
+  const link = note.params?.LINK || note.params?.link;
+  return typeof link === "string" && link.includes(".mp3");
 }
 
 async function fetchRecentNotes(sinceSeconds = 0, limit = 200) {

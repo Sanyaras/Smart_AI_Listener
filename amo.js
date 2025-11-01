@@ -170,6 +170,7 @@ function entityCardUrl(entity, id){
   if (entity === "lead")     return `${AMO_BASE_URL}/leads/detail/${id}`;
   if (entity === "contact")  return `${AMO_BASE_URL}/contacts/detail/${id}`;
   if (entity === "company")  return `${AMO_BASE_URL}/companies/detail/${id}`;
+  if (entity === "customer") return `${AMO_BASE_URL}/customers/detail/${id}`;
   return `${AMO_BASE_URL}`;
 }
 function isLikelyCallNote(note){
@@ -258,10 +259,11 @@ async function upsertCallQaToSupabase(row){
 
 // === /amo/debug/notes: всегда новые сверху ===
 export async function debugFetchRecentWithMeta(limit = 50){
-  const [leads, contacts, companies] = await Promise.all([
+  const [leads, contacts, companies, customers] = await Promise.all([
     amoFetch(`/api/v4/leads/notes?limit=${limit}&page=1&order[created_at]=desc`),
     amoFetch(`/api/v4/contacts/notes?limit=${limit}&page=1&order[created_at]=desc`),
     amoFetch(`/api/v4/companies/notes?limit=${limit}&page=1&order[created_at]=desc`),
+    amoFetch(`/api/v4/customers/notes?limit=${limit}&page=1&order[created_at]=desc`),
   ]);
   const pick = (entity, arr) => {
     const items = Array.isArray(arr?._embedded?.notes) ? arr._embedded.notes : [];
@@ -279,6 +281,7 @@ export async function debugFetchRecentWithMeta(limit = 50){
     ...pick("lead",     leads),
     ...pick("contact",  contacts),
     ...pick("company",  companies),
+    ...pick("customer", customers),
   ].sort((a,b) => (b.created_at||0) - (a.created_at||0));
   return { ok: true, count: out.length, items: out };
 }
@@ -324,17 +327,21 @@ export async function setManualSince(ts){
   await setSecret(SECRET_KEY_MANUAL_SINCE, String(n));
   return n;
 }
+async function fetchRecentNotes(pathBase, perPage, maxPagesForward, sinceSec){ /* как у тебя сейчас */ }
+
 async function fetchRecentAcrossEntities(sinceSec, perEntityLimit = 50){
-  const maxPagesForward = 25; // идём от свежих вверх
-  const [leadRaw, contactRaw, companyRaw] = await Promise.all([
+  const maxPagesForward = 25;
+  const [leadRaw, contactRaw, companyRaw, customerRaw] = await Promise.all([
     fetchRecentNotes("/api/v4/leads/notes",     perEntityLimit, maxPagesForward, sinceSec),
     fetchRecentNotes("/api/v4/contacts/notes",  perEntityLimit, maxPagesForward, sinceSec),
     fetchRecentNotes("/api/v4/companies/notes", perEntityLimit, maxPagesForward, sinceSec),
+    fetchRecentNotes("/api/v4/customers/notes", perEntityLimit, maxPagesForward, sinceSec),
   ]);
   const arr = [
-    ...leadRaw.map(n=>({entity:"lead", note:n})),
-    ...contactRaw.map(n=>({entity:"contact", note:n})),
-    ...companyRaw.map(n=>({entity:"company", note:n})),
+    ...leadRaw.map(n=>({entity:"lead",     note:n})),
+    ...contactRaw.map(n=>({entity:"contact",  note:n})),
+    ...companyRaw.map(n=>({entity:"company",  note:n})),
+    ...customerRaw.map(n=>({entity:"customer", note:n})),
   ];
   arr.sort((a,b)=> (b.note.created_at||0) - (a.note.created_at||0));
   return arr;
@@ -439,10 +446,12 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
     let managerTxt = "неизвестно";
     try {
       const cardPath = note.entity === "lead"
-        ? `/api/v4/leads/${note.entity_id}`
-        : note.entity === "contact"
-        ? `/api/v4/contacts/${note.entity_id}`
-        : `/api/v4/companies/${note.entity_id}`;
+       ? `/api/v4/leads/${note.entity_id}`
+       : note.entity === "contact"
+       ? `/api/v4/contacts/${note.entity_id}`
+       : note.entity === "company"
+       ? `/api/v4/companies/${note.entity_id}`
+       : `/api/v4/customers/${note.entity_id}`;
       const card = await amoFetch(cardPath);
       const respId = card.responsible_user_id || card.responsible_user || null;
       if (respId && usersMap.has(respId)) managerTxt = usersMap.get(respId).name;

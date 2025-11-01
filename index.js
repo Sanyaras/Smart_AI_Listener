@@ -114,6 +114,28 @@ app.get("/amo/debug", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+import { getAmoTokens } from "./supabaseStore.js";
+import { fetchWithTimeout } from "./utils.js";
+
+app.get("/amo/debug/full", async (req, res) => {
+  try {
+    const key = req.query.key;
+    if (key !== process.env.CRM_SHARED_KEY) return res.status(403).json({ error: "Forbidden" });
+
+    const tokens = await getAmoTokens();
+    const url = `${process.env.AMO_BASE_URL}/api/v4/leads/notes?limit=10`;
+    const amoRes = await fetchWithTimeout(url, {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    const json = await amoRes.json();
+
+    res.json(json._embedded?.notes || json);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ====================== SCHEDULER ======================
 
 setInterval(mainCycle, POLL_INTERVAL_MIN);

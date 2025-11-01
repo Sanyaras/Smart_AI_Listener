@@ -2,7 +2,7 @@
 import express from "express";
 import bodyParser from "body-parser";
 import { processAmoCalls } from "./amo.js";
-import { transcribeAudio } from "./asr.js";
+import { transcribeAudioFromUrl as transcribeAudio } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 import {
   getUnprocessedCalls,

@@ -6,12 +6,9 @@ const BASE_URL = process.env.AMO_BASE_URL;
 const CLIENT_ID = process.env.AMO_CLIENT_ID;
 const CLIENT_SECRET = process.env.AMO_CLIENT_SECRET;
 const REDIRECT_URI = process.env.AMO_REDIRECT_URI;
-const TIMEZONE = process.env.AMO_TIMEZONE || "Europe/Moscow";
 
 if (!BASE_URL || !CLIENT_ID || !CLIENT_SECRET)
   throw new Error("❌ Missing AmoCRM credentials in env");
-
-// ================= AUTH =================
 
 async function refreshAmoTokens(refreshToken) {
   debug("🔁 Refreshing Amo tokens...");
@@ -26,7 +23,6 @@ async function refreshAmoTokens(refreshToken) {
       redirect_uri: REDIRECT_URI,
     }),
   });
-
   const json = await res.json();
   if (json.access_token && json.refresh_token) {
     const expires_at = new Date(Date.now() + json.expires_in * 1000).toISOString();
@@ -56,39 +52,33 @@ async function getAccessToken() {
   return tokens.access_token;
 }
 
-// ================= CALL DETECTION =================
+// ================= FETCH RECENT NOTES =================
 
-function isLikelyCall(note) {
-  if (!note || note.note_type !== "call_in") return false;
-  const link = note.params?.link || note.params?.LINK;
-  return typeof link === "string" && link.endsWith(".mp3");
-}
-
-function extractCallLink(note) {
-  const link = note.params?.link || note.params?.LINK;
-  return typeof link === "string" && link.includes(".mp3") ? link : null;
-}
-
-// ================= FETCH RECENT CALL NOTES =================
-
-async function fetchRecentNotes(sinceSeconds = 0, limit = 200) {
-  const token = await getAccessToken();
-  const url = `${BASE_URL}/api/v4/leads/notes?filter[type]=call_in&limit=${limit}`;
-
-  const res = await fetchWithTimeout(
-    url,
-    { headers: { Authorization: `Bearer ${token}` } },
-    20000
+function isValidCall(note) {
+  if (!note) return false;
+  const type = note.note_type;
+  const link =
+    note.params?.LINK || note.params?.link || note.params?.file || "";
+  return (
+    (type === "call_in" || type === "call_out") &&
+    typeof link === "string" &&
+    link.includes(".mp3")
   );
+}
 
+async function fetchNotes(scope = "leads", sinceSeconds = 0, limit = 200) {
+  const token = await getAccessToken();
+  const url = `${BASE_URL}/api/v4/${scope}/notes?filter[type][]=call_in&filter[type][]=call_out&limit=${limit}&order[id]=desc`;
+  const res = await fetchWithTimeout(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
   const json = await res.json();
   if (!json?._embedded?.notes) {
-    debug("⚠️ No notes found:", safeStr(json));
+    debug(`⚠️ No notes found for ${scope}:`, safeStr(json));
     return [];
   }
-
   return json._embedded.notes.filter(
-    (n) => n.created_at >= sinceSeconds && isLikelyCall(n)
+    (n) => n.created_at >= sinceSeconds && isValidCall(n)
   );
 }
 
@@ -96,32 +86,48 @@ async function fetchRecentNotes(sinceSeconds = 0, limit = 200) {
 
 export async function processAmoCalls() {
   try {
-    const since = Math.floor(Date.now() / 1000) - 60 * 60 * 24; // последние 24 часа
-    const fresh = await fetchRecentNotes(since, process.env.AMO_POLL_LIMIT || 100);
+    const since = Math.floor(Date.now() / 1000) - 60 * 60 * 24; // 24 часа
+    const scopes = ["leads", "contacts"];
+    let totalInserted = 0;
 
-    if (!fresh.length) {
-      debug("📭 Нет новых звонков");
-      return 0;
-    }
-
-    debug(`📞 Найдено ${fresh.length} звонков`);
-
-    for (const note of fresh) {
-      const note_id = note.id;
-      const contact_id = note.entity_id;
-      const link = extractCallLink(note);
-      const created_at = new Date(note.created_at * 1000).toISOString();
-
-      if (!link) {
-        debug(`⚪️ Пропущен note ${note_id}: нет mp3`);
+    for (const scope of scopes) {
+      debug(`📡 Fetching recent ${scope} call notes...`);
+      const fresh = await fetchNotes(scope, since, 200);
+      if (!fresh.length) {
+        debug(`📭 Нет звонков для ${scope}`);
         continue;
       }
 
-      await insertCallRecord({ note_id, contact_id, link, created_at });
-      debug(`✅ Добавлен звонок: ${note_id} (${fmtDate(note.created_at)})`);
+      debug(`📞 Найдено ${fresh.length} звонков (${scope})`);
+
+      for (const note of fresh) {
+        const note_id = note.id;
+        const entity_id = note.entity_id || 0;
+        const link =
+          note.params?.LINK || note.params?.link || note.params?.file || null;
+        const created_at = note.created_at
+          ? new Date(note.created_at * 1000).toISOString()
+          : new Date().toISOString();
+
+        if (!link) {
+          debug(`⚪️ Пропущен note ${note_id}: нет ссылки`);
+          continue;
+        }
+
+        await insertCallRecord({
+          note_id,
+          contact_id: entity_id,
+          link,
+          created_at,
+          scope,
+        });
+        totalInserted++;
+        debug(`✅ Добавлен звонок (${scope}): ${note_id} (${fmtDate(note.created_at)})`);
+      }
     }
 
-    return fresh.length;
+    debug(`📦 Всего добавлено ${totalInserted} звонков`);
+    return totalInserted;
   } catch (e) {
     console.error("❌ processAmoCalls:", safeStr(e));
     return 0;

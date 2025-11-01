@@ -1,10 +1,11 @@
-// amo.js — AmoCRM интеграция (v3.6-IRAZBIL-manual-since)
+// amo.js — AmoCRM интеграция (v3.7-IRAZBIL-new-calls-only)
 import crypto from "crypto";
 import { fetchWithTimeout, mask, cap } from "./utils.js";
 import { sendTG, tgRelayAudio } from "./telegram.js";
 import { enqueueAsr, transcribeAudioFromUrl } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
+// ==== ENV ====
 const AMO_BASE_URL       = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
 const AMO_CLIENT_ID      = process.env.AMO_CLIENT_ID || "";
 const AMO_CLIENT_SECRET  = process.env.AMO_CLIENT_SECRET || "";
@@ -28,7 +29,6 @@ const ALERT_IF_ESCALATE      = (process.env.ALERT_IF_ESCALATE || "1") === "1";
 const SUPABASE_URL   = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "";
 const SUPABASE_QA    = process.env.SUPABASE_CALLS_QA_TABLE || "calls_qa";
-const SUPABASE_PROC  = process.env.SUPABASE_PROCESSED_TABLE || "processed_calls";
 
 import {
   isAlreadyProcessed,
@@ -40,7 +40,7 @@ import {
 
 const SECRET_KEY_ACCESS  = "amo_access_token";
 const SECRET_KEY_REFRESH = "amo_refresh_token";
-const SECRET_KEY_MANUAL_SINCE = "amo_manual_since"; // <— ручной курсор
+const SECRET_KEY_MANUAL_SINCE = "amo_manual_since"; // ручной курсор
 
 /* ===== OAuth & Fetch ===== */
 function ensureAmoEnv() {
@@ -119,26 +119,38 @@ export async function amoFetch(path, opts = {}, ms = 15000) {
   if (!AMO_ACCESS_TOKEN) throw new Error("No AMO_ACCESS_TOKEN — авторизуйся на /amo/oauth/start");
 
   const url = `${AMO_BASE_URL}${path}`;
-  const doFetch = (token) => fetchWithTimeout(url, {
-    ...opts,
-    headers: { "authorization": `Bearer ${token}`, "content-type":"application/json", ...(opts.headers||{}) }
-  }, ms);
+  const doFetch = (token) => fetchWithTimeout(
+    url,
+    { ...opts, headers: { "authorization": `Bearer ${token}`, "content-type":"application/json", ...(opts.headers||{}) } },
+    ms
+  );
 
-  let r = await doFetch(AMO_ACCESS_TOKEN);
-  if (r.status === 401) {
-    try { await amoRefresh(); }
-    catch (e) {
-      const body = await r.text().catch(()=> "");
-      throw new Error(`amo ${path} 401 and refresh failed: ${body || e?.message || e}`);
+  let attempt = 0;
+  while (true) {
+    let r = await doFetch(AMO_ACCESS_TOKEN);
+    if (r.status === 401) {
+      try { await amoRefresh(); }
+      catch (e) {
+        const body = await r.text().catch(()=> "");
+        throw new Error(`amo ${path} 401 and refresh failed: ${body || e?.message || e}`);
+      }
+      r = await doFetch(AMO_ACCESS_TOKEN);
     }
-    r = await doFetch(AMO_ACCESS_TOKEN);
+    if (r.status === 204) return { _embedded: { notes: [] } };
+
+    if (r.status === 429 || (r.status >= 500 && r.status < 600)) {
+      attempt++;
+      const retryAfter = parseInt(r.headers.get("Retry-After") || "0", 10);
+      const delayMs = retryAfter > 0 ? retryAfter * 1000 : Math.min(15000, 500 * Math.pow(2, attempt));
+      await new Promise(res => setTimeout(res, delayMs));
+      if (attempt <= 5) continue;
+    }
+    if (!r.ok) {
+      const t = await r.text().catch(()=> "");
+      throw new Error(`amo ${path} ${r.status}: ${t}`);
+    }
+    return await r.json();
   }
-  if (r.status === 204) return { _embedded: { notes: [] } };
-  if (!r.ok) {
-    const t = await r.text().catch(()=> "");
-    throw new Error(`amo ${path} ${r.status}: ${t}`);
-  }
-  return await r.json();
 }
 
 /* ===== Helpers ===== */
@@ -247,9 +259,9 @@ async function upsertCallQaToSupabase(row){
 /* ===== Debug dump последних заметок (для /amo/debug/notes) ===== */
 export async function debugFetchRecentWithMeta(limit = 50){
   const [leads, contacts, companies] = await Promise.all([
-    amoFetch(`/api/v4/leads/notes?limit=${limit}`),
-    amoFetch(`/api/v4/contacts/notes?limit=${limit}`),
-    amoFetch(`/api/v4/companies/notes?limit=${limit}`),
+    amoFetch(`/api/v4/leads/notes?limit=${limit}&page=1`),
+    amoFetch(`/api/v4/contacts/notes?limit=${limit}&page=1`),
+    amoFetch(`/api/v4/companies/notes?limit=${limit}&page=1`),
   ]);
   const pick = (entity, arr) => {
     const items = Array.isArray(arr?._embedded?.notes) ? arr._embedded.notes : [];
@@ -271,51 +283,33 @@ export async function debugFetchRecentWithMeta(limit = 50){
   return { ok: true, count: out.length, items: out };
 }
 
-/* ===== Общая выборка хвоста с порогом sinceSec ===== */
-async function probeLastPage(pathBase, perPage, maxPageCap = 2000){
-  const first = await amoFetch(`${pathBase}?limit=${perPage}&page=1`);
-  let lastPage = 1;
-  const lastHref = first?._links?.last?.href;
-  if (lastHref) {
-    const m = String(lastHref).match(/(?:\?|&)page=(\d+)/i);
-    if (m) { lastPage = parseInt(m[1], 10) || 1; if (lastPage > 1) return lastPage; }
-  }
-  // грубый бинарный поиск последней ненулевой страницы
-  let lo = 1, hi = 1;
-  const loHas = Array.isArray(first?._embedded?.notes) && first._embedded.notes.length>0;
-  if (!loHas) return 1;
-  while (hi < maxPageCap) {
-    hi *= 2;
-    const j = await amoFetch(`${pathBase}?limit=${perPage}&page=${hi}`);
-    const has = Array.isArray(j?._embedded?.notes) && j._embedded.notes.length>0;
-    if (!has) break; lo = hi;
-  }
-  let L = lo, R = Math.min(hi, maxPageCap);
-  while (L + 1 < R) {
-    const mid = Math.floor((L+R)/2);
-    const j = await amoFetch(`${pathBase}?limit=${perPage}&page=${mid}`);
-    const has = Array.isArray(j?._embedded?.notes) && j._embedded.notes.length>0;
-    if (has) L = mid; else R = mid;
-  }
-  return L;
-}
-
-async function fetchRecentNotes(pathBase, perPage, maxPagesBack, sinceSec){
-  const lastPage = await probeLastPage(pathBase, perPage);
+/* ===== Правильная выборка «новых»: page=1 → вверх, пока >= since ===== */
+async function fetchRecentNotes(pathBase, perPage, maxPagesForward, sinceSec){
   const out = [];
-  outer:
-  for (let page = lastPage; page >= Math.max(1, lastPage - maxPagesBack + 1); page--) {
+  let page = 1;
+  for (let i = 0; i < maxPagesForward; i++, page++) {
     const j = await amoFetch(`${pathBase}?limit=${perPage}&page=${page}`);
     const arr = Array.isArray(j?._embedded?.notes) ? j._embedded.notes : [];
-    if (!arr.length) continue;
-    for (const n of arr) {
-      const ca = parseInt(n?.created_at || 0, 10) || 0;
-      if (ca < sinceSec) break outer;
-      out.push(n);
+    if (!arr.length) break;
+
+    // Если самая старая в странице уже < since — страница дальше не нужна
+    const minCreated = Math.min(...arr.map(n => parseInt(n?.created_at || 0, 10) || 0));
+    if (Number.isFinite(minCreated) && minCreated < sinceSec) {
+      for (const n of arr) {
+        const ca = parseInt(n?.created_at || 0, 10) || 0;
+        if (ca >= sinceSec) out.push(n);
+      }
+      break;
+    } else {
+      out.push(...arr);
     }
+
+    // Если есть _links.next — продолжаем, иначе выходим
+    const hasNext = !!j?._links?.next?.href;
+    if (!hasNext) break;
   }
   out.sort((a,b) => (b.created_at||0) - (a.created_at||0));
-  return out;
+  return out.filter(n => (parseInt(n?.created_at || 0, 10) || 0) >= sinceSec);
 }
 
 function filterCallish(arr){ return arr.filter(isLikelyCallNote); }
@@ -332,11 +326,11 @@ export async function setManualSince(ts){
   return n;
 }
 async function fetchRecentAcrossEntities(sinceSec, perEntityLimit = 50){
-  const maxPagesBack = 12;
+  const maxPagesForward = 25; // идём от свежих вверх
   const [leadRaw, contactRaw, companyRaw] = await Promise.all([
-    fetchRecentNotes("/api/v4/leads/notes",     perEntityLimit, maxPagesBack, sinceSec),
-    fetchRecentNotes("/api/v4/contacts/notes",  perEntityLimit, maxPagesBack, sinceSec),
-    fetchRecentNotes("/api/v4/companies/notes", perEntityLimit, maxPagesBack, sinceSec),
+    fetchRecentNotes("/api/v4/leads/notes",     perEntityLimit, maxPagesForward, sinceSec),
+    fetchRecentNotes("/api/v4/contacts/notes",  perEntityLimit, maxPagesForward, sinceSec),
+    fetchRecentNotes("/api/v4/companies/notes", perEntityLimit, maxPagesForward, sinceSec),
   ]);
   const arr = [
     ...leadRaw.map(n=>({entity:"lead", note:n})),
@@ -347,17 +341,16 @@ async function fetchRecentAcrossEntities(sinceSec, perEntityLimit = 50){
   return arr;
 }
 export async function setManualSinceToPenultimate(){
-  // берём окно за 72ч назад, смотрим только заметки c валидной ссылкой на запись
   const since = Math.floor((Date.now() - BACKFILL_MAX_HOURS * 3600 * 1000) / 1000);
   const rows = await fetchRecentAcrossEntities(since, 100);
   const withLink = rows.filter(r => {
     if (!r?.note) return false;
-    const links = (r.note?.params?.link && typeof r.note.params.link === "string" && r.note.params.link.startsWith("http"))
-      ? [r.note.params.link] : [];
-    return (r.note?.note_type || "").startsWith("call_") && (links.length > 0);
+    const link = r.note?.params?.link;
+    const ln = (typeof link === "string" && link.startsWith("http")) ? [link] : [];
+    return (r.note?.note_type || "").startsWith("call_") && ln.length > 0;
   });
   if (withLink.length < 2) throw new Error("not enough linked call notes to set penultimate");
-  const penultimate = withLink[1].note.created_at; // [0] — последний, [1] — предпоследний
+  const penultimate = withLink[1].note.created_at;
   await setManualSince(penultimate);
   return penultimate;
 }
@@ -378,7 +371,6 @@ function deriveCallTypeAndScored(qa, durSec) {
 }
 
 /* ===== Главный поллер ===== */
-// options: { force?: boolean, sinceEpochSec?: number|null, bootstrapLimit?: number }
 export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, options = {}) {
   const { sinceEpochSec = null } = options || {};
   const perEntityLimit = Math.min(limit, 200);
@@ -399,6 +391,7 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
     }))
     .filter(n => isLikelyCallNote(n));
 
+  // свежие сверху
   picked.sort((a,b) => (b.created_at||0) - (a.created_at||0));
 
   const out = {
@@ -411,7 +404,7 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
     since: sinceSec
   };
 
-  // Получим имена ответственных (опционально)
+  // имена ответственных (опционально)
   let usersMap = new Map();
   try {
     const data = await amoFetch("/api/v4/users?limit=250");
@@ -424,7 +417,7 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
     const source_type = "amo_note";
     const source_id   = String(note.note_id);
 
-    // Дедуп на входе
+    // Дедуп
     const already = await isAlreadyProcessed(source_type, source_id).catch(()=>false);
     if (already) { out.skipped++; continue; }
 
@@ -456,7 +449,7 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
       if (respId && usersMap.has(respId)) managerTxt = usersMap.get(respId).name;
     } catch {}
 
-    // Пред-репорт
+    // Пред-репорт (без сырых HTML-страниц)
     try {
       await sendTG(
         [
@@ -474,7 +467,7 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
       );
     } catch {}
 
-    // Mark processed ДО тяжёлых шагов (409 — норм)
+    // Mark processed ДО тяжёлых шагов
     try { await markProcessed(source_type, source_id, links[0]); } catch {}
 
     // ASR → QA → Telegram → Supabase
@@ -512,7 +505,7 @@ export async function processAmoCallNotes(limit = 200, _bootstrapRemaining = 0, 
 
         const { call_type_norm, scored } = deriveCallTypeAndScored(qa, durSec);
 
-        // Alerts (опционально)
+        // Alerts
         try {
           const total = qa?.score?.total ?? 0;
           const pe    = qa?.psycho_emotional || {};

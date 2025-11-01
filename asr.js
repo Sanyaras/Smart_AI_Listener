@@ -1,52 +1,62 @@
 // asr.js
-import fs from "fs";
-import path from "path";
 import fetch from "node-fetch";
-import { debug, safeStr, fetchWithTimeout } from "./utils.js";
+import fs from "fs/promises";
+import path from "path";
+import { debug, safeStr } from "./utils.js";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) throw new Error("❌ OPENAI_API_KEY is missing");
+const TMP_DIR = "/tmp/audio_cache";
+await fs.mkdir(TMP_DIR, { recursive: true });
 
-const TEMP_DIR = "/tmp/asr_audio";
+// Helper to download mp3 with retry
+async function downloadAudioFile(url, timeout = 120000) {
+  const filename = path.join(TMP_DIR, `${Date.now()}.mp3`);
+  debug(`🕓 Скачиваю аудио: ${url}`);
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
 
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
-
-export async function transcribeAudio(url) {
   try {
-    debug("🎧 Downloading audio:", url);
-    const filename = path.join(TEMP_DIR, `call_${Date.now()}.mp3`);
-    const file = fs.createWriteStream(filename);
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`Bad response ${res.status}`);
+    const buffer = await res.arrayBuffer();
+    await fs.writeFile(filename, Buffer.from(buffer));
+    clearTimeout(id);
+    debug(`✅ Аудио скачано: ${filename}`);
+    return filename;
+  } catch (e) {
+    clearTimeout(id);
+    console.error("❌ Ошибка скачивания mp3:", safeStr(e));
+    return null;
+  }
+}
 
-    const res = await fetchWithTimeout(url, {}, 30000);
-    if (!res.ok) throw new Error(`Download failed ${res.status}`);
-    await new Promise((resolve, reject) => {
-      res.body.pipe(file);
-      res.body.on("error", reject);
-      file.on("finish", resolve);
-    });
+// Whisper/OpenAI transcription
+export async function transcribeAudio(audioUrl) {
+  try {
+    const localPath = await downloadAudioFile(audioUrl);
+    if (!localPath) return null;
 
-    debug("📡 Uploading to Whisper...");
+    const openaiUrl = "https://api.openai.com/v1/audio/transcriptions";
+    const formData = new FormData();
+    formData.append("model", "whisper-1");
+    formData.append("file", new Blob([await fs.readFile(localPath)]), "call.mp3");
+    formData.append("response_format", "text");
 
-    const form = new FormData();
-    form.append("file", fs.createReadStream(filename));
-    form.append("model", "whisper-1");
-    form.append("language", "ru");
-
-    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    debug("🎙️ Отправляю в Whisper...");
+    const res = await fetch(openaiUrl, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: form,
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: formData,
     });
 
-    const json = await r.json();
-    if (!json.text) throw new Error("No transcription returned");
-    debug("✅ Transcription complete, length:", json.text.length);
+    if (!res.ok) {
+      const text = await res.text();
+      console.error("❌ Ошибка OpenAI:", text);
+      return null;
+    }
 
-    try { fs.unlinkSync(filename); } catch {}
-
-    return json.text.trim();
+    const transcript = await res.text();
+    debug(`🧾 Распознано ${transcript.length} символов`);
+    return transcript.trim();
   } catch (e) {
     console.error("❌ transcribeAudio error:", safeStr(e));
     return null;

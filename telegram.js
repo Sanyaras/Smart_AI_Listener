@@ -10,7 +10,7 @@ let TELEGRAM_BOT_TOKEN = null;
 /**
  * Инициализация окружения Telegram
  */
-export function initTelegramEnv(env) {
+export function initTelegramEnv(env = process.env) {
   TELEGRAM_BOT_TOKEN = env.TELEGRAM_BOT_TOKEN || env.TG_BOT_TOKEN;
   TELEGRAM_CHAT_ID = env.TELEGRAM_CHAT_ID;
 

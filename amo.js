@@ -306,10 +306,21 @@ async function fetchRecentNotes(pathBase, perPage, maxPagesForward, sinceSec){
 
     let pageHasNewer = false;
     for (const n of arr) {
-      const ca = parseInt(n?.created_at || 0, 10) || 0;
-      if (ca >= sinceSec) { out.push(n); pageHasNewer = true; }
-      else { break; } // дальше на странице — ещё старше
-    }
+  const ca = parseInt(n?.created_at ?? 0, 10) || 0;
+
+  // 1) created_at отсутствует — не считаем это «старше», просто пропускаем
+  if (ca === 0) continue;
+
+  // 2) свежая заметка — забираем и продолжаем
+  if (ca >= sinceSec) {
+    out.push(n);
+    pageHasNewer = true;
+    continue;
+  }
+
+  // 3) действительно старше — можно остановиться на этой странице
+  break;
+}
     if (!pageHasNewer) break;      // следующая страница будет только старее
     if (arr.length < perPage) break;
   }

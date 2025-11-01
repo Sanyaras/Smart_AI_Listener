@@ -1,152 +1,100 @@
 // telegram.js
 import fetch from "node-fetch";
 import { Telegraf } from "telegraf";
-import FormData from "form-data";
-import { debug } from "./utils.js";
-
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
-const TG_CHAT_ID = process.env.TG_CHAT_ID;
-
-// =============================
-// Telegram Bot и утилиты
-// =============================
+import { debug, safeStr } from "./utils.js";
 
 let bot = null;
+let TELEGRAM_CHAT_ID = null;
+let TELEGRAM_BOT_TOKEN = null;
 
 /**
- * Инициализация Telegram-бота
+ * Инициализация окружения Telegram
  */
-export async function initTelegram() {
-  if (!TG_BOT_TOKEN) {
-    console.error("❌ TG_BOT_TOKEN отсутствует в переменных окружения!");
+export function initTelegramEnv(env) {
+  TELEGRAM_BOT_TOKEN = env.TELEGRAM_BOT_TOKEN || env.TG_BOT_TOKEN;
+  TELEGRAM_CHAT_ID = env.TELEGRAM_CHAT_ID;
+
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.error("⚠️ TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы");
     return;
   }
 
-  bot = new Telegraf(TG_BOT_TOKEN);
-
-  // 🎧 Обработка голосовых и аудио сообщений
-  bot.on(["voice", "audio"], async (ctx) => {
-    try {
-      const fileId = ctx.message.voice?.file_id || ctx.message.audio?.file_id;
-      const sender = ctx.message.from.username || ctx.message.from.first_name;
-
-      console.log(`🎧 Получен файл от ${sender}, file_id=${fileId}`);
-
-      const fileInfoRes = await fetch(
-        `https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile?file_id=${fileId}`
-      );
-      const fileInfo = await fileInfoRes.json();
-      const filePath = fileInfo.result.file_path;
-
-      const telegramFileUrl = `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${filePath}`;
-      console.log("✅ Telegram CDN link:", telegramFileUrl);
-
-      await ctx.reply(`✅ Файл получен!\nCDN: ${telegramFileUrl}`);
-    } catch (err) {
-      console.error("❌ Ошибка при обработке аудио:", err.message);
-      await ctx.reply("⚠️ Ошибка при обработке аудио файла.");
-    }
-  });
-
-  // Простейшие команды
-  bot.command("start", (ctx) =>
-    ctx.reply("🤖 Бот запущен и готов принимать аудио/войсы!")
-  );
-  bot.command("ping", (ctx) => ctx.reply("🏓 Pong!"));
-
-  await bot.launch();
-  console.log("🤖 Telegram bot listener initialized...");
-  console.log("🚀 Telegram bot запущен и слушает новые аудио/войсы...");
+  try {
+    bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+    console.log("🤖 Telegram бот инициализирован (relay mode)");
+  } catch (err) {
+    console.error("❌ Ошибка инициализации Telegraf:", err);
+  }
 }
 
 /**
- * Отправка простого текстового сообщения в Telegram
+ * Отправка текстового сообщения в Telegram
  */
 export async function sendTGMessage(text) {
-  if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-    console.warn("⚠️ TG_BOT_TOKEN или TG_CHAT_ID не заданы");
-    return;
-  }
-
+  if (!bot || !TELEGRAM_CHAT_ID) return;
   try {
-    const res = await fetch(
-      `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: TG_CHAT_ID,
-          text,
-          parse_mode: "HTML",
-        }),
-      }
-    );
-
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.description);
-    debug("💬 Сообщение отправлено в Telegram");
+    await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, text, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
+    debug("📩 Отправлено в Telegram");
   } catch (e) {
-    console.error("❌ sendTGMessage error:", e.message);
+    console.error("❌ Ошибка при отправке Telegram-сообщения:", safeStr(e));
   }
 }
 
-// =============================
-// Telegram Proxy для аудио
-// =============================
-
 /**
- * Загружает mp3 в Telegram и возвращает CDN ссылку
- * (используется как прокси для обхода VPN-блокировок MegaPBX)
+ * Передача аудио через Telegram — прокси-загрузка
+ * Telegram скачивает mp3 с MegaPBX и возвращает CDN-ссылку
  */
-export async function uploadToTelegramAndGetUrl(fileUrl) {
+export async function tgRelayAudio(url, caption = "Call recording") {
+  if (!bot || !TELEGRAM_CHAT_ID) {
+    console.error("⚠️ Telegram не инициализирован — relay невозможно");
+    return null;
+  }
+
   try {
-    if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-      console.warn("⚠️ Telegram env vars not set");
+    console.log(`🎧 Relay: скачиваем и заливаем в Telegram -> ${url}`);
+
+    const sent = await bot.telegram.sendAudio(TELEGRAM_CHAT_ID, { url }, { caption });
+
+    if (!sent?.audio?.file_id) {
+      console.warn("⚠️ Telegram relay не вернул file_id");
       return null;
     }
 
-    console.log("🎧 Uploading audio to Telegram via bot...");
+    const fileInfo = await bot.telegram.getFile(sent.audio.file_id);
+    if (!fileInfo?.file_path) {
+      console.warn("⚠️ Telegram relay не вернул file_path");
+      return null;
+    }
 
-    // 1️⃣ Пытаемся скачать mp3 (Railway может не иметь доступа к MegaPBX)
-    const res = await fetch(fileUrl, { timeout: 15000 });
-    if (!res.ok) throw new Error(`Cannot fetch source audio: ${res.status}`);
-    const buffer = await res.arrayBuffer();
-
-    // 2️⃣ Заливаем в Telegram
-    const form = new FormData();
-    form.append("chat_id", TG_CHAT_ID);
-    form.append("audio", Buffer.from(buffer), "call.mp3");
-
-    const sendRes = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendAudio`, {
-      method: "POST",
-      body: form,
-    });
-
-    const data = await sendRes.json();
-    if (!data.ok) throw new Error("Telegram upload failed: " + JSON.stringify(data));
-
-    const fileId = data.result.audio.file_id;
-
-    // 3️⃣ Получаем CDN-ссылку
-    const fileInfoRes = await fetch(
-      `https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile?file_id=${fileId}`
-    );
-    const fileInfo = await fileInfoRes.json();
-    const filePath = fileInfo.result.file_path;
-
-    const telegramFileUrl = `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${filePath}`;
-    console.log("✅ Telegram CDN link:", telegramFileUrl);
-
-    return telegramFileUrl;
+    const cdnUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
+    console.log(`✅ Telegram CDN link готов: ${cdnUrl}`);
+    return cdnUrl;
   } catch (e) {
-    console.error("❌ uploadToTelegramAndGetUrl:", e.message);
+    console.error("❌ tgRelayAudio error:", safeStr(e));
     return null;
   }
 }
 
-// =============================
-// Автоматический запуск (только при DEBUG)
-// =============================
-if (process.env.TG_BOT_TOKEN && process.env.TG_CHAT_ID && process.env.TG_DEBUG === "true") {
-  initTelegram().catch((e) => console.error("⚠️ Telegram init error:", e.message));
+/**
+ * Универсальная обёртка — используется в Amo обработке
+ * (пытается relay через Telegram, если напрямую не доступен)
+ */
+export async function uploadToTelegramAndGetUrl(mp3Url) {
+  try {
+    console.log("🎧 Uploading audio to Telegram via relay...");
+    const tgUrl = await tgRelayAudio(mp3Url, "📞 Новый звонок");
+    if (!tgUrl) {
+      console.warn("⚠️ Не удалось получить relay-ссылку через Telegram");
+      return null;
+    }
+    return tgUrl;
+  } catch (err) {
+    console.error("❌ uploadToTelegramAndGetUrl:", safeStr(err));
+    return null;
+  }
 }
+
+export { TELEGRAM_CHAT_ID };

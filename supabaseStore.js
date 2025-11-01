@@ -64,32 +64,51 @@ export async function markCallProcessed(note_id, transcript, qa_report) {
   }
 }
 
-// ===== APP_SECRETS TABLE (AMO TOKENS) =====
-
 export async function getAmoTokens() {
-  const { data, error } = await supabase
-    .from("app_secrets")
-    .select("access_token, refresh_token, expires_at")
-    .limit(1)
-    .single();
+  try {
+    const { data, error } = await supabase
+      .from("app_secrets")
+      .select("key, val");
 
-  if (error) {
-    console.error("❌ getAmoTokens:", safeStr(error));
+    if (error) throw error;
+
+    const map = {};
+    for (const row of data || []) {
+      map[row.key.toLowerCase()] = row.val;
+    }
+
+    const access_token = map.amo_access_token || map.amo_access_token?.toUpperCase() || map.amo_access_token;
+    const refresh_token = map.amo_refresh_token || map.amo_refresh_token?.toUpperCase() || map.amo_refresh_token;
+    const expires_at = map.amo_expires_at || null;
+
+    if (!access_token || !refresh_token) {
+      console.error("⚠️ Amo tokens not found in app_secrets");
+      return null;
+    }
+
+    return { access_token, refresh_token, expires_at };
+  } catch (e) {
+    console.error("❌ getAmoTokens:", e.message);
     return null;
   }
-  return data;
 }
 
 export async function saveAmoTokens({ access_token, refresh_token, expires_at }) {
   try {
-    // очищаем таблицу и вставляем одну запись
-    await supabase.from("app_secrets").delete().neq("id", 0);
-    const { error } = await supabase.from("app_secrets").insert([
-      { access_token, refresh_token, expires_at },
-    ]);
-    if (error) throw error;
-    debug("💾 Saved Amo tokens to app_secrets");
+    const entries = [
+      { key: "amo_access_token", val: access_token },
+      { key: "AMO_ACCESS_TOKEN", val: access_token },
+      { key: "amo_refresh_token", val: refresh_token },
+      { key: "AMO_REFRESH_TOKEN", val: refresh_token },
+      { key: "amo_expires_at", val: expires_at || new Date(Date.now() + 3600 * 1000).toISOString() },
+    ];
+
+    for (const row of entries) {
+      await supabase.from("app_secrets").upsert(row, { onConflict: "key" });
+    }
+
+    debug("💾 Amo tokens updated in app_secrets");
   } catch (e) {
-    console.error("❌ saveAmoTokens:", safeStr(e));
+    console.error("❌ saveAmoTokens:", e.message);
   }
 }

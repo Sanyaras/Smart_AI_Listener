@@ -1,6 +1,6 @@
-// index.js — Smart AI Listener (railway-2.7.2-irazbil)
-// Режим: окно по времени + РУЧНОЙ КУРСОР (manual_since), чтобы «встать на предпоследний»
-// Эндпоинты: /version, /diag/env, /amo/diag?key=..., /amo/debug/notes?key=..., /amo/since [GET/POST]?key=..., /amo/since/penultimate?key=..., /amo/poll?key=...
+// index.js — Smart AI Listener (railway-2.7.3-irazbil-new-calls)
+// Берём только новые звонки: пагинация page=1 → вверх, ручной since, ретраи на 429.
+// Эндпоинты: /version, /diag/env, /amo/diag, /amo/debug/notes, /amo/since [GET/POST], /amo/since/penultimate [POST], /amo/poll
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -29,20 +29,20 @@ import {
   amoRefresh,
   getAmoTokensMask,
   injectAmoTokens,
-  getManualSince,        // NEW
-  setManualSince,        // NEW
-  setManualSinceToPenultimate, // NEW
-  debugFetchRecentWithMeta,    // NEW
+  getManualSince,
+  setManualSince,
+  setManualSinceToPenultimate,
+  debugFetchRecentWithMeta,
 } from "./amo.js";
 
 // ---- Utils
 import { cap, mask, fetchWithTimeout } from "./utils.js";
 
 // ---- Supabase secrets
-import { setSecret, getSecret } from "./supabaseStore.js";
+import { setSecret } from "./supabaseStore.js";
 
 /* -------------------- ENV -------------------- */
-const VERSION             = "railway-2.7.2-irazbil";
+const VERSION             = "railway-2.7.3-irazbil";
 
 const TG_BOT_TOKEN        = process.env.TG_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT_ID          = process.env.TG_CHAT_ID || "";
@@ -199,7 +199,6 @@ app.get("/amo/poll", async (req, res) => {
   try {
     assertKey(req);
     const limit = Math.min(parseInt(req.query.limit || AMO_POLL_LIMIT, 10) || AMO_POLL_LIMIT, 300);
-    // приоритет: явный ?since → ручной курсор (если есть) → окно по времени (amo.js сам решит)
     const since = req.query.since ? parseInt(req.query.since, 10) : null;
     const manual = since || await getManualSince().catch(()=> null);
     const options = {};
@@ -222,11 +221,7 @@ app.get("/amo/diag", async (req, res) => {
   try {
     assertKey(req);
     const manual_since = await getManualSince().catch(()=> null);
-    res.json({
-      ok: true,
-      version: VERSION,
-      manual_since,
-    });
+    res.json({ ok: true, version: VERSION, manual_since });
   } catch (e) {
     res.status(401).json({ ok:false, error: String(e) });
   }
@@ -236,7 +231,7 @@ app.get("/amo/debug/notes", async (req, res) => {
   try {
     assertKey(req);
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
-    const j = await debugFetchRecentWithMeta(limit); // вернёт «как у тебя» список последних заметок по лидам
+    const j = await debugFetchRecentWithMeta(limit);
     res.json(j);
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
@@ -276,7 +271,7 @@ app.post("/amo/since/penultimate", async (req, res) => {
   }
 });
 
-/* -------------------- TELEGRAM WEBHOOK (без изменений по сути) -------------------- */
+/* -------------------- TELEGRAM WEBHOOK -------------------- */
 app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
   try {
     const upd = req.body || {};
@@ -387,8 +382,7 @@ function buildSimplePollUrl() {
   if (!SIMPLE_POLL_URL) return null;
   try {
     const u = new URL(SIMPLE_POLL_URL);
-    const manual = null; // для внешнего пингера оставим как есть (он у тебя уже с since)
-    if (manual) u.searchParams.set("since", String(manual));
+    // внешний пингер может сам ставить since
     return u.toString();
   } catch {
     return SIMPLE_POLL_URL;

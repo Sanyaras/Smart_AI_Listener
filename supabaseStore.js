@@ -112,3 +112,25 @@ export async function saveAmoTokens({ access_token, refresh_token, expires_at })
     console.error("❌ saveAmoTokens:", e.message);
   }
 }
+
+// ====================== GET RECENT CALLS ======================
+
+/**
+ * Возвращает последние N звонков из таблицы call_records
+ * (по умолчанию 15 последних по времени)
+ */
+export async function getRecentCalls(limit = 15) {
+  try {
+    const { data, error } = await supabase
+      .from("call_records")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error) throw error;
+    return data || [];
+  } catch (e) {
+    console.error("❌ getRecentCalls:", e.message);
+    return [];
+  }
+}

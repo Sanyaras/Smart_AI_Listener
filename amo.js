@@ -11,6 +11,8 @@ const TIMEZONE = process.env.AMO_TIMEZONE || "Europe/Moscow";
 if (!BASE_URL || !CLIENT_ID || !CLIENT_SECRET)
   throw new Error("❌ Missing AmoCRM credentials in env");
 
+// ================= AUTH =================
+
 async function refreshAmoTokens(refreshToken) {
   debug("🔁 Refreshing Amo tokens...");
   const res = await fetchWithTimeout(`${BASE_URL}/oauth2/access_token`, {
@@ -24,6 +26,7 @@ async function refreshAmoTokens(refreshToken) {
       redirect_uri: REDIRECT_URI,
     }),
   });
+
   const json = await res.json();
   if (json.access_token && json.refresh_token) {
     const expires_at = new Date(Date.now() + json.expires_in * 1000).toISOString();
@@ -53,25 +56,37 @@ async function getAccessToken() {
   return tokens.access_token;
 }
 
-// ================= FETCH RECENT CALL NOTES =================
+// ================= CALL DETECTION =================
 
 function isLikelyCall(note) {
   if (!note || note.note_type !== "call_in") return false;
-  const link = note.params?.LINK || note.params?.link;
-  return typeof link === "string" && link.includes(".mp3");
+  const link = note.params?.link || note.params?.LINK;
+  return typeof link === "string" && link.endsWith(".mp3");
 }
+
+function extractCallLink(note) {
+  const link = note.params?.link || note.params?.LINK;
+  return typeof link === "string" && link.includes(".mp3") ? link : null;
+}
+
+// ================= FETCH RECENT CALL NOTES =================
 
 async function fetchRecentNotes(sinceSeconds = 0, limit = 200) {
   const token = await getAccessToken();
   const url = `${BASE_URL}/api/v4/leads/notes?filter[type]=call_in&limit=${limit}`;
-  const res = await fetchWithTimeout(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+
+  const res = await fetchWithTimeout(
+    url,
+    { headers: { Authorization: `Bearer ${token}` } },
+    20000
+  );
+
   const json = await res.json();
   if (!json?._embedded?.notes) {
     debug("⚠️ No notes found:", safeStr(json));
     return [];
   }
+
   return json._embedded.notes.filter(
     (n) => n.created_at >= sinceSeconds && isLikelyCall(n)
   );
@@ -94,12 +109,11 @@ export async function processAmoCalls() {
     for (const note of fresh) {
       const note_id = note.id;
       const contact_id = note.entity_id;
-      const link =
-        note.params?.LINK || note.params?.link || note.params?.file || null;
+      const link = extractCallLink(note);
       const created_at = new Date(note.created_at * 1000).toISOString();
 
       if (!link) {
-        debug(`⚪️ Пропущен note ${note_id}: нет ссылки`);
+        debug(`⚪️ Пропущен note ${note_id}: нет mp3`);
         continue;
       }
 

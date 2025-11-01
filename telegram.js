@@ -2,7 +2,7 @@
 import crypto from "crypto";
 import { fetchWithTimeout, cap, safeStr } from "./utils.js";
 import { getUnprocessedCalls, markCallProcessed } from "./supabaseStore.js";
-import { transcribeAudio } from "./asr.js";
+import { transcribeAudioFromUrl as transcribeAudio } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
 export const TELEGRAM = {

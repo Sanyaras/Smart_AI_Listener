@@ -36,7 +36,7 @@ export async function initTelegram(env = process.env) {
     await processCallsAndReport(ctx);
   });
 
-  // === Обработка голосовых ===
+  // === Обработка голосовых и аудио ===
   bot.on("message", async (ctx) => {
     const msg = ctx.message;
 
@@ -49,6 +49,12 @@ export async function initTelegram(env = process.env) {
           `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
         );
         const fileInfo = await fileRes.json();
+
+        if (!fileInfo.ok || !fileInfo.result?.file_path) {
+          await ctx.reply("⚠️ Не удалось получить файл из Telegram API.");
+          return;
+        }
+
         const filePath = fileInfo.result.file_path;
         const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
 
@@ -81,7 +87,7 @@ export async function initTelegram(env = process.env) {
 
   // === Запуск Polling ===
   await bot.launch();
-  console.log("🤖 Telegram запущен в режиме polling (читает чат)");
+  console.log("🤖 Telegram запущен в режиме polling (читает чат напрямую)");
 
   // === Автообработка звонков ===
   const AUTO_SCAN_MINUTES = parseInt(env.AUTO_SCAN_MINUTES || "5", 10);
@@ -103,7 +109,7 @@ export async function sendTGMessage(text, chatOverride = null) {
     if (!bot) return;
     const chatId = chatOverride || TELEGRAM_CHAT_ID;
 
-    // Разбиваем длинные сообщения
+    // Разбиваем длинные сообщения (Telegram лимит 4096)
     const parts = text.match(/[\s\S]{1,4000}/g) || [];
     for (const part of parts) {
       await bot.telegram.sendMessage(chatId, part, { parse_mode: "HTML" });
@@ -126,14 +132,15 @@ export async function uploadToTelegramAndGetUrl(mp3Url) {
 
     const res = await fetch(mp3Url);
     if (!res.ok) throw new Error(`Ошибка загрузки ${mp3Url}: ${res.status}`);
-    const buffer = await res.arrayBuffer();
+    const buffer = Buffer.from(await res.arrayBuffer());
 
     const tmpFile = `/tmp/audio_${Date.now()}.mp3`;
-    fs.writeFileSync(tmpFile, Buffer.from(buffer));
+    fs.writeFileSync(tmpFile, buffer);
 
     const formData = new FormData();
     formData.append("chat_id", TG_UPLOAD_CHAT_ID);
     formData.append("document", fs.createReadStream(tmpFile));
+    formData.append("caption", "📎 Звонок (relay)");
 
     const uploadUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`;
     const uploadRes = await fetch(uploadUrl, { method: "POST", body: formData });
@@ -164,6 +171,7 @@ export async function uploadToTelegramAndGetUrl(mp3Url) {
     return null;
   }
 }
+
 /**
  * Основной процесс обработки звонков
  */

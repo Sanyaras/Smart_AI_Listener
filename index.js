@@ -1,34 +1,15 @@
-// index.js — Smart AI Listener (v2.7.1-IRAZBIL)
-// Режим: без курсоров, с manual-since (храним в Supabase).
-// Фичи:
-//  • /amo/poll — берёт ?since=... (unix), иначе manual-since из Supabase
-//  • После успешной обработки сдвигает manual-since на maxCreatedAt (только вперёд)
-//  • /amo/penultimate — ставит manual-since на предпоследний звонок
-//  • /amo/since/* — get / set / bump / reset (чтобы руками двигать водяной знак)
-//  • Автопуллер, self-HTTP тик, мягкий backfill, watchdog
-//
-// ENV минимум:
-//  TG_BOT_TOKEN, TG_CHAT_ID
-//  AMO_BASE_URL, AMO_CLIENT_ID, AMO_CLIENT_SECRET, AMO_REDIRECT_URI
-//  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (или ANON для теста)
-//  CRM_SHARED_KEY=boxfield-qa-2025
-//
-// Необязательное:
-//  AMO_POLL_MINUTES=10  AMO_POLL_LIMIT=200
-//  AMO_BACKFILL_MAX_HOURS=72
-//  SELF_HTTP_POLL=1  BACKFILL_ENABLED=1  WATCHDOG_ENABLED=1
-//  SIMPLE_POLL_URL="https://<host>/amo/poll?key=boxfield-qa-2025&limit=200"
-//  SIMPLE_POLL_INTERVAL_MIN=10
-//  SIMPLE_POLL_FORCE_HOURS=0/72  (если >0 — будет добавлять ?since=)
+// index.js — Smart AI Listener (railway-2.7.2-irazbil)
+// Режим: окно по времени + РУЧНОЙ КУРСОР (manual_since), чтобы «встать на предпоследний»
+// Эндпоинты: /version, /diag/env, /amo/diag?key=..., /amo/debug/notes?key=..., /amo/since [GET/POST]?key=..., /amo/since/penultimate?key=..., /amo/poll?key=...
 
 import express from "express";
 import bodyParser from "body-parser";
 import crypto from "crypto";
 
-// ---- QA (аналитика звонков) ----
+// ---- QA
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 
-// ---- Telegram helpers ----
+// ---- Telegram
 import {
   initTelegramEnv,
   TELEGRAM,
@@ -38,33 +19,30 @@ import {
   tgRelayAudio,
 } from "./telegram.js";
 
-// ---- ASR очередь/распознавание ----
+// ---- ASR
 import { enqueueAsr, transcribeAudioFromUrl } from "./asr.js";
 
-// ---- AmoCRM интеграция (надёжный поллер) ----
+// ---- AmoCRM
 import {
   processAmoCallNotes,
   amoFetch,
   amoRefresh,
   getAmoTokensMask,
   injectAmoTokens,
-
-  // manual-since helpers:
-  getManualSince,
-  setManualSinceForwardOnly,
-  bumpManualSince,
-  resetManualSinceFromHours,
-  getPenultimateCreatedAt,
+  getManualSince,        // NEW
+  setManualSince,        // NEW
+  setManualSinceToPenultimate, // NEW
+  debugFetchRecentWithMeta,    // NEW
 } from "./amo.js";
 
-// ---- Утилиты/сетевые ----
+// ---- Utils
 import { cap, mask, fetchWithTimeout } from "./utils.js";
 
-// ---- Supabase tokens/flags ----
+// ---- Supabase secrets
 import { setSecret, getSecret } from "./supabaseStore.js";
 
 /* -------------------- ENV -------------------- */
-const VERSION             = "railway-2.7.1-irazbil";
+const VERSION             = "railway-2.7.2-irazbil";
 
 const TG_BOT_TOKEN        = process.env.TG_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT_ID          = process.env.TG_CHAT_ID || "";
@@ -74,25 +52,22 @@ const NODE_ENV            = process.env.NODE_ENV || "development";
 
 const CRM_SHARED_KEY      = process.env.CRM_SHARED_KEY || "boxfield-qa-2025";
 
-const RELAY_BASE_URL      = process.env.RELAY_BASE_URL || "";
-const TG_DIRECT_FETCH     = process.env.TG_DIRECT_FETCH === "1";
-
 const AMO_POLL_MINUTES    = parseInt(process.env.AMO_POLL_MINUTES || "10", 10);
-const AMO_POLL_LIMIT      = parseInt(process.env.AMO_POLL_LIMIT   || "200", 10);
+const AMO_POLL_LIMIT      = parseInt(process.env.AMO_POLL_LIMIT   || "30", 10);
 let   bootstrapRemaining  = parseInt(process.env.AMO_BOOTSTRAP_LIMIT || "5", 10);
 
 const PORT                = process.env.PORT || 3000;
 
-// OAuth env (для /amo/oauth/*)
+// Amo OAuth env
 const AMO_BASE_URL        = (process.env.AMO_BASE_URL || "").replace(/\/+$/,"");
 const AMO_CLIENT_ID       = process.env.AMO_CLIENT_ID || "";
 const AMO_CLIENT_SECRET   = process.env.AMO_CLIENT_SECRET || "";
 const AMO_REDIRECT_URI    = process.env.AMO_REDIRECT_URI || "";
 
-/* -------------------- SIMPLE PINGER ENV -------------------- */
+/* -------------------- SIMPLE PINGER -------------------- */
 const SIMPLE_POLL_URL          = (process.env.SIMPLE_POLL_URL || "").trim();
 const SIMPLE_POLL_INTERVAL_MIN = parseInt(process.env.SIMPLE_POLL_INTERVAL_MIN || "10", 10);
-const SIMPLE_POLL_FORCE_HOURS  = parseInt(process.env.SIMPLE_POLL_FORCE_HOURS || "0", 10);
+const SIMPLE_POLL_FORCE_HOURS  = parseInt(process.env.SIMPLE_POLL_FORCE_HOURS || "72", 10);
 
 /* -------------------- INIT -------------------- */
 initTelegramEnv({
@@ -219,85 +194,41 @@ app.get("/amo/refresh", async (_req, res) => {
   }
 });
 
-/* -------------------- AMO: MANUAL-SINCE ручки -------------------- */
-app.get("/amo/since/get", async (req, res) => {
-  try { assertKey(req); const v = await getManualSince(); res.json({ ok:true, manual_since:v }); }
-  catch(e){ res.status(401).json({ ok:false, error:String(e) }); }
-});
-
-app.get("/amo/since/set", async (req, res) => {
-  try {
-    assertKey(req);
-    const val = parseInt(req.query.value || "0", 10);
-    if (!Number.isFinite(val) || val<=0) return res.status(400).json({ ok:false, error:"value must be unix seconds > 0" });
-    const next = await setManualSinceForwardOnly(val);
-    res.json({ ok:true, manual_since: next });
-  } catch(e){ res.status(401).json({ ok:false, error:String(e) }); }
-});
-
-app.get("/amo/since/bump", async (req, res) => {
-  try {
-    assertKey(req);
-    const by = parseInt(req.query.by || "0", 10);
-    if (!Number.isFinite(by) || by===0) return res.status(400).json({ ok:false, error:"by must be integer seconds (can be negative, но смысл — вперёд)" });
-    const next = await bumpManualSince(by);
-    res.json({ ok:true, manual_since: next });
-  } catch(e){ res.status(401).json({ ok:false, error:String(e) }); }
-});
-
-app.get("/amo/since/reset", async (req, res) => {
-  try {
-    assertKey(req);
-    const hours = parseInt(req.query.hours || "72", 10);
-    const next = await resetManualSinceFromHours(hours);
-    res.json({ ok:true, manual_since: next, from_hours: hours });
-  } catch(e){ res.status(401).json({ ok:false, error:String(e) }); }
-});
-
-app.get("/amo/penultimate", async (req, res) => {
-  try {
-    assertKey(req);
-    const ts = await getPenultimateCreatedAt();
-    const next = await setManualSinceForwardOnly(ts);
-    res.json({ ok:true, manual_since: next, source: "penultimate" });
-  } catch(e){ res.status(500).json({ ok:false, error:String(e) }); }
-});
-
-/* -------------------- AMO: POLL/FORCE/DEBUG -------------------- */
+/* -------------------- AMO: POLL/FORCE/DEBUG/DIAG -------------------- */
 app.get("/amo/poll", async (req, res) => {
   try {
     assertKey(req);
     const limit = Math.min(parseInt(req.query.limit || AMO_POLL_LIMIT, 10) || AMO_POLL_LIMIT, 300);
-    const sinceQ = req.query.since ? parseInt(req.query.since, 10) : 0;
-    const since = Number.isFinite(sinceQ) && sinceQ > 0 ? sinceQ : await getManualSince();
-
-    const out = await processAmoCallNotes(limit, 0, { sinceEpochSec: since });
-
-    // авто-сдвиг manual-since только вперёд
-    const maxCA = out?.maxCreatedAt || 0;
-    if (maxCA > since) {
-      try { await setManualSinceForwardOnly(maxCA); } catch {}
+    // приоритет: явный ?since → ручной курсор (если есть) → окно по времени (amo.js сам решит)
+    const since = req.query.since ? parseInt(req.query.since, 10) : null;
+    const manual = since || await getManualSince().catch(()=> null);
+    const options = {};
+    if (manual && Number.isFinite(manual) && manual > 0) {
+      options.force = true;
+      options.sinceEpochSec = manual;
+      options.bootstrapLimit = limit;
     }
-
+    const out = await processAmoCallNotes(limit, bootstrapRemaining, options);
     if (bootstrapRemaining > 0 && out && typeof out.started === "number") {
       bootstrapRemaining = Math.max(0, bootstrapRemaining - out.started);
     }
-    res.json({ ok: true, ...out, bootstrapRemaining });
+    res.json({ ok: true, ...out, bootstrapRemaining, since: manual || out?.since });
   } catch (e) {
     res.status(401).json({ ok: false, error: String(e) });
   }
 });
 
-app.get("/amo/force", async (req, res) => {
+app.get("/amo/diag", async (req, res) => {
   try {
     assertKey(req);
-    const hours = Math.max(1, Math.min(parseInt(req.query.hours || "24", 10), 72));
-    const limit = Math.min(parseInt(req.query.limit || "200", 10), 500);
-    const since = Math.max(0, Math.floor(Date.now()/1000) - hours*3600);
-    const out = await processAmoCallNotes(limit, 0, { sinceEpochSec: since });
-    res.json({ ok: true, forced: true, hours, limit, ...out });
+    const manual_since = await getManualSince().catch(()=> null);
+    res.json({
+      ok: true,
+      version: VERSION,
+      manual_since,
+    });
   } catch (e) {
-    res.status(401).json({ ok: false, error: String(e) });
+    res.status(401).json({ ok:false, error: String(e) });
   }
 });
 
@@ -305,47 +236,47 @@ app.get("/amo/debug/notes", async (req, res) => {
   try {
     assertKey(req);
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
-    const [leads, contacts, companies] = await Promise.all([
-      amoFetch(`/api/v4/leads/notes?limit=${limit}`),
-      amoFetch(`/api/v4/contacts/notes?limit=${limit}`),
-      amoFetch(`/api/v4/companies/notes?limit=${limit}`),
-    ]);
-    const pick = (entity, arr) => {
-      const items = Array.isArray(arr?._embedded?.notes) ? arr._embedded.notes : [];
-      return items.map(n => ({
-        entity,
-        id: n.id,
-        note_type: n.note_type,
-        created_at: n.created_at,
-        entity_id: n.entity_id,
-        params_keys: n.params ? Object.keys(n.params).slice(0, 20) : [],
-        has_link: !!(n?.params?.link),
-      }));
-    };
-    const out = [
-      ...pick("lead",     leads),
-      ...pick("contact",  contacts),
-      ...pick("company",  companies),
-    ].sort((a,b) => (b.created_at||0) - (a.created_at||0));
-    res.json({ ok: true, count: out.length, items: out });
+    const j = await debugFetchRecentWithMeta(limit); // вернёт «как у тебя» список последних заметок по лидам
+    res.json(j);
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-app.get("/amo/debug/raw", async (req, res) => {
+/* ----- Ручной курсор: GET — посмотреть, POST — установить, /penultimate — на предпоследний ----- */
+app.get("/amo/since", async (req, res) => {
   try {
     assertKey(req);
-    const path = String(req.query.path || "");
-    if (!path.startsWith("/")) return res.status(400).json({ ok:false, error:"path must start with /" });
-    const j = await amoFetch(path);
-    res.json(j);
+    const manual_since = await getManualSince().catch(()=> null);
+    res.json({ ok: true, manual_since });
+  } catch (e) {
+    res.status(401).json({ ok:false, error:String(e) });
+  }
+});
+
+app.post("/amo/since", async (req, res) => {
+  try {
+    assertKey(req);
+    const since = parseInt(req.body?.since ?? req.query.since ?? "0", 10) || 0;
+    if (!since) return res.status(400).json({ ok:false, error:"since required (unix sec)" });
+    await setManualSince(since);
+    res.json({ ok:true, manual_since: since });
+  } catch (e) {
+    res.status(401).json({ ok:false, error:String(e) });
+  }
+});
+
+app.post("/amo/since/penultimate", async (req, res) => {
+  try {
+    assertKey(req);
+    const manual_since = await setManualSinceToPenultimate();
+    res.json({ ok:true, manual_since, source:"penultimate" });
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e) });
   }
 });
 
-/* -------------------- TELEGRAM WEBHOOK -------------------- */
+/* -------------------- TELEGRAM WEBHOOK (без изменений по сути) -------------------- */
 app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
   try {
     const upd = req.body || {};
@@ -407,29 +338,23 @@ app.post(`/tg/${TELEGRAM.TG_SECRET}`, async (req, res) => {
   }
 });
 
-/* -------------------- AUTO / WATCHDOG / HTTP-SELF -------------------- */
+/* -------------------- AUTO / WATCHDOG / PINGER -------------------- */
 const SELF_HTTP_POLL   = (process.env.SELF_HTTP_POLL || "1") === "1";
 const BACKFILL_ENABLED = (process.env.BACKFILL_ENABLED || "1") === "1";
 const WATCHDOG_ENABLED = (process.env.WATCHDOG_ENABLED || "1") === "1";
 
-let lastTickAt = 0;        // ms
-let lastStartedAt = 0;     // ms
-let lastWithLinksAt = 0;   // ms
+let lastTickAt = 0;
+let lastStartedAt = 0;
+let lastWithLinksAt = 0;
 
 async function runTick(kind = "regular") {
   try {
-    const since = await getManualSince();
-    const out = await processAmoCallNotes(AMO_POLL_LIMIT, 0, { sinceEpochSec: since });
+    const manual = await getManualSince().catch(()=> null);
+    const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining, manual ? { force:true, sinceEpochSec: manual, bootstrapLimit: AMO_POLL_LIMIT } : {});
     lastTickAt = Date.now();
     if (out.started > 0) lastStartedAt = Date.now();
     if (out.withLinks > 0) lastWithLinksAt = Date.now();
-
-    // авто-сдвиг manual-since вперёд
-    if (out?.maxCreatedAt && out.maxCreatedAt > since) {
-      try { await setManualSinceForwardOnly(out.maxCreatedAt); } catch {}
-    }
-
-    console.log(`[AMO] ${kind} tick -> since=${since} scanned=${out.scanned} withLinks=${out.withLinks} started=${out.started}`);
+    console.log(`[AMO] ${kind} tick -> since=${manual || out?.since} scanned=${out.scanned} withLinks=${out.withLinks} started=${out.started}`);
     if (out.started > 0) { try { await sendTG(`📡 AMO ${kind} tick: scanned ${out.scanned}, withLinks ${out.withLinks}, started ${out.started}`); } catch {} }
     return out;
   } catch (e) {
@@ -440,9 +365,13 @@ async function runTick(kind = "regular") {
 }
 
 async function runHttpSelfPoll() {
-  const url = `http://127.0.0.1:${PORT}/amo/poll?key=${encodeURIComponent(CRM_SHARED_KEY)}&limit=${AMO_POLL_LIMIT}`;
+  const manual = await getManualSince().catch(()=> null);
+  const u = new URL(`http://127.0.0.1:${PORT}/amo/poll`);
+  u.searchParams.set("key", CRM_SHARED_KEY);
+  u.searchParams.set("limit", String(AMO_POLL_LIMIT));
+  if (manual) u.searchParams.set("since", String(manual));
   try {
-    const r = await fetch(url);
+    const r = await fetch(u.toString());
     const j = await r.json().catch(()=> ({}));
     lastTickAt = Date.now();
     if (j.started > 0) lastStartedAt = Date.now();
@@ -454,66 +383,12 @@ async function runHttpSelfPoll() {
   }
 }
 
-function minutes(ms){ return Math.floor(ms/60000); }
-
-if (AMO_POLL_MINUTES > 0) {
-  console.log(`⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT})`);
-
-  runTick("boot").catch(()=>{});
-  setInterval(() => { runTick("regular").catch(()=>{}); }, AMO_POLL_MINUTES * 60 * 1000);
-
-  if (SELF_HTTP_POLL) {
-    setInterval(() => { runHttpSelfPoll(); }, AMO_POLL_MINUTES * 60 * 1000);
-  }
-
-  if (BACKFILL_ENABLED) {
-    setInterval(async () => {
-      try {
-        const since = Math.floor((Date.now() - 6*3600*1000) / 1000);
-        const out = await processAmoCallNotes(AMO_POLL_LIMIT, 0, { sinceEpochSec: since });
-        console.log(`[AMO] soft-backfill -> scanned=${out.scanned} withLinks=${out.withLinks} started=${out.started}`);
-        if (out.started > 0) lastStartedAt = Date.now();
-        if (out.withLinks > 0) lastWithLinksAt = Date.now();
-      } catch (e) {
-        console.warn(`[AMO] soft-backfill error:`, e?.message || e);
-      }
-    }, 15 * 60 * 1000);
-  }
-
-  if (WATCHDOG_ENABLED) {
-    setInterval(async () => {
-      const now = Date.now();
-      const noLinksMin   = lastWithLinksAt ? minutes(now - lastWithLinksAt) : Infinity;
-      const noStartedMin = lastStartedAt   ? minutes(now - lastStartedAt)   : Infinity;
-      if (noLinksMin >= 20 && noStartedMin >= 20) {
-        try { await sendTG(`🛠 Watchdog: не было активности ${Math.min(noLinksMin, noStartedMin)} мин — форс-скан за 6ч.`); } catch {}
-        const since = Math.floor((Date.now() - 6*3600*1000) / 1000);
-        try {
-          const out = await processAmoCallNotes(AMO_POLL_LIMIT, 0, { sinceEpochSec: since });
-          console.log(`[AMO] watchdog-force -> scanned=${out.scanned} withLinks=${out.withLinks} started=${out.started}`);
-          if (out.started > 0) lastStartedAt = Date.now();
-          if (out.withLinks > 0) lastWithLinksAt = Date.now();
-        } catch (e) {
-          console.warn(`[AMO] watchdog-force error:`, e?.message || e);
-        }
-      }
-    }, 5 * 60 * 1000);
-  }
-} else {
-  console.log("⏸ auto-poll disabled");
-}
-
-/* -------------------- SIMPLE URL PINGER -------------------- */
 function buildSimplePollUrl() {
   if (!SIMPLE_POLL_URL) return null;
   try {
     const u = new URL(SIMPLE_POLL_URL);
-    if (SIMPLE_POLL_FORCE_HOURS > 0) {
-      const since = Math.floor((Date.now() - SIMPLE_POLL_FORCE_HOURS * 3600 * 1000) / 1000);
-      u.searchParams.set("since", String(since));
-    } else {
-      u.searchParams.delete("since");
-    }
+    const manual = null; // для внешнего пингера оставим как есть (он у тебя уже с since)
+    if (manual) u.searchParams.set("since", String(manual));
     return u.toString();
   } catch {
     return SIMPLE_POLL_URL;
@@ -527,9 +402,7 @@ async function simplePingOnce(kind = "simple") {
     const r = await fetch(url);
     let j = null;
     try { j = await r.json(); } catch {}
-    const msg =
-      `[PING] ${kind} -> ${r.status}` +
-      (j ? ` scanned=${j.scanned||0} withLinks=${j.withLinks||0} started=${j.started||0}` : "");
+    const msg = `[PING] ${kind} -> ${r.status}` + (j ? ` scanned=${j.scanned||0} withLinks=${j.withLinks||0} started=${j.started||0}` : "");
     console.log(msg);
     try { await sendTG(`✅ ${msg}`); } catch {}
   } catch (e) {
@@ -539,10 +412,54 @@ async function simplePingOnce(kind = "simple") {
   }
 }
 
-if (SIMPLE_POLL_URL && SIMPLE_POLL_INTERVAL_MIN > 0) {
-  console.log(`🔁 SIMPLE_PINGER: каждые ${SIMPLE_POLL_INTERVAL_MIN} мин → ${buildSimplePollUrl()}`);
-  simplePingOnce("boot").catch(()=>{});
-  setInterval(() => { simplePingOnce("interval").catch(()=>{}); }, SIMPLE_POLL_INTERVAL_MIN * 60 * 1000);
+/* schedule */
+if (AMO_POLL_MINUTES > 0) {
+  console.log(`⏰ auto-poll каждые ${AMO_POLL_MINUTES} мин (limit=${AMO_POLL_LIMIT})`);
+  runTick("boot").catch(()=>{});
+  setInterval(() => { runTick("regular").catch(()=>{}); }, AMO_POLL_MINUTES * 60 * 1000);
+
+  if (SELF_HTTP_POLL) {
+    setInterval(() => { runHttpSelfPoll(); }, AMO_POLL_MINUTES * 60 * 1000);
+  }
+
+  if (BACKFILL_ENABLED) {
+    setInterval(async () => {
+      try {
+        const manual = await getManualSince().catch(()=> null);
+        const since = manual || Math.floor((Date.now() - 6*3600*1000) / 1000);
+        const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining, { force:true, sinceEpochSec: since, bootstrapLimit: AMO_POLL_LIMIT });
+        console.log(`[AMO] soft-backfill -> scanned=${out.scanned} withLinks=${out.withLinks} started=${out.started}`);
+        if (out.started > 0) lastStartedAt = Date.now();
+        if (out.withLinks > 0) lastWithLinksAt = Date.now();
+      } catch (e) {
+        console.warn(`[AMO] soft-backfill error:`, e?.message || e);
+      }
+    }, 15 * 60 * 1000);
+  }
+
+  if (WATCHDOG_ENABLED) {
+    function minutes(ms){ return Math.floor(ms/60000); }
+    setInterval(async () => {
+      const now = Date.now();
+      const noLinksMin   = lastWithLinksAt ? minutes(now - lastWithLinksAt) : Infinity;
+      const noStartedMin = lastStartedAt   ? minutes(now - lastStartedAt)   : Infinity;
+      if (noLinksMin >= 20 && noStartedMin >= 20) {
+        try { await sendTG(`🛠 Watchdog: не было активности ${Math.min(noLinksMin, noStartedMin)} мин — форс-скан.`); } catch {}
+        try {
+          const manual = await getManualSince().catch(()=> null);
+          const since = manual || Math.floor((Date.now() - 6*3600*1000) / 1000);
+          const out = await processAmoCallNotes(AMO_POLL_LIMIT, bootstrapRemaining, { force:true, sinceEpochSec: since, bootstrapLimit: AMO_POLL_LIMIT });
+          console.log(`[AMO] watchdog-force -> scanned=${out.scanned} withLinks=${out.withLinks} started=${out.started}`);
+          if (out.started > 0) lastStartedAt = Date.now();
+          if (out.withLinks > 0) lastWithLinksAt = Date.now();
+        } catch (e) {
+          console.warn(`[AMO] watchdog-force error:`, e?.message || e);
+        }
+      }
+    }, 5 * 60 * 1000);
+  }
+} else {
+  console.log("⏸ auto-poll disabled");
 }
 
 /* -------------------- SERVER -------------------- */

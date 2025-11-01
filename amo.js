@@ -283,37 +283,43 @@ export async function debugFetchRecentWithMeta(limit = 50){
   return { ok: true, count: out.length, items: out };
 }
 
-/* ===== Правильная выборка «новых»: page=1 → вверх, пока >= since ===== */
-async function fetchRecentNotes(pathBase, perPage, maxPagesForward, sinceSec){
+// вместо прежней версии
+async function fetchRecentNotes(pathBase, perPage, maxPagesBack, sinceSec){
   const out = [];
-  let page = 1;
-  for (let i = 0; i < maxPagesForward; i++, page++) {
-    const j = await amoFetch(`${pathBase}?limit=${perPage}&page=${page}`);
-    const arr = Array.isArray(j?._embedded?.notes) ? j._embedded.notes : [];
-    if (!arr.length) break;
+  let reachedOld = false;
 
-    // Если самая старая в странице уже < since — страница дальше не нужна
-    const minCreated = Math.min(...arr.map(n => parseInt(n?.created_at || 0, 10) || 0));
-    if (Number.isFinite(minCreated) && minCreated < sinceSec) {
-      for (const n of arr) {
-        const ca = parseInt(n?.created_at || 0, 10) || 0;
-        if (ca >= sinceSec) out.push(n);
+  // Идём от page=1 (самые новые) к page=... пока не упёрлись в старше sinceSec
+  for (let page = 1; page <= maxPagesBack; page++) {
+    // небольшой джиттер/бэкофф от 429
+    let j = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        j = await amoFetch(`${pathBase}?limit=${perPage}&page=${page}`);
+        break;
+      } catch (e) {
+        const msg = String(e?.message || e);
+        if (/429/i.test(msg)) { await new Promise(r => setTimeout(r, 800 * (attempt + 1))); continue; }
+        throw e;
       }
-      break;
-    } else {
-      out.push(...arr);
     }
+    const arr = Array.isArray(j?._embedded?.notes) ? j._embedded.notes : [];
+    if (!arr.length) break; // записей дальше нет — выходим
 
-    // Если есть _links.next — продолжаем, иначе выходим
-    const hasNext = !!j?._links?.next?.href;
-    if (!hasNext) break;
+    for (const n of arr) {
+      const ca = parseInt(n?.created_at || 0, 10) || 0;
+      if (ca < sinceSec) { reachedOld = true; break; } // пошли старые — дальше смысла нет
+      out.push(n);
+    }
+    if (reachedOld) break;
+
+    // если страница короче perPage — это «хвост» новых, дальше будет старьё
+    if (arr.length < perPage) break;
   }
+
+  // финально отсортируем от новых к старым
   out.sort((a,b) => (b.created_at||0) - (a.created_at||0));
-  return out.filter(n => (parseInt(n?.created_at || 0, 10) || 0) >= sinceSec);
+  return out;
 }
-
-function filterCallish(arr){ return arr.filter(isLikelyCallNote); }
-
 /* ===== Ручной курсор ===== */
 export async function getManualSince(){
   const v = await getSecret(SECRET_KEY_MANUAL_SINCE).catch(()=> null);

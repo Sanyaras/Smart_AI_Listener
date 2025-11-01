@@ -1,38 +1,62 @@
-// qa_assistant.js
-import fetch from "node-fetch";
-import { debug, safeStr } from "./utils.js";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const CALL_QA_MODEL = "gpt-4o-mini"; // компактная и дешёвая, можно поменять на gpt-4o при желании
-const TIMEOUT_MS = 60000;
-const MAX_RETRIES = 2;
+// qa_assistant.js (v4.3-IRAZBIL-ru) — JSON-only QA per iRazbil rubric
+// - Строгий фиксированный JSON (roles + anchors + consistency rules)
+// - Детерминизм (temperature=0)
+// - Ретраи запроса к OpenAI с таймаутом
+// - Нормализация баллов (0..10) и корректный total (учёт intent и N/A для value)
+// - Полностью русскоязычный рендер в Telegram + авто-перевод кратких англ. ярлыков
 
-if (!OPENAI_API_KEY) throw new Error("❌ OPENAI_API_KEY missing");
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const CALL_QA_MODEL  = process.env.CALL_QA_MODEL  || "gpt-4.1-mini";
+
+const MAX_TXT = 16000;
+const OPENAI_TIMEOUT_MS  = parseInt(process.env.CALL_QA_TIMEOUT_MS || "60000", 10);
+const OPENAI_MAX_RETRIES = parseInt(process.env.CALL_QA_RETRIES    || "2", 10);
 
 /**
- * Анализирует транскрипт звонка и возвращает JSON-оценку
+ * Анализ транскрипта по фиксированной JSON-схеме.
+ * Возвращает объект строго по структуре:
+ * {
+ *   intent, score{...}, psycho_emotional{...}, techniques{...},
+ *   quotes:[{speaker,quote},...], summary, action_items:[...]
+ * }
  */
 export async function analyzeTranscript(transcript, meta = {}) {
-  if (!transcript?.trim()) throw new Error("Empty transcript");
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is missing");
+  if (!transcript || !transcript.trim()) throw new Error("Empty transcript");
 
-  const systemPrompt = `
-Вы – AI-ассистент отдела контроля качества компании iRazbil.
-Вы оцениваете телефонные разговоры менеджеров с клиентами.
-Нужно выдать строго JSON со структурой:
+  const t = transcript.length > MAX_TXT ? (transcript.slice(0, MAX_TXT) + "\n[...cut...]") : transcript;
+
+  // ---------------- System ----------------
+  const system = `
+Вы – AI-ассистент по оценке качества звонков компании iRazbil (продажа и ремонт устройств).
+Входные данные – транскрипт телефонного разговора (без указания говорящих).
+Ваша задача – провести полную оценку звонка с разбиением ролей и выводом результатов строго в формате JSON.
+
+Инструкции для оценки:
+• Определите роли собеседников: manager (менеджер компании), customer (клиент) и ivr (автоинформатор). Разбейте транскрипт на реплики с указанием роли каждого говорящего.
+• Определите намерение звонка (intent): "sales" (покупка/продажа устройства) или "support" (ремонт/поддержка устройства). Учитывайте это при оценке: не снижайте оценку за критерии, не относящиеся к данному intent (если критерий неприменим, он не должен уменьшать итоговый балл).
+• Оцените работу менеджера по ключевым техникам разговора: greeting, rapport, needs, value, objection_handling, next_step, closing, clarity, compliance. Для каждого параметра присвойте числовую оценку и краткий анализ (см. схему).
+• Проведите психоэмоциональный анализ разговора: эмоциональное состояние клиента и менеджера, уровень стресса/спокойствия, вежливость, эмпатия менеджера и т.д.
+• Выделите ключевые цитаты (2–5 фраз) с ролью говорящего.
+• Составьте краткое резюме звонка.
+• Сформируйте список рекомендаций/action items.
+
+Формат вывода: один JSON-объект со следующими полями И ТОЛЬКО ИМИ:
 
 {
-  "intent": "sales" | "support",
+  "intent": "...",            // "sales" или "support"
   "score": {
-    "greeting": 0-10,
-    "rapport": 0-10,
-    "needs": 0-10,
-    "value": 0-10,
-    "objection_handling": 0-10,
-    "next_step": 0-10,
-    "closing": 0-10,
-    "clarity": 0-10,
-    "compliance": 0-10,
-    "total": 0-100
+    "greeting": <number>,
+    "rapport": <number>,
+    "needs": <number>,
+    "value": <number>,
+    "objection_handling": <number>,
+    "next_step": <number>,
+    "closing": <number>,
+    "clarity": <number>,
+    "compliance": <number>,
+    "total": <number>
   },
   "psycho_emotional": {
     "customer_sentiment": "...",
@@ -51,105 +75,362 @@ export async function analyzeTranscript(transcript, meta = {}) {
     "clarity": "...",
     "compliance": "..."
   },
-  "quotes": [{ "speaker": "manager", "quote": "..." }],
+  "quotes": [
+    { "speaker": "manager", "quote": "..." },
+    { "speaker": "customer", "quote": "..." }
+  ],
   "summary": "...",
-  "action_items": ["...", "..."]
+  "action_items": [ "...", "..." ]
 }
 
-Вывод ТОЛЬКО JSON, без комментариев.
-`;
+Особые требования:
+• Строго следуйте схеме JSON. НИКАКОГО текста вне JSON.
+• Формат и поля фиксированы — без добавления или удаления ключей.
+• Если данных нет, ставьте "unknown" или null (соблюдая тип).
+• Температура модели: 0.0 (детерминизм).
+• Убедитесь, что total согласован с подоценками. Не наказывайте за неприменимые критерии (value для support и т.п.) — используйте N/A/нейтрально в techniques, а при подсчёте total не штрафуйте.
 
-  const userPrompt = `
-CallID: ${meta.callId || "unknown"}
-Direction: ${meta.direction || "unknown"}
-From: ${meta.from || "-"} → To: ${meta.to || "-"}
-Brand: iRazbil
+2) JSON Schema — ключи и типы:
+- intent (string): "sales" или "support".
+- score (object): greeting, rapport, needs, value, objection_handling, next_step, closing, clarity, compliance — числа 0..10. total — 0..100.
+- psycho_emotional (object): customer_sentiment, manager_tone, manager_empathy, stress_level — строки.
+- techniques (object): значения-строки ("done well", "partially", "missed", "N/A" или короткое описание).
+- quotes: массив {speaker, quote}, speaker ∈ {"manager","customer","ivr"}.
+- summary: строка (3–5 предложений).
+- action_items: массив строк.
 
-Транскрипт:
-${transcript.slice(0, 16000)}
-`;
+3) Scoring Calibration — Anchor Examples
+Anchor 1 – Слабый: greeting 0, rapport 0, needs 1, value 0, objections 0, next 0, closing 0, clarity 1, compliance 0; total ~5/100.
+Anchor 2 – Средний (support): greeting 3, rapport 3, needs 4, value N/A, objections N/A/5, next 5, closing 4, clarity 5, compliance 5; total ~80/100.
+Anchor 3 – Сильный (sales): почти везде 5/5 → total ~100/100.
 
-  const body = {
+4) Consistency Rules:
+- Жёсткая JSON-форма.
+- Температура 0.
+- Нормализация total по явной формуле: N/A не штрафует.
+- Сначала разметка ролей, затем оценка.
+- Не придумывать фактов.
+
+5) Edge Cases:
+- Пусто/только IVR → intent "support", всё 0, summary объясняет нехватку данных, action_items: ["Перезвонить клиенту"].
+- Агрессия/мат фиксировать в psycho_emotional.
+- Очень длинный → 2–5 цитат, без «воды».
+
+Ответ ТОЛЬКО JSON.`.trim();
+
+  // ---------------- User ----------------
+  const exampleUserIntro = `
+User: Пример:
+
+Здравствуйте, вы позвонили в компанию iRazbil. Пожалуйста, ожидайте ответа оператора...
+Алло, у меня телефон сломался после обновления. Что делать?
+Добрый день! Менеджер iRazbil, чем могу помочь?
+... (транскрипт разговора) ...
+`.trim();
+
+  const user = [
+    meta.callId ? `CallID: ${meta.callId}` : null,
+    meta.direction ? `direction: ${meta.direction}` : null,
+    meta.from && meta.to ? `from: ${meta.from} -> to: ${meta.to}` : null,
+    meta.brand ? `brand: ${meta.brand}` : "brand: iRazbil",
+    "",
+    exampleUserIntro,
+    "",
+    "Транскрипт (без указания говорящих, требуется ролевая сегментация):",
+    t
+  ].filter(Boolean).join("\n");
+
+  // ---------------- OpenAI call (retry + timeout) ----------------
+  const payload = {
     model: CALL_QA_MODEL,
     messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
+      { role: "system", content: system },
+      { role: "user", content: user }
     ],
     temperature: 0.0,
-    response_format: { type: "json_object" },
+    response_format: { type: "json_object" }
   };
 
-  const result = await callOpenAIWithRetry(body, MAX_RETRIES);
-  return result;
-}
+  const data = await callOpenAIChatWithRetry(payload, OPENAI_MAX_RETRIES, OPENAI_TIMEOUT_MS);
+  const txt = data?.choices?.[0]?.message?.content || "";
+  const clean = String(txt).trim().replace(/^```json\s*|\s*```$/g, "");
 
-async function callOpenAIWithRetry(payload, retries = 2) {
-  let lastErr;
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
-
-      const res = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-        signal: ctrl.signal,
-      });
-
-      clearTimeout(timer);
-      const json = await res.json();
-
-      if (json?.choices?.[0]?.message?.content) {
-        const txt = json.choices[0].message.content.trim();
-        const clean = txt.replace(/^```json\s*|\s*```$/g, "");
-        return JSON.parse(clean);
-      }
-
-      throw new Error("No valid response");
-    } catch (e) {
-      lastErr = e;
-      debug(`⚠️ Retry ${i + 1}/${retries} — ${safeStr(e)}`);
-      await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
-    }
+  let parsed;
+  try {
+    parsed = JSON.parse(clean);
+  } catch {
+    throw new Error("assistant returned non-JSON (schema violation)");
   }
-  throw lastErr;
+
+  ensureSchemaShape(parsed);
+  normalizeScoresAndTotal(parsed);
+  sanitizeQuotes(parsed);
+
+  return parsed;
 }
 
 /**
- * Форматирует JSON-оценку в HTML для Telegram
+ * Телеграм-рендер (полностью по-русски).
  */
 export function formatQaForTelegram(qa) {
-  if (!qa || typeof qa !== "object") return "⚠️ Нет данных анализа";
+  const s = safe(qa);
 
-  const sc = qa.score || {};
-  const pe = qa.psycho_emotional || {};
-  const t = qa.techniques || {};
-  const quotes = Array.isArray(qa.quotes) ? qa.quotes.slice(0, 3) : [];
+  const sc = s.score || {};
+  const pe = s.psycho_emotional || {};
+  const tech = s.techniques || {};
+  const quotes = Array.isArray(s.quotes) ? s.quotes.slice(0, 3) : [];
+
+  const intentRu = toRuIntent(s.intent);
+  const peCustomer = ruify(pe.customer_sentiment || "unknown");
+  const peTone     = ruify(pe.manager_tone || "unknown");
+  const peEmp      = ruify(pe.manager_empathy || "unknown");
+  const peStress   = ruify(pe.stress_level || "unknown");
 
   const lines = [
-    "📊 <b>Оценка звонка</b>",
-    `• Тип: <b>${qa.intent}</b> · Итог: <b>${sc.total}</b>/100`,
+    "📊 <b>Аналитика звонка (iRazbil v4.3)</b>",
+    `• Тип: <b>${esc(intentRu)}</b> · Итоговый балл: <b>${num(sc.total)}</b>/100`,
     "",
-    "🧩 <b>Техники</b>",
-    `Приветствие: ${sc.greeting}, Раппорт: ${sc.rapport}, Потребности: ${sc.needs}`,
-    `Ценность: ${sc.value}, Возражения: ${sc.objection_handling}, Следующий шаг: ${sc.next_step}`,
-    `Завершение: ${sc.closing}, Ясность: ${sc.clarity}, Комплаенс: ${sc.compliance}`,
+    "🧠 <b>Психо-эмоциональный фон</b>",
+    `• Клиент: <i>${esc(peCustomer)}</i>`,
+    `• Менеджер: <i>${esc(peTone)}</i> · Эмпатия: <i>${esc(peEmp)}</i> · Уровень стресса: <i>${esc(peStress)}</i>`,
     "",
-    "🧠 <b>Психоэмоциональный фон</b>",
-    `Клиент: ${pe.customer_sentiment} · Менеджер: ${pe.manager_tone} · Эмпатия: ${pe.manager_empathy}`,
+    "🧩 <b>Техники (оценки 0–10)</b>",
+    `• Приветствие: <code>${num(sc.greeting)}</code> · Раппорт: <code>${num(sc.rapport)}</code> · Потребности: <code>${num(sc.needs)}</code> · Ценность: <code>${num(sc.value)}</code>`,
+    `• Возражения: <code>${num(sc.objection_handling)}</code> · Следующий шаг: <code>${num(sc.next_step)}</code> · Завершение: <code>${num(sc.closing)}</code>`,
+    `• Ясность: <code>${num(sc.clarity)}</code> · Комплаенс: <code>${num(sc.compliance)}</code>`,
     "",
-    quotes.length ? "💬 <b>Цитаты</b>:" : null,
-    ...quotes.map((q) => `• <b>${q.speaker}:</b> “${q.quote}”`),
+    "🧩 <b>Техники (статус)</b>",
+    `• Приветствие: ${esc(ruify(tech.greeting || "-"))}`,
+    `• Раппорт: ${esc(ruify(tech.rapport || "-"))}`,
+    `• Потребности: ${esc(ruify(tech.needs || "-"))}`,
+    `• Ценность: ${esc(ruify(tech.value || "-"))}`,
+    `• Возражения: ${esc(ruify(tech.objection_handling || "-"))}`,
+    `• Следующий шаг: ${esc(ruify(tech.next_step || "-"))}`,
+    `• Завершение: ${esc(ruify(tech.closing || "-"))}`,
+    `• Ясность: ${esc(ruify(tech.clarity || "-"))}`,
+    `• Комплаенс: ${esc(ruify(tech.compliance || "-"))}`,
     "",
-    qa.summary ? `📝 ${qa.summary}` : null,
-    qa.action_items?.length
-      ? ["📌 <b>Рекомендации:</b>", ...qa.action_items.map((i) => `• ${i}`)].join("\n")
-      : null,
+    quotes.length ? "💬 <b>Цитаты</b>" : null,
+    ...quotes.map(q => `• <b>${roleRu(q.speaker || "?")}:</b> “${esc(q.quote || "")}”`),
+    "",
+    s.summary ? `📝 <b>Итог</b>: ${esc(s.summary)}` : null,
+    Array.isArray(s.action_items) && s.action_items.length
+      ? ["📌 <b>Действия</b>:", ...s.action_items.slice(0, 5).map(i => `• ${esc(i)}`)].join("\n")
+      : null
   ].filter(Boolean);
 
   return lines.join("\n");
+}
+
+/**
+ * Необязательный вывод компактного транскрипта
+ */
+export function makeSpoilerTranscript(roleLabeledText, maxChars = 4000) {
+  const body = String(roleLabeledText || "").slice(0, maxChars);
+  return body ? `🗣️ <b>Расшифровка (сокращено)</b>\n||${esc(body)}||` : "";
+}
+
+// ---------------- Internal: OpenAI call with retry + timeout ----------------
+async function callOpenAIChatWithRetry(payload, retries, timeoutMs) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const r = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload),
+        signal: ac.signal
+      });
+      clearTimeout(to);
+      if (!r.ok) {
+        const txt = await r.text().catch(() => "");
+        throw new Error(`assistant http ${r.status}: ${txt}`);
+      }
+      return await r.json();
+    } catch (e) {
+      clearTimeout(to);
+      lastError = e;
+      if (attempt < retries) {
+        const backoff = 300 * Math.pow(2, attempt);
+        await sleep(backoff);
+      }
+    }
+  }
+  throw lastError || new Error("OpenAI call failed");
+}
+
+// ---------------- utils ----------------
+function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
+function safe(x) { return (x && typeof x === "object") ? x : {}; }
+function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function num(n) { return (typeof n === "number" && Number.isFinite(n)) ? n : "-"; }
+
+function clamp10(n) {
+  const v = Number.isFinite(+n) ? +n : 0;
+  return Math.max(0, Math.min(10, v));
+}
+
+function ensureSchemaShape(obj) {
+  obj.intent ??= "unknown";
+  obj.score ??= {};
+  const sc = obj.score;
+  sc.greeting ??= 0;
+  sc.rapport  ??= 0;
+  sc.needs    ??= 0;
+  sc.value    ??= 0;
+  sc.objection_handling ??= 0;
+  sc.next_step ??= 0;
+  sc.closing   ??= 0;
+  sc.clarity   ??= 0;
+  sc.compliance ??= 0;
+  sc.total ??= 0;
+
+  obj.psycho_emotional ??= {
+    customer_sentiment: "unknown",
+    manager_tone: "unknown",
+    manager_empathy: "unknown",
+    stress_level: "unknown"
+  };
+  obj.techniques ??= {
+    greeting: "unknown",
+    rapport: "unknown",
+    needs: "unknown",
+    value: "unknown",
+    objection_handling: "unknown",
+    next_step: "unknown",
+    closing: "unknown",
+    clarity: "unknown",
+    compliance: "unknown"
+  };
+  if (!Array.isArray(obj.quotes)) obj.quotes = [];
+  obj.summary ??= "unknown";
+  if (!Array.isArray(obj.action_items)) obj.action_items = [];
+}
+
+/**
+ * Нормализация баллов и корректный total.
+ * Если intent="support" ИЛИ techniques.value содержит "N/A"/"не применимо", value исключается из знаменателя.
+ */
+function normalizeScoresAndTotal(obj) {
+  const sc = obj.score || {};
+  const tech = obj.techniques || {};
+  const intent = String(obj.intent || "").toLowerCase();
+
+  sc.greeting = clamp10(sc.greeting);
+  sc.rapport  = clamp10(sc.rapport);
+  sc.needs    = clamp10(sc.needs);
+  sc.value    = clamp10(sc.value);
+  sc.objection_handling = clamp10(sc.objection_handling);
+  sc.next_step = clamp10(sc.next_step);
+  sc.closing   = clamp10(sc.closing);
+  sc.clarity   = clamp10(sc.clarity);
+  sc.compliance = clamp10(sc.compliance);
+
+  const valueText = (tech.value || "").toLowerCase();
+  const valueNA = intent === "support" || valueText.includes("n/a") || valueText.includes("не применимо");
+
+  const metrics = [
+    ["greeting", sc.greeting],
+    ["rapport", sc.rapport],
+    ["needs", sc.needs],
+    ["value", sc.value, valueNA], // условно
+    ["objection_handling", sc.objection_handling],
+    ["next_step", sc.next_step],
+    ["closing", sc.closing],
+    ["clarity", sc.clarity],
+    ["compliance", sc.compliance],
+  ];
+
+  let sum = 0;
+  let denom = 0;
+  for (const [name, val, na] of metrics) {
+    if (name === "value" && na) continue;
+    sum += clamp10(val);
+    denom += 10;
+  }
+  const total = denom > 0 ? Math.round((sum / denom) * 100) : 0;
+  sc.total = Math.max(0, Math.min(100, total));
+}
+
+/**
+ * Санитизация цитат: speaker ∈ {"manager","customer","ivr"}, quote — строка.
+ */
+function sanitizeQuotes(obj) {
+  if (!Array.isArray(obj.quotes)) { obj.quotes = []; return; }
+  const mapRole = (r) => {
+    const s = String(r || "").toLowerCase();
+    if (s.includes("manager") || s.includes("менедж")) return "manager";
+    if (s.includes("customer") || s.includes("client") || s.includes("клиент")) return "customer";
+    if (s.includes("ivr") || s.includes("auto") || s.includes("авто")) return "ivr";
+    return "customer";
+  };
+  obj.quotes = obj.quotes
+    .map(q => ({ speaker: mapRole(q?.speaker), quote: String(q?.quote || "").trim() }))
+    .filter(q => q.quote.length > 0)
+    .slice(0, 5);
+}
+
+// -------------- локализация для рендера --------------
+function toRuIntent(intent) {
+  const s = String(intent || "").toLowerCase();
+  if (s === "sales") return "продажа";
+  if (s === "support") return "поддержка/ремонт";
+  if (s === "ivr") return "IVR/меню";
+  if (s === "noise") return "шум/неразборчиво";
+  return s || "unknown";
+}
+
+function roleRu(speaker) {
+  const s = String(speaker || "").toLowerCase();
+  if (s.includes("manager")) return "менеджер";
+  if (s.includes("customer")) return "клиент";
+  if (s.includes("ivr")) return "автоинформатор";
+  return "говорящий";
+}
+
+/**
+ * Простой «русификатор» коротких англ. ярлыков и типичных формулировок.
+ */
+function ruify(text) {
+  const s = String(text || "").trim();
+
+  // Нормализация статусов техник
+  const map = [
+    [/^done\s*well$/i, "хорошо выполнено"],
+    [/^partially$/i, "частично выполнено"],
+    [/^missed$/i, "пропущено"],
+    [/^n\/?a$/i, "не применимо"],
+
+    // Частые тона/настроения
+    [/^polite$/i, "вежливый"],
+    [/^calm$/i, "спокойный"],
+    [/^professional$/i, "профессиональный"],
+    [/^impatient/i, "нетерпеливый"],
+    [/^frustrat/i, "раздражение/фрустрация"],
+    [/^neutral$/i, "нейтральный"],
+    [/^negative$/i, "негативный"],
+    [/^positive$/i, "позитивный"],
+    [/^low$/i, "низкий"],
+    [/^moderate$/i, "умеренный"],
+    [/^high$/i, "высокий"],
+  ];
+
+  for (const [re, rep] of map) {
+    if (re.test(s)) return rep;
+  }
+
+  const lower = s.toLowerCase();
+  if (lower.includes("impatient") && lower.includes("polite")) {
+    return "нетерпеливый, но вежливый";
+  }
+  if (lower.includes("calm") && lower.includes("professional")) {
+    return "спокойный, профессиональный";
+  }
+
+  return s;
 }

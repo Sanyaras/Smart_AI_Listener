@@ -1,162 +1,193 @@
-// supabaseStore.js — работа с Supabase REST API
-// Используется для Amo sync и очереди транскрипции.
-// Совместимо с Railway. Авторизация через SUPABASE_SERVICE_KEY.
-//
-// Таблицы:
-//  - amo_notes_raw (уникальный amo_note_key)
-//  - recordings_queue (уникальный record_url)
-//  - amo_ingest_state (опционально для хранения since и др.)
+// supabaseStore.js — унифицированное хранилище для Smart AI Listener
+// Зависит от @supabase/supabase-js и переменных окружения:
+// SUPABASE_URL, SUPABASE_SERVICE_KEY
+// Таблицы настраиваются через ENV: SB_TBL_QUEUE / SB_TBL_SEEN / SB_TBL_SECRETS
 
-import { fetchWithTimeout } from "./utils.js";
+import { createClient } from "@supabase/supabase-js";
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+// -------- ENV / init --------
+const SUPABASE_URL  = process.env.SUPABASE_URL || "";
+const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_KEY || "";
 
-if (!SUPABASE_URL) console.warn("[supabaseStore] SUPABASE_URL not set");
-if (!SUPABASE_SERVICE_KEY) console.warn("[supabaseStore] SUPABASE_SERVICE_KEY not set");
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.warn("[supabaseStore] Missing SUPABASE_URL or SUPABASE_SERVICE_KEY");
+}
 
-// ===== Helper =====
-async function sbase(path, method = "GET", payload = null, extraHeaders = {}) {
-  const url = `${SUPABASE_URL}/rest/v1${path}`;
-  const opts = {
-    method,
-    headers: {
-      "apikey": SUPABASE_SERVICE_KEY,
-      "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
-      "Content-Type": "application/json",
-      ...extraHeaders
-    },
+export const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+
+// Имена таблиц (можно переопределить через ENV)
+const TBL_QUEUE   = process.env.SB_TBL_QUEUE   || "recordings_queue";
+const TBL_SEEN    = process.env.SB_TBL_SEEN    || "amo_notes_seen";
+const TBL_SECRETS = process.env.SB_TBL_SECRETS || "app_secrets";
+
+/* ============================================================
+ * QUEUE API
+ * ============================================================
+ * Структура ожидаемой таблицы recordings_queue (минимум):
+ * id (uuid/serial), status (text: 'pending'|'done'|'failed'),
+ * record_url (text), amo_note_key (text), created_at (timestamptz),
+ * finished_at (timestamptz), error_reason (text),
+ * transcript_len (int), score_total (int),
+ * issues (jsonb), summary (text), qa_raw (jsonb)
+ */
+
+// Вернуть pending-задачи по FIFO
+export async function getPending(limit = 5) {
+  const { data, error } = await sb
+    .from(TBL_QUEUE)
+    .select("*")
+    .eq("status", "pending")
+    .order("created_at", { ascending: true })
+    .limit(limit);
+
+  if (error) throw error;
+  return data || [];
+}
+
+// Поставить запись в очередь (если такой amo_note_key + record_url уже есть — не дублировать)
+export async function enqueueRecording(payload) {
+  // ожидаем: { record_url, amo_note_key, ... }
+  const record_url = (payload?.record_url || payload?.recordUrl || "").trim();
+  const amo_note_key = (payload?.amo_note_key || payload?.amoNoteKey || "").trim();
+
+  if (!record_url) throw new Error("enqueueRecording: record_url is required");
+
+  // Пытаемся найти дубликат
+  let q = sb.from(TBL_QUEUE).select("id,status").eq("record_url", record_url).limit(1);
+  if (amo_note_key) q = q.eq("amo_note_key", amo_note_key);
+
+  const { data: exist, error: errFind } = await q;
+  if (errFind) throw errFind;
+
+  if (Array.isArray(exist) && exist.length > 0) {
+    // Уже в очереди — ок, просто вернём существующий id
+    return { id: exist[0].id, status: exist[0].status, dedup: true };
+  }
+
+  const insert = {
+    status: "pending",
+    record_url,
+    amo_note_key: amo_note_key || null,
+    created_at: new Date().toISOString(),
+    ...(payload || {}),
   };
-  if (payload) opts.body = JSON.stringify(payload);
-  const res = await fetchWithTimeout(url, opts, 30000);
-  if (!res.ok) {
-    const t = await res.text().catch(()=> "");
-    throw new Error(`Supabase ${method} ${path} failed ${res.status}: ${t}`);
-  }
-  try { return await res.json(); } catch { return {}; }
+
+  const { data, error } = await sb.from(TBL_QUEUE).insert(insert).select("id,status").limit(1);
+  if (error) throw error;
+  return (data && data[0]) ? data[0] : null;
 }
 
-// ===== Amo raw notes =====
-export async function saveAmoNotesRaw(rows) {
-  if (!rows?.length) return { inserted: 0, updated: 0, skipped: 0 };
-  const url = `${SUPABASE_URL}/rest/v1/amo_notes_raw`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "apikey": SUPABASE_SERVICE_KEY,
-      "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
-      "Content-Type": "application/json",
-      "Prefer": "resolution=merge-duplicates"
-    },
-    body: JSON.stringify(rows)
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(()=> "");
-    throw new Error(`saveAmoNotesRaw failed ${res.status}: ${t}`);
-  }
-  const uniq = new Set(rows.map(r => r.amo_note_key));
-  return { inserted: uniq.size, updated: 0, skipped: 0 };
-}
-
-// ===== Recordings queue =====
-export async function enqueueRecordings(rows) {
-  if (!rows?.length) return { enqueued: 0, duplicates: 0 };
-  const enq = [];
-  for (const r of rows) {
-    for (const u of r.links) {
-      enq.push({
-        amo_note_key: r.amo_note_key,
-        record_url: u,
-        status: "pending",
-        created_at: new Date().toISOString()
-      });
-    }
-  }
-  if (!enq.length) return { enqueued: 0, duplicates: 0 };
-
-  const url = `${SUPABASE_URL}/rest/v1/recordings_queue`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "apikey": SUPABASE_SERVICE_KEY,
-      "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
-      "Content-Type": "application/json",
-      "Prefer": "resolution=merge-duplicates"
-    },
-    body: JSON.stringify(enq)
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(()=> "");
-    throw new Error(`enqueueRecordings failed ${res.status}: ${t}`);
-  }
-  const uniq = new Set(enq.map(r => r.record_url));
-  return { enqueued: uniq.size, duplicates: 0 };
-}
-
-// ===== Очередь: получить batch pending =====
-export async function takeQueueBatch(limit = 5) {
-  const url = `/recordings_queue?status=eq.pending&order=created_at.asc&limit=${limit}`;
-  return sbase(url, "GET");
-}
-
-// ===== Обновить статус =====
-export async function markQueueStatus(ids, status, extra = {}) {
-  if (!ids?.length) return { updated: 0 };
-  const idList = ids.map(x => `"${x}"`).join(",");
-  const path = `/recordings_queue?id=in.(${idList})`;
-  const payload = { status, ...extra };
-  const res = await sbase(path, "PATCH", payload);
-  return { updated: Array.isArray(res) ? res.length : 0 };
-}
-
-export async function markQueueDone(id, extra = {}) {
-  const path = `/recordings_queue?id=eq.${id}`;
-  const payload = {
+// Завершить задачу успешно (с сохранением результатов)
+export async function markDone(id, payload = {}) {
+  if (!id) throw new Error("markDone: id is required");
+  const patch = {
     status: "done",
     finished_at: new Date().toISOString(),
-    ...extra
+    ...(payload || {}),
   };
-  const res = await sbase(path, "PATCH", payload);
-  return { updated: Array.isArray(res) ? res.length : 0 };
-}
-
-export async function markQueueError(id, err) {
-  const path = `/recordings_queue?id=eq.${id}`;
-  const payload = {
-    status: "error",
-    attempts: 1,
-    error: String(err),
-    finished_at: new Date().toISOString()
-  };
-  const res = await sbase(path, "PATCH", payload);
-  return { updated: Array.isArray(res) ? res.length : 0 };
-}
-
-// ===== Stats =====
-export async function getQueueStats() {
-  const url = `/recordings_queue?select=status,count:id`;
-  return sbase(url, "GET");
-}
-
-// ===== State store (опционально) =====
-export async function saveIngestState(key, val) {
-  const payload = [{ key, val, updated_at: new Date().toISOString() }];
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/amo_ingest_state`, {
-    method: "POST",
-    headers: {
-      "apikey": SUPABASE_SERVICE_KEY,
-      "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
-      "Content-Type": "application/json",
-      "Prefer": "resolution=merge-duplicates"
-    },
-    body: JSON.stringify(payload)
-  });
-  if (!res.ok) throw new Error(`saveIngestState failed ${res.status}`);
+  const { error } = await sb.from(TBL_QUEUE).update(patch).eq("id", id);
+  if (error) throw error;
   return true;
 }
 
-export async function loadIngestState(key) {
-  const url = `/amo_ingest_state?key=eq.${key}&select=val`;
-  const res = await sbase(url, "GET");
-  return Array.isArray(res) && res.length ? res[0].val : null;
+// Пометить задачу как failed
+export async function markFailed(id, reason = "unknown") {
+  if (!id) throw new Error("markFailed: id is required");
+  const patch = {
+    status: "failed",
+    finished_at: new Date().toISOString(),
+    error_reason: String(reason).slice(0, 1000),
+  };
+  const { error } = await sb.from(TBL_QUEUE).update(patch).eq("id", id);
+  if (error) throw error;
+  return true;
+}
+
+// Статистика очереди (для /diag)
+export async function getQueueStats() {
+  const { data, error } = await sb.from(TBL_QUEUE).select("status");
+  if (error) throw error;
+  const counts = { total: 0, pending: 0, done: 0, failed: 0 };
+  for (const row of data || []) {
+    counts.total++;
+    const s = String(row.status || "").toLowerCase();
+    if (counts[s] !== undefined) counts[s]++;
+  }
+  return counts;
+}
+
+/* ============================================================
+ * SEEN NOTES API (для amo.js)
+ * ============================================================
+ * Таблица amo_notes_seen (минимум):
+ * id (uuid/serial), note_key (text unique), seen_at (timestamptz), processed_at (timestamptz)
+ */
+
+// Проверить, обрабатывали ли уже эту заметку (true если была processed)
+export async function isAlreadyProcessed(noteKey) {
+  if (!noteKey) return false;
+  const { data, error } = await sb
+    .from(TBL_SEEN)
+    .select("processed_at, seen_at")
+    .eq("note_key", String(noteKey))
+    .limit(1);
+  if (error) throw error;
+  if (!data || data.length === 0) return false;
+  // processed_at приоритетно; если только seen_at — считаем «видели, но не обработали»
+  return Boolean(data[0].processed_at);
+}
+
+// Отметить как увиденную (но ещё не обработанную)
+export async function markSeenOnly(noteKey) {
+  if (!noteKey) return false;
+  const now = new Date().toISOString();
+  // upsert по note_key
+  const { error } = await sb
+    .from(TBL_SEEN)
+    .upsert({ note_key: String(noteKey), seen_at: now }, { onConflict: "note_key" });
+  if (error) throw error;
+  return true;
+}
+
+// Отметить как обработанную
+export async function markProcessed(noteKey) {
+  if (!noteKey) return false;
+  const now = new Date().toISOString();
+  const { error } = await sb
+    .from(TBL_SEEN)
+    .upsert({ note_key: String(noteKey), processed_at: now, seen_at: now }, { onConflict: "note_key" });
+  if (error) throw error;
+  return true;
+}
+
+/* ============================================================
+ * APP SECRETS (опционально: хранение токенов/параметров)
+ * ============================================================
+ * Таблица app_secrets (минимум):
+ * id (uuid/serial), key (text unique), val (text/jsonb), updated_at (timestamptz)
+ */
+
+// Получить секрет по ключу (строка или объект, как храните)
+export async function getSecret(key) {
+  if (!key) return null;
+  const { data, error } = await sb
+    .from(TBL_SECRETS)
+    .select("val")
+    .eq("key", String(key))
+    .limit(1);
+  if (error) throw error;
+  if (!data || data.length === 0) return null;
+  return data[0]?.val ?? null;
+}
+
+// Установить/обновить секрет
+export async function setSecret(key, val) {
+  if (!key) return false;
+  const now = new Date().toISOString();
+  const row = { key: String(key), val, updated_at: now };
+  const { error } = await sb.from(TBL_SECRETS).upsert(row, { onConflict: "key" });
+  if (error) throw error;
+  return true;
 }

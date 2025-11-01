@@ -5,7 +5,8 @@ import { processAmoCalls } from "./amo.js";
 import { transcribeAudio } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 import { getUnprocessedCalls, markCallProcessed, getAmoTokens, getRecentCalls } from "./supabaseStore.js";
-import { initTelegramEnv as initTelegram, sendTGMessage, uploadToTelegramAndGetUrl } from "./telegram.js";
+import { initTelegram, sendTGMessage } from "./telegram.js";
+await initTelegram();
 import { fetchWithTimeout, debug, safeStr } from "./utils.js";
 
 const app = express();

@@ -5,14 +5,14 @@ import { processAmoCalls } from "./amo.js";
 import { transcribeAudio } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
 import { getUnprocessedCalls, markCallProcessed, getAmoTokens, getRecentCalls } from "./supabaseStore.js";
-import { initTelegramEnv, sendTGMessage } from "./telegram.js";
+import { initTelegram, sendTGMessage, uploadToTelegramAndGetUrl } from "./telegram.js";
 import { fetchWithTimeout, debug, safeStr } from "./utils.js";
 
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" }));
 
 // --- Init Telegram ---
-initTelegramEnv(process.env);
+initTelegram();
 
 const PORT = process.env.PORT || 8080;
 const POLL_INTERVAL_MIN = parseInt(process.env.AMO_POLL_MINUTES || "5", 10) * 60 * 1000;
@@ -34,8 +34,21 @@ async function mainCycle() {
 
     debug(`🎧 Обрабатываем ${unprocessed.length} звонков...`);
     for (const call of unprocessed) {
-      const { note_id, link } = call;
+      let { note_id, link } = call;
       debug(`➡️ Note ${note_id}: ${link}`);
+
+      // 0️⃣ Проверка источника: если MegaPBX — проксируем через Telegram
+      if (link && link.includes("megapbx.ru")) {
+        debug("📡 MegaPBX detected — uploading to Telegram...");
+        const newLink = await uploadToTelegramAndGetUrl(link);
+        if (newLink) {
+          link = newLink;
+          debug("✅ Заменён на Telegram CDN:", link);
+        } else {
+          console.warn("⚠️ Не удалось загрузить через Telegram, пропуск...");
+          continue;
+        }
+      }
 
       // 1️⃣ Транскрипция
       const transcript = await transcribeAudio(link);
@@ -125,7 +138,7 @@ app.get("/amo/debug", async (req, res) => {
   }
 });
 
-// ====================== DEBUG: FULL (with pagination + filtering) ======================
+// ====================== DEBUG: FULL ======================
 
 app.get("/amo/debug/full", async (req, res) => {
   try {
@@ -133,7 +146,7 @@ app.get("/amo/debug/full", async (req, res) => {
     if (key !== process.env.CRM_SHARED_KEY)
       return res.status(403).json({ error: "Forbidden" });
 
-    const scope = req.query.scope || "leads"; // leads, contacts, companies, events
+    const scope = req.query.scope || "leads";
     const page = req.query.page || 1;
     const from = req.query.from || null;
     const limit = req.query.limit || 20;
@@ -179,7 +192,7 @@ app.get("/amo/debug/full", async (req, res) => {
   }
 });
 
-// ====================== CALLS VIEW (Supabase) ======================
+// ====================== CALLS VIEW ======================
 
 app.get("/amo/calls", async (req, res) => {
   try {

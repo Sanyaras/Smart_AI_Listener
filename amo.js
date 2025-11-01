@@ -327,7 +327,6 @@ export async function setManualSince(ts){
   await setSecret(SECRET_KEY_MANUAL_SINCE, String(n));
   return n;
 }
-async function fetchRecentNotes(pathBase, perPage, maxPagesForward, sinceSec){ /* как у тебя сейчас */ }
 
 async function fetchRecentAcrossEntities(sinceSec, perEntityLimit = 50){
   const maxPagesForward = 25;

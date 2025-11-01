@@ -10,7 +10,7 @@ import {
   getAmoTokens, 
   getRecentCalls 
 } from "./supabaseStore.js";
-import { initTelegram, sendTGMessage } from "./telegram.js";
+import { initTelegram, sendTGMessage, uploadToTelegramAndGetUrl } from "./telegram.js";
 import { fetchWithTimeout, debug, safeStr } from "./utils.js";
 
 const app = express();
@@ -19,28 +19,17 @@ app.use(bodyParser.json({ limit: "10mb" }));
 const PORT = process.env.PORT || 3000;
 const POLL_INTERVAL_MIN = parseInt(process.env.AMO_POLL_MINUTES || "5", 10) * 60 * 1000;
 
-// ====================== INIT TELEGRAM (Webhook mode) ======================
+// ====================== INIT TELEGRAM ======================
 (async () => {
   try {
     await initTelegram(process.env, app);
-    console.log("🤖 Telegram инициализирован (Webhook mode)");
-  } catch (err) {
-    console.error("❌ Ошибка инициализации Telegram:", err);
-  }
-})();
-
-// ====================== INIT TELEGRAM (Webhook mode) ======================
-(async () => {
-  try {
-    await initTelegram(process.env, app);
-    console.log("🤖 Telegram инициализирован (Webhook mode)");
+    console.log("🤖 Telegram инициализирован (Webhook or polling mode)");
   } catch (err) {
     console.error("❌ Ошибка инициализации Telegram:", err);
   }
 })();
 
 // ====================== CORE PROCESS ======================
-
 async function mainCycle() {
   console.log("🌀 mainCycle() стартовал...");
   try {
@@ -59,15 +48,15 @@ async function mainCycle() {
       let { note_id, link } = call;
       debug(`➡️ Note ${note_id}: ${link}`);
 
-      // 0️⃣ Проверка источника: если MegaPBX — проксируем через Telegram
+      // 0️⃣ MegaPBX: relay через Telegram, если ссылка не скачивается напрямую
       if (link && link.includes("megapbx.ru")) {
         debug("📡 MegaPBX detected — uploading to Telegram...");
         const newLink = await uploadToTelegramAndGetUrl(link);
         if (newLink) {
           link = newLink;
-          debug("✅ Заменён на Telegram CDN:", link);
+          debug("✅ Relay ссылка:", link);
         } else {
-          console.warn("⚠️ Не удалось загрузить через Telegram, пропуск...");
+          console.warn("⚠️ Не удалось получить relay-ссылку, пропуск...");
           continue;
         }
       }
@@ -79,41 +68,39 @@ async function mainCycle() {
         continue;
       }
 
-      // 2️⃣ Анализ звонка (QA)
+      // 2️⃣ Анализ звонка
       const qa = await analyzeTranscript(transcript, { callId: note_id });
       const qaText = formatQaForTelegram(qa);
 
-      // 3️⃣ Telegram отчёт
+      // 3️⃣ Отчёт в Telegram
       await sendTGMessage(`📞 <b>Звонок #${note_id}</b>\n${qaText}`);
 
-      // 4️⃣ Помечаем в Supabase
+      // 4️⃣ Пометка в Supabase
       await markCallProcessed(note_id, transcript, qa);
-      debug(`✅ Звонок ${note_id} полностью обработан`);
+      debug(`✅ Звонок ${note_id} обработан`);
     }
 
     console.log("✅ mainCycle успешно завершён");
   } catch (e) {
-    console.error("❌ Ошибка цикла:", safeStr(e));
+    console.error("❌ Ошибка mainCycle:", safeStr(e));
   }
 }
 
 // ====================== EXPRESS ROUTES ======================
-
 app.get("/", (req, res) => res.send("✅ Smart AI Listener v3 работает"));
 
 app.post("/amo/force-scan", async (req, res) => {
   console.log("⚙️ POST /amo/force-scan запущен вручную");
   try {
     await mainCycle();
-    console.log("✅ mainCycle завершён вручную");
     res.json({ ok: true });
   } catch (err) {
-    console.error("❌ Ошибка при ручном запуске force-scan:", err);
+    console.error("❌ Ошибка force-scan:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.get("/status", async (req, res) => {
+app.get("/status", (req, res) => {
   res.json({
     ok: true,
     uptime: process.uptime(),
@@ -124,8 +111,7 @@ app.get("/status", async (req, res) => {
   });
 });
 
-// ====================== DEBUG: SHORT ======================
-
+// ====================== DEBUG ROUTES ======================
 app.get("/amo/debug", async (req, res) => {
   try {
     const key = req.query.key;
@@ -160,83 +146,11 @@ app.get("/amo/debug", async (req, res) => {
   }
 });
 
-// ====================== DEBUG: FULL ======================
-
-app.get("/amo/debug/full", async (req, res) => {
-  try {
-    const key = req.query.key;
-    if (key !== process.env.CRM_SHARED_KEY)
-      return res.status(403).json({ error: "Forbidden" });
-
-    const scope = req.query.scope || "leads";
-    const page = req.query.page || 1;
-    const from = req.query.from || null;
-    const limit = req.query.limit || 20;
-
-    const tokens = await getAmoTokens();
-    if (!tokens?.access_token)
-      return res.status(401).json({ error: "No valid token" });
-
-    let url = `${process.env.AMO_BASE_URL}/api/v4/${scope}/notes?limit=${limit}&page=${page}&order[id]=desc`;
-    if (from) {
-      const ts = Math.floor(new Date(from).getTime() / 1000);
-      url += `&filter[created_at][from]=${ts}`;
-    }
-
-    console.log(`📡 Fetching ${scope} notes page=${page} from=${from || "none"} ...`);
-
-    const amoRes = await fetchWithTimeout(
-      url,
-      { headers: { Authorization: `Bearer ${tokens.access_token}` } },
-      25000
-    );
-
-    const json = await amoRes.json();
-    const notes = (json._embedded?.notes || []).map((n) => ({
-      id: n.id,
-      type: n.note_type,
-      created_at: n.created_at,
-      entity_id: n.entity_id,
-      paramsKeys: n.params ? Object.keys(n.params) : [],
-      sample: JSON.stringify(n.params || {}).slice(0, 500) + "...",
-    }));
-
-    res.json({
-      ok: true,
-      scope,
-      page,
-      count: notes.length,
-      notes,
-    });
-  } catch (e) {
-    console.error("❌ /amo/debug/full:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ====================== CALLS VIEW ======================
-
-app.get("/amo/calls", async (req, res) => {
-  try {
-    const key = req.query.key;
-    if (key !== process.env.CRM_SHARED_KEY)
-      return res.status(403).json({ error: "Forbidden" });
-
-    const calls = await getRecentCalls(15);
-    res.json({ ok: true, count: calls.length, calls });
-  } catch (e) {
-    console.error("❌ /amo/calls:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 // ====================== SCHEDULER ======================
-
 setInterval(mainCycle, POLL_INTERVAL_MIN);
 mainCycle().catch(console.error);
 
 // ====================== START SERVER ======================
-
 app.listen(PORT, () => {
   console.log(`🚀 Smart-AI-Listener v3 запущен на порту ${PORT}`);
 });

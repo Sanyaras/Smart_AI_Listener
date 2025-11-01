@@ -256,12 +256,12 @@ async function upsertCallQaToSupabase(row){
   }
 }
 
-/* ===== Debug dump последних заметок (для /amo/debug/notes) ===== */
+// === /amo/debug/notes: всегда новые сверху ===
 export async function debugFetchRecentWithMeta(limit = 50){
   const [leads, contacts, companies] = await Promise.all([
-    amoFetch(`/api/v4/leads/notes?limit=${limit}&page=1`),
-    amoFetch(`/api/v4/contacts/notes?limit=${limit}&page=1`),
-    amoFetch(`/api/v4/companies/notes?limit=${limit}&page=1`),
+    amoFetch(`/api/v4/leads/notes?limit=${limit}&page=1&order[created_at]=desc`),
+    amoFetch(`/api/v4/contacts/notes?limit=${limit}&page=1&order[created_at]=desc`),
+    amoFetch(`/api/v4/companies/notes?limit=${limit}&page=1&order[created_at]=desc`),
   ]);
   const pick = (entity, arr) => {
     const items = Array.isArray(arr?._embedded?.notes) ? arr._embedded.notes : [];
@@ -283,18 +283,14 @@ export async function debugFetchRecentWithMeta(limit = 50){
   return { ok: true, count: out.length, items: out };
 }
 
-// вместо прежней версии
-async function fetchRecentNotes(pathBase, perPage, maxPagesBack, sinceSec){
+// === Главная выборка заметок: идём вперёд от page=1 при order[created_at]=desc ===
+async function fetchRecentNotes(pathBase, perPage, maxPagesForward, sinceSec){
   const out = [];
-  let reachedOld = false;
-
-  // Идём от page=1 (самые новые) к page=... пока не упёрлись в старше sinceSec
-  for (let page = 1; page <= maxPagesBack; page++) {
-    // небольшой джиттер/бэкофф от 429
+  for (let page = 1; page <= maxPagesForward; page++) {
     let j = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        j = await amoFetch(`${pathBase}?limit=${perPage}&page=${page}`);
+        j = await amoFetch(`${pathBase}?limit=${perPage}&page=${page}&order[created_at]=desc`);
         break;
       } catch (e) {
         const msg = String(e?.message || e);
@@ -303,20 +299,17 @@ async function fetchRecentNotes(pathBase, perPage, maxPagesBack, sinceSec){
       }
     }
     const arr = Array.isArray(j?._embedded?.notes) ? j._embedded.notes : [];
-    if (!arr.length) break; // записей дальше нет — выходим
+    if (!arr.length) break;
 
+    let pageHasNewer = false;
     for (const n of arr) {
       const ca = parseInt(n?.created_at || 0, 10) || 0;
-      if (ca < sinceSec) { reachedOld = true; break; } // пошли старые — дальше смысла нет
-      out.push(n);
+      if (ca >= sinceSec) { out.push(n); pageHasNewer = true; }
+      else { break; } // дальше на странице — ещё старше
     }
-    if (reachedOld) break;
-
-    // если страница короче perPage — это «хвост» новых, дальше будет старьё
+    if (!pageHasNewer) break;      // следующая страница будет только старее
     if (arr.length < perPage) break;
   }
-
-  // финально отсортируем от новых к старым
   out.sort((a,b) => (b.created_at||0) - (a.created_at||0));
   return out;
 }

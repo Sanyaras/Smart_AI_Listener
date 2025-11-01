@@ -155,3 +155,94 @@ export async function setSecret(key, val) {
     return false;
   }
 }
+// --- recordings_queue helpers ---
+
+async function sbase(url, method, payload) {
+  const res = await fetch(url, {
+    method,
+    headers: {
+      "apikey": process.env.SUPABASE_SERVICE_KEY,
+      "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": "return=representation"
+    },
+    body: payload ? JSON.stringify(payload) : undefined
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(()=> "");
+    throw new Error(`Supabase ${method} ${url} failed ${res.status}: ${t}`);
+  }
+  return res.json().catch(()=> ({}));
+}
+
+export async function saveAmoNotesRaw(rows) {
+  if (!rows?.length) return { inserted: 0, updated: 0, skipped: 0 };
+  const url = `${process.env.SUPABASE_URL}/rest/v1/amo_notes_raw`;
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      "apikey": process.env.SUPABASE_SERVICE_KEY,
+      "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": "resolution=merge-duplicates"
+    },
+    body: JSON.stringify(rows)
+  });
+  const uniq = new Set(rows.map(r => r.amo_note_key));
+  return { inserted: uniq.size, updated: 0, skipped: 0 };
+}
+
+export async function enqueueRecordings(rows) {
+  const enq = [];
+  for (const r of rows) {
+    for (const url of r.links) {
+      enq.push({
+        amo_note_key: r.amo_note_key,
+        record_url: url,
+        status: "pending"
+      });
+    }
+  }
+  if (!enq.length) return { enqueued: 0, duplicates: 0 };
+  const url = `${process.env.SUPABASE_URL}/rest/v1/recordings_queue`;
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      "apikey": process.env.SUPABASE_SERVICE_KEY,
+      "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": "resolution=merge-duplicates"
+    },
+    body: JSON.stringify(enq)
+  });
+  const uniq = new Set(enq.map(r => r.record_url));
+  return { enqueued: uniq.size, duplicates: 0 };
+}
+
+export async function takeQueueBatch(limit=5) {
+  // берём pending по created_at
+  const url = `${process.env.SUPABASE_URL}/rest/v1/recordings_queue?status=eq.pending&order=created_at.asc&limit=${limit}`;
+  return sbase(url, "GET");
+}
+
+export async function markQueueStatus(ids, status, extra={}) {
+  if (!ids?.length) return { updated: 0 };
+  const url = `${process.env.SUPABASE_URL}/rest/v1/recordings_queue?id=in.(${ids.map(x => `"${x}"`).join(",")})`;
+  const payload = { status, ...extra, ...(status==="downloading" ? { started_at: new Date().toISOString() } : {}) };
+  const res = await sbase(url, "PATCH", payload);
+  return { updated: Array.isArray(res) ? res.length : 0 };
+}
+
+export async function markQueueDone(id, extra={}) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/recordings_queue?id=eq.${id}`;
+  const payload = { status: "done", finished_at: new Date().toISOString(), ...extra };
+  const res = await sbase(url, "PATCH", payload);
+  return { updated: Array.isArray(res) ? res.length : 0 };
+}
+
+export async function markQueueError(id, err) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/recordings_queue?id=eq.${id}`;
+  const payload = { status: "error", attempts: 1, error: String(err), finished_at: new Date().toISOString() };
+  const res = await sbase(url, "PATCH", payload);
+  return { updated: Array.isArray(res) ? res.length : 0 };
+}

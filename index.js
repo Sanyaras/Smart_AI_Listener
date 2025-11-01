@@ -4,7 +4,7 @@ import bodyParser from "body-parser";
 import { processAmoCalls } from "./amo.js";
 import { transcribeAudio } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
-import { getUnprocessedCalls, markCallProcessed, getAmoTokens } from "./supabaseStore.js";
+import { getUnprocessedCalls, markCallProcessed, getAmoTokens, getRecentCalls } from "./supabaseStore.js";
 import { initTelegramEnv, sendTGMessage } from "./telegram.js";
 import { fetchWithTimeout, debug, safeStr } from "./utils.js";
 
@@ -20,6 +20,7 @@ const POLL_INTERVAL_MIN = parseInt(process.env.AMO_POLL_MINUTES || "5", 10) * 60
 // ====================== CORE PROCESS ======================
 
 async function mainCycle() {
+  console.log("🌀 mainCycle() стартовал...");
   try {
     debug("🔄 Запуск цикла AmoCRM...");
     const found = await processAmoCalls();
@@ -54,6 +55,8 @@ async function mainCycle() {
       await markCallProcessed(note_id, transcript, qa);
       debug(`✅ Звонок ${note_id} полностью обработан`);
     }
+
+    console.log("✅ mainCycle успешно завершён");
   } catch (e) {
     console.error("❌ Ошибка цикла:", safeStr(e));
   }
@@ -64,9 +67,15 @@ async function mainCycle() {
 app.get("/", (req, res) => res.send("✅ Smart AI Listener v3 работает"));
 
 app.post("/amo/force-scan", async (req, res) => {
-  debug("⚙️ Принудительный запуск /amo/force-scan");
-  await mainCycle();
-  res.json({ ok: true });
+  console.log("⚙️ POST /amo/force-scan запущен вручную");
+  try {
+    await mainCycle();
+    console.log("✅ mainCycle завершён вручную");
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ Ошибка при ручном запуске force-scan:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 app.get("/status", async (req, res) => {
@@ -105,7 +114,7 @@ app.get("/amo/debug", async (req, res) => {
       id: n.id,
       entity_id: n.entity_id,
       created_at: n.created_at,
-      link: n.params?.LINK || n.params?.link || null,
+      link: n.params?.link || n.params?.LINK || null,
       type: n.note_type,
     }));
 
@@ -116,7 +125,7 @@ app.get("/amo/debug", async (req, res) => {
   }
 });
 
-// ====================== DEBUG: FULL (25s timeout) ======================
+// ====================== DEBUG: FULL ======================
 
 app.get("/amo/debug/full", async (req, res) => {
   try {
@@ -134,7 +143,7 @@ app.get("/amo/debug/full", async (req, res) => {
     const amoRes = await fetchWithTimeout(
       url,
       { headers: { Authorization: `Bearer ${tokens.access_token}` } },
-      25000 // Увеличенный тайм-аут
+      25000
     );
 
     const json = await amoRes.json();
@@ -149,6 +158,22 @@ app.get("/amo/debug/full", async (req, res) => {
     res.json({ ok: true, count: notes.length, notes });
   } catch (e) {
     console.error("❌ /amo/debug/full:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ====================== CALLS VIEW (Supabase) ======================
+
+app.get("/amo/calls", async (req, res) => {
+  try {
+    const key = req.query.key;
+    if (key !== process.env.CRM_SHARED_KEY)
+      return res.status(403).json({ error: "Forbidden" });
+
+    const calls = await getRecentCalls(15);
+    res.json({ ok: true, count: calls.length, calls });
+  } catch (e) {
+    console.error("❌ /amo/calls:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });

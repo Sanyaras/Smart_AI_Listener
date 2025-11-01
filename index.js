@@ -78,7 +78,42 @@ app.get("/status", async (req, res) => {
     },
   });
 });
+import { getAmoTokens } from "./supabaseStore.js";
+import { fetchWithTimeout } from "./utils.js";
 
+app.get("/amo/debug", async (req, res) => {
+  try {
+    const key = req.query.key;
+    if (key !== process.env.CRM_SHARED_KEY) return res.status(403).json({ error: "Forbidden" });
+
+    const tokens = await getAmoTokens();
+    if (!tokens?.access_token) return res.status(401).json({ error: "No valid token" });
+
+    const url = `${process.env.AMO_BASE_URL}/api/v4/leads/notes?filter[type]=call_in&limit=10`;
+    const amoRes = await fetchWithTimeout(url, {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+
+    const json = await amoRes.json();
+
+    if (!json?._embedded?.notes) {
+      return res.status(500).json({ error: "No notes returned", raw: json });
+    }
+
+    const result = json._embedded.notes.map((n) => ({
+      id: n.id,
+      entity_id: n.entity_id,
+      created_at: n.created_at,
+      link: n.params?.LINK || n.params?.link || null,
+      type: n.note_type,
+    }));
+
+    res.json({ ok: true, count: result.length, notes: result });
+  } catch (e) {
+    console.error("❌ /amo/debug:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 // ====================== SCHEDULER ======================
 
 setInterval(mainCycle, POLL_INTERVAL_MIN);

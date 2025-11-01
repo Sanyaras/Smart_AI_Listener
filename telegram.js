@@ -1,101 +1,80 @@
 // telegram.js
-import crypto from "crypto";
-import { fetchWithTimeout, debug, safeStr, chunkText } from "./utils.js";
+import fetch from "node-fetch";
+import { Telegraf } from "telegraf";
+import { insertCallRecord } from "./supabaseStore.js";
+import { debug, safeStr } from "./utils.js";
 
-export const TELEGRAM = {
-  TG_BOT_TOKEN: "",
-  TG_CHAT_ID: "",
-  TG_UPLOAD_CHAT_ID: "",
-  TG_WEBHOOK_SECRET: "",
-  NODE_ENV: "",
-};
+const botToken = process.env.TG_BOT_TOKEN;
+const chatId = process.env.TG_CHAT_ID;
 
-let tgQueue = [];
-let tgWorkerRunning = false;
+if (!botToken) throw new Error("❌ Missing TG_BOT_TOKEN in environment variables");
 
-export function initTelegramEnv(env = process.env) {
-  TELEGRAM.TG_BOT_TOKEN = env.TG_BOT_TOKEN || "";
-  TELEGRAM.TG_CHAT_ID = env.TG_CHAT_ID || "";
-  TELEGRAM.TG_UPLOAD_CHAT_ID = env.TG_UPLOAD_CHAT_ID || TELEGRAM.TG_CHAT_ID;
-  TELEGRAM.TG_WEBHOOK_SECRET = env.TG_WEBHOOK_SECRET || crypto.randomBytes(8).toString("hex");
-  TELEGRAM.NODE_ENV = env.NODE_ENV || "production";
+export const bot = new Telegraf(botToken);
 
-  if (!TELEGRAM.TG_BOT_TOKEN || !TELEGRAM.TG_CHAT_ID) {
-    throw new Error("❌ Missing TG_BOT_TOKEN or TG_CHAT_ID");
-  }
+debug("🤖 Telegram bot listener initialized...");
 
-  debug("✅ Telegram env initialized");
-}
-
-function enqueue(fn) {
-  return new Promise((resolve, reject) => {
-    tgQueue.push({ fn, resolve, reject });
-    if (!tgWorkerRunning) runWorker();
-  });
-}
-
-async function runWorker() {
-  tgWorkerRunning = true;
-  while (tgQueue.length) {
-    const job = tgQueue.shift();
-    try {
-      const res = await job.fn();
-      job.resolve(res);
-    } catch (e) {
-      job.reject(e);
-    }
-    await new Promise((r) => setTimeout(r, 200)); // задержка между сообщениями
-  }
-  tgWorkerRunning = false;
-}
-
-async function tgRequest(api, body, timeout = 12000) {
-  if (!TELEGRAM.TG_BOT_TOKEN) throw new Error("TG_BOT_TOKEN not set");
-  const url = `https://api.telegram.org/bot${TELEGRAM.TG_BOT_TOKEN}/${api}`;
-  const payload = JSON.stringify(body);
-
-  return enqueue(async () => {
-    const res = await fetchWithTimeout(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: payload,
-    }, timeout);
-
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) throw new Error(`Telegram error: ${safeStr(data)}`);
-    return data;
-  });
-}
-
-export async function sendTGMessage(text) {
+// ==========================
+// Обработка аудио и войсов
+// ==========================
+bot.on(["audio", "voice"], async (ctx) => {
   try {
-    const chunks = chunkText(text, 3900);
-    for (const part of chunks) {
-      await tgRequest("sendMessage", {
-        chat_id: TELEGRAM.TG_CHAT_ID,
-        text: part,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-      });
-    }
-    return true;
-  } catch (e) {
-    console.error("❌ sendTGMessage:", safeStr(e));
-    return false;
-  }
-}
+    const msg = ctx.message;
+    const fileInfo = msg.audio || msg.voice;
+    const file_id = fileInfo.file_id;
+    const duration = fileInfo.duration || 0;
+    const sender = msg.from?.username || msg.from?.first_name || "unknown";
+    const created_at = new Date(msg.date * 1000).toISOString();
 
-export async function sendTGDocument(fileUrl, caption = "") {
-  try {
-    await tgRequest("sendDocument", {
-      chat_id: TELEGRAM.TG_UPLOAD_CHAT_ID,
-      document: fileUrl,
-      caption,
-      parse_mode: "HTML",
+    // 1️⃣ Получаем file_path
+    const getFileRes = await fetch(
+      `https://api.telegram.org/bot${botToken}/getFile?file_id=${file_id}`
+    );
+    const fileJson = await getFileRes.json();
+    if (!fileJson.ok) throw new Error(`getFile failed: ${safeStr(fileJson)}`);
+
+    // 2️⃣ Строим прямую ссылку
+    const file_path = fileJson.result.file_path;
+    const fileUrl = `https://api.telegram.org/file/bot${botToken}/${file_path}`;
+    debug(`🎧 Получен файл из Telegram: ${fileUrl}`);
+
+    // 3️⃣ Сохраняем в Supabase как звонок
+    const note_id = `tg_${msg.message_id}`;
+    const contact_id = msg.from?.id || 0;
+
+    const record = await insertCallRecord({
+      note_id,
+      contact_id,
+      link: fileUrl,
+      created_at,
     });
-    return true;
+
+    if (record) {
+      await ctx.reply(`✅ Аудио получено и сохранено (${sender}, ${duration}s)`);
+      debug(`💾 call_record добавлен в Supabase: ${note_id}`);
+    } else {
+      await ctx.reply(`⚠️ Ошибка при сохранении записи в базу`);
+    }
   } catch (e) {
-    console.error("❌ sendTGDocument:", safeStr(e));
-    return false;
+    console.error("❌ Ошибка при обработке аудио:", safeStr(e));
+    await ctx.reply("⚠️ Не удалось сохранить аудио 😢");
   }
+});
+
+// ==========================
+// Обработка текстовых команд
+// ==========================
+bot.command("ping", async (ctx) => {
+  await ctx.reply("🏓 Bot online!");
+});
+
+bot.command("last", async (ctx) => {
+  await ctx.reply("📜 Последние 10 аудио-записей обрабатываются...");
+});
+
+// ==========================
+// Запуск
+// ==========================
+export function startTelegramBot() {
+  bot.launch();
+  debug("🚀 Telegram bot запущен и слушает новые аудио/войсы...");
 }

@@ -4,13 +4,14 @@ import bodyParser from "body-parser";
 import { processAmoCalls } from "./amo.js";
 import { transcribeAudio } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
-import { getUnprocessedCalls, markCallProcessed } from "./supabaseStore.js";
+import { getUnprocessedCalls, markCallProcessed, getAmoTokens } from "./supabaseStore.js";
 import { initTelegramEnv, sendTGMessage } from "./telegram.js";
-import { debug, safeStr } from "./utils.js";
+import { fetchWithTimeout, debug, safeStr } from "./utils.js";
 
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" }));
 
+// --- Init Telegram ---
 initTelegramEnv(process.env);
 
 const PORT = process.env.PORT || 8080;
@@ -78,27 +79,27 @@ app.get("/status", async (req, res) => {
     },
   });
 });
-import { getAmoTokens } from "./supabaseStore.js";
-import { fetchWithTimeout } from "./utils.js";
+
+// ====================== DEBUG: SHORT ======================
 
 app.get("/amo/debug", async (req, res) => {
   try {
     const key = req.query.key;
-    if (key !== process.env.CRM_SHARED_KEY) return res.status(403).json({ error: "Forbidden" });
+    if (key !== process.env.CRM_SHARED_KEY)
+      return res.status(403).json({ error: "Forbidden" });
 
     const tokens = await getAmoTokens();
-    if (!tokens?.access_token) return res.status(401).json({ error: "No valid token" });
+    if (!tokens?.access_token)
+      return res.status(401).json({ error: "No valid token" });
 
     const url = `${process.env.AMO_BASE_URL}/api/v4/leads/notes?filter[type]=call_in&limit=10`;
     const amoRes = await fetchWithTimeout(url, {
       headers: { Authorization: `Bearer ${tokens.access_token}` },
     });
-
     const json = await amoRes.json();
 
-    if (!json?._embedded?.notes) {
+    if (!json?._embedded?.notes)
       return res.status(500).json({ error: "No notes returned", raw: json });
-    }
 
     const result = json._embedded.notes.map((n) => ({
       id: n.id,
@@ -115,24 +116,40 @@ app.get("/amo/debug", async (req, res) => {
   }
 });
 
-import { getAmoTokens } from "./supabaseStore.js";
-import { fetchWithTimeout } from "./utils.js";
+// ====================== DEBUG: FULL (25s timeout) ======================
 
 app.get("/amo/debug/full", async (req, res) => {
   try {
     const key = req.query.key;
-    if (key !== process.env.CRM_SHARED_KEY) return res.status(403).json({ error: "Forbidden" });
+    if (key !== process.env.CRM_SHARED_KEY)
+      return res.status(403).json({ error: "Forbidden" });
 
     const tokens = await getAmoTokens();
-    const url = `${process.env.AMO_BASE_URL}/api/v4/leads/notes?limit=10`;
-    const amoRes = await fetchWithTimeout(url, {
-      headers: { Authorization: `Bearer ${tokens.access_token}` },
-    });
-    const json = await amoRes.json();
+    if (!tokens?.access_token)
+      return res.status(401).json({ error: "No valid token" });
 
-    res.json(json._embedded?.notes || json);
+    const url = `${process.env.AMO_BASE_URL}/api/v4/leads/notes?limit=10`;
+    console.log("📡 Fetching full notes from AmoCRM...");
+
+    const amoRes = await fetchWithTimeout(
+      url,
+      { headers: { Authorization: `Bearer ${tokens.access_token}` } },
+      25000 // Увеличенный тайм-аут
+    );
+
+    const json = await amoRes.json();
+    const notes = (json._embedded?.notes || []).map((n) => ({
+      id: n.id,
+      type: n.note_type,
+      created_at: n.created_at,
+      paramsKeys: n.params ? Object.keys(n.params) : [],
+      sample: JSON.stringify(n.params || {}).slice(0, 500) + "...",
+    }));
+
+    res.json({ ok: true, count: notes.length, notes });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("❌ /amo/debug/full:", e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 

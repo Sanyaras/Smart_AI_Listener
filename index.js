@@ -125,7 +125,7 @@ app.get("/amo/debug", async (req, res) => {
   }
 });
 
-// ====================== DEBUG: FULL ======================
+// ====================== DEBUG: FULL (universal scopes) ======================
 
 app.get("/amo/debug/full", async (req, res) => {
   try {
@@ -133,12 +133,21 @@ app.get("/amo/debug/full", async (req, res) => {
     if (key !== process.env.CRM_SHARED_KEY)
       return res.status(403).json({ error: "Forbidden" });
 
+    const scope = req.query.scope || "leads"; // leads, contacts, companies, events
     const tokens = await getAmoTokens();
     if (!tokens?.access_token)
       return res.status(401).json({ error: "No valid token" });
 
-    const url = `${process.env.AMO_BASE_URL}/api/v4/leads/notes?limit=10`;
-    console.log("📡 Fetching full notes from AmoCRM...");
+    const baseUrl = process.env.AMO_BASE_URL;
+    let url;
+
+    if (scope === "events") {
+      url = `${baseUrl}/api/v4/events?limit=10`;
+    } else {
+      url = `${baseUrl}/api/v4/${scope}/notes?limit=10`;
+    }
+
+    console.log(`📡 Fetching full notes from AmoCRM [${scope}]...`);
 
     const amoRes = await fetchWithTimeout(
       url,
@@ -147,15 +156,23 @@ app.get("/amo/debug/full", async (req, res) => {
     );
 
     const json = await amoRes.json();
-    const notes = (json._embedded?.notes || []).map((n) => ({
+
+    // нормализуем массив для разного типа ответов
+    const notes = (json._embedded?.notes || json._embedded?.events || []).map((n) => ({
       id: n.id,
-      type: n.note_type,
+      type: n.note_type || n.type,
       created_at: n.created_at,
+      entity_id: n.entity_id || n.object_id,
       paramsKeys: n.params ? Object.keys(n.params) : [],
       sample: JSON.stringify(n.params || {}).slice(0, 500) + "...",
     }));
 
-    res.json({ ok: true, count: notes.length, notes });
+    res.json({
+      ok: true,
+      scope,
+      count: notes.length,
+      notes,
+    });
   } catch (e) {
     console.error("❌ /amo/debug/full:", e);
     res.status(500).json({ ok: false, error: e.message });

@@ -16,6 +16,19 @@ import { fetchWithTimeout, debug, safeStr } from "./utils.js";
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" }));
 
+const PORT = process.env.PORT || 3000;
+const POLL_INTERVAL_MIN = parseInt(process.env.AMO_POLL_MINUTES || "5", 10) * 60 * 1000;
+
+// ====================== INIT TELEGRAM (Webhook mode) ======================
+(async () => {
+  try {
+    await initTelegram(process.env, app);
+    console.log("🤖 Telegram инициализирован (Webhook mode)");
+  } catch (err) {
+    console.error("❌ Ошибка инициализации Telegram:", err);
+  }
+})();
+
 // ====================== INIT TELEGRAM (Webhook mode) ======================
 (async () => {
   try {

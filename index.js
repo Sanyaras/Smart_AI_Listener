@@ -4,19 +4,27 @@ import bodyParser from "body-parser";
 import { processAmoCalls } from "./amo.js";
 import { transcribeAudio } from "./asr.js";
 import { analyzeTranscript, formatQaForTelegram } from "./qa_assistant.js";
-import { getUnprocessedCalls, markCallProcessed, getAmoTokens, getRecentCalls } from "./supabaseStore.js";
+import { 
+  getUnprocessedCalls, 
+  markCallProcessed, 
+  getAmoTokens, 
+  getRecentCalls 
+} from "./supabaseStore.js";
 import { initTelegram, sendTGMessage } from "./telegram.js";
-await initTelegram();
 import { fetchWithTimeout, debug, safeStr } from "./utils.js";
 
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" }));
 
-// --- Init Telegram ---
-initTelegram();
-
-const PORT = process.env.PORT || 8080;
-const POLL_INTERVAL_MIN = parseInt(process.env.AMO_POLL_MINUTES || "5", 10) * 60 * 1000;
+// ====================== INIT TELEGRAM (Webhook mode) ======================
+(async () => {
+  try {
+    await initTelegram(process.env, app);
+    console.log("🤖 Telegram инициализирован (Webhook mode)");
+  } catch (err) {
+    console.error("❌ Ошибка инициализации Telegram:", err);
+  }
+})();
 
 // ====================== CORE PROCESS ======================
 

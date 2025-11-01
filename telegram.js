@@ -164,7 +164,6 @@ export async function uploadToTelegramAndGetUrl(mp3Url) {
     return null;
   }
 }
-
 /**
  * Основной процесс обработки звонков
  */

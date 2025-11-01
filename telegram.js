@@ -45,6 +45,7 @@ export async function initTelegram(env = process.env) {
       console.log(`🎤 Получен голос/аудио file_id=${fileId}`);
 
       try {
+        // Получаем путь к файлу
         const fileRes = await fetch(
           `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
         );
@@ -121,6 +122,7 @@ export async function sendTGMessage(text, chatOverride = null) {
 
 /**
  * Relay: загружает mp3 в Telegram и возвращает ссылку
+ * (исправлено: используем sendDocument вместо sendAudio, чтобы избежать 404)
  */
 export async function uploadToTelegramAndGetUrl(mp3Url) {
   try {
@@ -139,15 +141,16 @@ export async function uploadToTelegramAndGetUrl(mp3Url) {
 
     const formData = new FormData();
     formData.append("chat_id", TG_UPLOAD_CHAT_ID);
+    // ⚠️ Используем document, а не audio — 100% стабильный способ
     formData.append("document", fs.createReadStream(tmpFile));
-    formData.append("caption", "📎 Звонок (relay)");
+    formData.append("caption", "📎 Звонок (relay upload)");
 
     const uploadUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`;
     const uploadRes = await fetch(uploadUrl, { method: "POST", body: formData });
     const uploadJson = await uploadRes.json();
 
     if (!uploadJson.ok) {
-      console.error("❌ Ошибка Telegram upload:", uploadJson);
+      console.error("❌ Ошибка Telegram upload:", JSON.stringify(uploadJson, null, 2));
       return null;
     }
 
@@ -158,7 +161,7 @@ export async function uploadToTelegramAndGetUrl(mp3Url) {
     const fileInfo = await fileInfoRes.json();
 
     if (!fileInfo.ok) {
-      console.error("❌ Ошибка получения file_path:", fileInfo);
+      console.error("❌ Ошибка получения file_path:", JSON.stringify(fileInfo, null, 2));
       return null;
     }
 
